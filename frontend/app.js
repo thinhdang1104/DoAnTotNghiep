@@ -43,46 +43,10 @@
   const btnRefreshManagement = document.getElementById("btn-refresh-management");
   const historyTableBody = document.getElementById("history-table-body");
 
-  // Fallback dataset used only if inspecting static HTML without the server running
-  const STATIC_SAMPLE_RECORDS = [
-    {
-      ID: 108,
-      "Biển số": "99E1-22268",
-      "Thời gian nhận diện": "2026-10-28 18:11:25",
-      "Đồng thuận biển số": "3/3 (100%)",
-      "Khuôn mặt": "Không rõ",
-      "Camera index": 0,
-    },
-    {
-      ID: 107,
-      "Biển số": "79F9-7131",
-      "Thời gian nhận diện": "2026-10-28 14:52:19",
-      "Đồng thuận biển số": "5/6 (83%)",
-      "Khuôn mặt": "Không rõ",
-      "Camera index": 0,
-    },
-    {
-      ID: 106,
-      "Biển số": "43N2-6176",
-      "Thời gian nhận diện": "2026-10-28 14:52:13",
-      "Đồng thuận biển số": "6/7 (86%)",
-      "Khuôn mặt": "Không rõ",
-      "Camera index": 0,
-    },
-    {
-      ID: 105,
-      "Biển số": "14AA-99999",
-      "Thời gian nhận diện": "2026-10-28 14:23:28",
-      "Đồng thuận biển số": "4/5 (80%)",
-      "Khuôn mặt": "Không rõ",
-      "Camera index": 0,
-    },
-  ];
-
-  let allHistoryRecords = [];
   let activeFaceFilter = "all";
   let isCameraStreaming = false;
-  let lastSeenConfirmedTime = null;
+  let lastRecordsVersion = -1;
+  let searchDebounceTimer = null;
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -147,9 +111,12 @@
     activateView("view-management");
   }
 
-  function updateDatabaseStatusUI(dbReady, pendingCount) {
+  function updateDatabaseStatusUI(serverOnline, dbReady, pendingCount) {
     if (dbStatusPill) {
-      if (dbReady) {
+      if (!serverOnline) {
+        dbStatusPill.className = "pill neg";
+        dbStatusPill.textContent = "Mất kết nối máy chủ";
+      } else if (dbReady) {
         dbStatusPill.className = "pill pos";
         dbStatusPill.textContent = "MySQL: Đã kết nối";
       } else {
@@ -184,6 +151,20 @@
       return `<span class="pill pos">${escapeHtml(str)}</span>`;
     }
     return `<span class="pill">${escapeHtml(str || "Không rõ")}</span>`;
+  }
+
+  function renderMatchPill(matchText) {
+    const str = String(matchText || "-");
+    if (str.startsWith("Khớp")) {
+      return `<span class="pill pos">${escapeHtml(str)}</span>`;
+    }
+    if (str.startsWith("Lệch")) {
+      return `<span class="pill neg">${escapeHtml(str)}</span>`;
+    }
+    if (str === "Lần đầu" || str === "Chờ lưu") {
+      return `<span class="pill warn">${escapeHtml(str)}</span>`;
+    }
+    return `<span class="pill">${escapeHtml(str)}</span>`;
   }
 
   // ==================== CAMERA CONTROLS ====================
@@ -228,7 +209,7 @@
         throw new Error(data.detail || "Không thể mở camera.");
       }
       showBanner(cameraAlertBox, "", "");
-      await pollCameraStatus();
+      await pollCameraStatusOnce();
     } catch (err) {
       showBanner(cameraAlertBox, "error", err.message);
       btnStartCamera.disabled = false;
@@ -240,15 +221,15 @@
     btnStopCamera.disabled = true;
     try {
       await fetch("/api/camera/stop", { method: "POST" });
-      await pollCameraStatus();
+      await pollCameraStatusOnce();
     } catch (err) {
       showBanner(cameraAlertBox, "error", err.message);
     }
   });
 
-  function updateRecentFeed(records) {
-    const recentSlice = (records || []).slice(0, 5);
-    if (recentSlice.length === 0) {
+  function updateRecentFeed(pendingRecords, confirmedRecords) {
+    const combined = [...(pendingRecords || []), ...(confirmedRecords || [])].slice(0, 5);
+    if (combined.length === 0) {
       recentMiniTbody.innerHTML = `
         <tr>
           <td colspan="4">Chưa có bản ghi nhận diện.</td>
@@ -257,15 +238,14 @@
       return;
     }
 
-    recentMiniTbody.innerHTML = recentSlice
+    recentMiniTbody.innerHTML = combined
       .map((row) => {
         const timePart = String(row["Thời gian nhận diện"] || "").split(" ").pop() || "-";
-        const consensusRaw = row["Đồng thuận biển số"] || "-";
         return `
           <tr>
             <td><span class="plate-cell-main num">${escapeHtml(row["Biển số"])}</span></td>
             <td>${renderFacePill(row["Khuôn mặt"])}</td>
-            <td class="n num">${escapeHtml(consensusRaw)}</td>
+            <td>${renderMatchPill(row["Đối chiếu"])}</td>
             <td class="n num">${escapeHtml(timePart)}</td>
           </tr>
         `;
@@ -273,13 +253,13 @@
       .join("");
   }
 
-  async function pollCameraStatus() {
+  async function pollCameraStatusOnce() {
     try {
       const res = await fetch("/api/camera/status");
-      if (!res.ok) return;
+      if (!res.ok) throw new Error("HTTP " + res.status);
       const state = await res.json();
 
-      updateDatabaseStatusUI(state.database_ready, state.pending_count);
+      updateDatabaseStatusUI(true, state.database_ready, state.pending_count);
 
       if (state.running) {
         if (!isCameraStreaming) {
@@ -332,60 +312,39 @@
 
       voteAmbiguousWarning.classList.toggle("hidden", !state.ambiguous_frame);
 
-      if (state.last_confirmed) {
-        if (lastSeenConfirmedTime !== state.last_confirmed.recognized_at) {
-          lastSeenConfirmedTime = state.last_confirmed.recognized_at;
-          fetchManagementOverview();
-        }
+      if (
+        typeof state.records_version === "number" &&
+        state.records_version !== lastRecordsVersion
+      ) {
+        lastRecordsVersion = state.records_version;
+        fetchManagementOverview();
       }
     } catch {
-      if (allHistoryRecords.length === 0) {
-        applyManagementData({
-          database_ready: true,
-          database_error: null,
-          pending_records: [],
-          records: STATIC_SAMPLE_RECORDS,
-        });
-      }
+      updateDatabaseStatusUI(false, false, 0);
     }
   }
 
+  async function pollLoop() {
+    await pollCameraStatusOnce();
+    setTimeout(pollLoop, 400);
+  }
+
   // ==================== MANAGEMENT & HISTORY TABLE ====================
-  function renderHistoryTable() {
-    const query = (searchPlateInput.value || "").trim().toUpperCase();
-
-    const withFaceTotal = allHistoryRecords.filter((r) =>
-      String(r["Khuôn mặt"] || "").startsWith("Có")
-    ).length;
-    const noFaceTotal = allHistoryRecords.length - withFaceTotal;
-
-    if (tabCountAll) tabCountAll.textContent = String(allHistoryRecords.length);
-    if (tabCountFace) tabCountFace.textContent = String(withFaceTotal);
-    if (tabCountNoface) tabCountNoface.textContent = String(noFaceTotal);
-
-    const filtered = allHistoryRecords.filter((row) => {
-      const plate = String(row["Biển số"] || "").toUpperCase();
-      const face = String(row["Khuôn mặt"] || "");
-      if (query && !plate.includes(query)) return false;
-      if (activeFaceFilter === "with_face" && !face.startsWith("Có")) return false;
-      if (activeFaceFilter === "no_face" && face.startsWith("Có")) return false;
-      return true;
-    });
-
+  function renderHistoryTable(records, matchedCount, totalRecords) {
     if (ledgerCountText) {
-      ledgerCountText.textContent = `${filtered.length} / ${allHistoryRecords.length} bản ghi`;
+      ledgerCountText.textContent = `${matchedCount} / ${totalRecords} bản ghi`;
     }
 
-    if (filtered.length === 0) {
+    if (!records || records.length === 0) {
       historyTableBody.innerHTML = `
         <tr>
-          <td colspan="6">Không có bản ghi nào khớp điều kiện lọc.</td>
+          <td colspan="7">Không có bản ghi nào khớp điều kiện lọc.</td>
         </tr>
       `;
       return;
     }
 
-    historyTableBody.innerHTML = filtered
+    historyTableBody.innerHTML = records
       .map((row) => {
         const consensusRaw = row["Đồng thuận biển số"] || "-";
         const ratioText = parseConsensusRatio(consensusRaw);
@@ -394,6 +353,7 @@
           <tr>
             <td><span class="plate-cell-main num">${escapeHtml(row["Biển số"])}</span></td>
             <td>${renderFacePill(row["Khuôn mặt"])}</td>
+            <td>${renderMatchPill(row["Đối chiếu"])}</td>
             <td class="n num">${escapeHtml(ratioText)}</td>
             <td class="n num">${pctVal > 0 ? `${pctVal}%` : "-"}</td>
             <td class="n num">${escapeHtml(row["Thời gian nhận diện"])}</td>
@@ -407,25 +367,24 @@
   function applyManagementData(data) {
     const records = data.records || [];
     const pending = data.pending_records || [];
-    allHistoryRecords = records;
+    const stats = data.stats || {
+      total_records: records.length,
+      today_records: 0,
+      with_face: 0,
+      no_face: 0,
+      face_rate: 0,
+    };
 
-    const total = records.length;
-    const withFace = records.filter((r) => String(r["Khuôn mặt"] || "").startsWith("Có")).length;
-    const faceRate = total > 0 ? Math.round((withFace / total) * 100) : 0;
+    updateDatabaseStatusUI(true, data.database_ready, pending.length);
 
-    const todayPrefix = new Date().toISOString().slice(0, 10);
-    const todayRecords =
-      data.stats && typeof data.stats.today_records === "number"
-        ? data.stats.today_records
-        : records.filter((r) => String(r["Thời gian nhận diện"] || "").startsWith(todayPrefix))
-            .length;
-
-    updateDatabaseStatusUI(data.database_ready, pending.length);
-
-    statTotalRecords.textContent = String(total);
-    statTodayRecords.textContent = String(todayRecords);
-    statFaceRate.textContent = `${faceRate}%`;
+    statTotalRecords.textContent = String(stats.total_records);
+    statTodayRecords.textContent = String(stats.today_records);
+    statFaceRate.textContent = `${stats.face_rate}%`;
     statPendingRecords.textContent = String(pending.length);
+
+    if (tabCountAll) tabCountAll.textContent = String(stats.total_records);
+    if (tabCountFace) tabCountFace.textContent = String(stats.with_face);
+    if (tabCountNoface) tabCountNoface.textContent = String(stats.no_face);
 
     if (data.database_error) {
       showBanner(managementAlertBox, "error", `Chưa kết nối được MySQL: ${data.database_error}`);
@@ -453,25 +412,36 @@
       pendingTableBody.innerHTML = "";
     }
 
-    updateRecentFeed(records);
-    renderHistoryTable();
+    const query = (searchPlateInput.value || "").trim();
+    if (!query && activeFaceFilter === "all") {
+      updateRecentFeed(pending, records);
+    }
+
+    const matched = typeof data.matched === "number" ? data.matched : records.length;
+    renderHistoryTable(records, matched, stats.total_records);
   }
 
   async function fetchManagementOverview() {
+    const query = (searchPlateInput.value || "").trim();
+    const params = new URLSearchParams();
+    if (query) params.set("q", query);
+    if (activeFaceFilter && activeFaceFilter !== "all") {
+      params.set("face", activeFaceFilter);
+    }
+    const qs = params.toString();
+    const url = qs ? `/api/management/overview?${qs}` : "/api/management/overview";
+
     try {
-      const res = await fetch("/api/management/overview");
-      if (!res.ok) throw new Error("API status " + res.status);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
+      if (typeof data.records_version === "number") {
+        lastRecordsVersion = data.records_version;
+      }
       applyManagementData(data);
     } catch {
-      if (allHistoryRecords.length === 0) {
-        applyManagementData({
-          database_ready: true,
-          database_error: null,
-          pending_records: [],
-          records: STATIC_SAMPLE_RECORDS,
-        });
-      }
+      updateDatabaseStatusUI(false, false, 0);
+      showBanner(managementAlertBox, "error", "Không kết nối được tới máy chủ FastAPI.");
     }
   }
 
@@ -480,11 +450,16 @@
       tabLinks.forEach((b) => b.setAttribute("aria-selected", "false"));
       btn.setAttribute("aria-selected", "true");
       activeFaceFilter = btn.getAttribute("data-face-filter") || "all";
-      renderHistoryTable();
+      fetchManagementOverview();
     });
   });
 
-  searchPlateInput.addEventListener("input", renderHistoryTable);
+  searchPlateInput.addEventListener("input", () => {
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+      fetchManagementOverview();
+    }, 200);
+  });
 
   btnRefreshManagement.addEventListener("click", async () => {
     btnRefreshManagement.disabled = true;
@@ -495,7 +470,9 @@
         throw new Error(data.detail || "Chưa kết nối được MySQL.");
       }
       await fetchManagementOverview();
-      showBanner(managementAlertBox, "success", "Đã làm mới dữ liệu từ MySQL.");
+      const flushedMsg =
+        data.flushed > 0 ? ` và đồng bộ ${data.flushed} bản ghi chờ` : "";
+      showBanner(managementAlertBox, "success", `Đã làm mới dữ liệu từ MySQL${flushedMsg}.`);
     } catch (err) {
       await fetchManagementOverview();
       showBanner(managementAlertBox, "error", err.message);
@@ -513,7 +490,11 @@
         throw new Error(data.detail || "Không thể đồng bộ bản ghi chờ.");
       }
       await fetchManagementOverview();
-      showBanner(managementAlertBox, "success", "Đã đồng bộ bản ghi chờ vào MySQL.");
+      showBanner(
+        managementAlertBox,
+        "success",
+        `Đã đồng bộ ${data.flushed || 0} bản ghi chờ vào MySQL.`
+      );
     } catch (err) {
       await fetchManagementOverview();
       showBanner(managementAlertBox, "error", err.message);
@@ -523,6 +504,5 @@
   });
 
   fetchManagementOverview();
-  pollCameraStatus();
-  setInterval(pollCameraStatus, 400);
+  pollLoop();
 })();
