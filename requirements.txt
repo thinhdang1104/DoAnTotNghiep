@@ -1,7 +1,11 @@
 ultralytics>=8.0.0
 torch>=1.13.0
 torchvision>=0.14.0
+facenet-pytorch>=2.6.0
+pillow>=10.0.0
 opencv-python
 numpy
-pillow
-streamlit
+fastapi>=0.110.0
+uvicorn>=0.30.0
+mysql-connector-python>=8.0.0
+python-dotenv>=1.0.0

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quản Lý Bãi Xe — Camera Nhận Diện &amp; Lịch Sử</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- TOP BAR -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1 id="page-title" class="brand-title">Bãi Giữ Xe Trường Học</h1>
+        <nav class="top-nav" aria-label="Chuyển màn hình">
+          <button
+            id="nav-recognition"
+            type="button"
+            class="top-nav-btn"
+            data-target="view-recognition"
+            aria-current="page"
+          >
+            Camera nhận diện
+          </button>
+          <button
+            id="nav-management"
+            type="button"
+            class="top-nav-btn"
+            data-target="view-management"
+          >
+            Lịch sử &amp; quản lý
+            <span id="nav-pending-badge" class="nav-count hidden">0</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="topbar-right">
+        <span id="db-status-pill" class="pill pos">MySQL: Đã kết nối</span>
+      </div>
+    </header>
+
+    <!-- MAIN CONTENT -->
+    <main class="workspace">
+      <!-- ==================== SCREEN 1: CAMERA ==================== -->
+      <section id="view-recognition" class="screen-view active" aria-label="Camera nhận diện">
+        <div id="camera-alert-box" class="notice-banner hidden" role="status"></div>
+
+        <div class="workspace-grid">
+          <!-- LEFT: 4:3 CAMERA PANEL -->
+          <article class="panel camera-panel">
+            <header class="panel-header">
+              <h2>Camera</h2>
+
+              <div class="camera-controls">
+                <label class="port-field" for="camera-index-input">
+                  <span>Cổng</span>
+                  <input id="camera-index-input" class="input port-input num" type="number" min="0" max="10" value="0" />
+                </label>
+                <button id="btn-scan-camera" class="btn" type="button">Dò cổng</button>
+                <button id="btn-start-camera" class="btn primary" type="button">Kết nối camera</button>
+                <button id="btn-stop-camera" class="btn" type="button" disabled>Ngắt kết nối</button>
+              </div>
+            </header>
+
+            <div class="camera-stage">
+              <img id="camera-stream-img" class="camera-stream hidden" alt="Camera" />
+
+              <div id="camera-placeholder" class="camera-standby">
+                <span class="standby-text">Chưa kết nối camera</span>
+              </div>
+            </div>
+
+            <div id="vote-ambiguous-warning" class="notice-banner notice-warn hidden">
+              Nhiều biển số trong khung hình — tạm bỏ qua mẫu này.
+            </div>
+          </article>
+
+          <!-- RIGHT: LIVE READOUT + RECENT 5 VEHICLES -->
+          <div class="side-stack">
+            <section class="panel live-panel" aria-label="Đang nhận diện">
+              <header class="panel-header">
+                <h2>Đang nhận diện</h2>
+                <span id="live-vote-pill" class="pill num">0/3 mẫu</span>
+              </header>
+
+              <div class="live-readout-grid">
+                <div class="live-box">
+                  <span class="live-label">Biển số xe</span>
+                  <strong id="live-plate-value" class="live-value plate-highlight num">-</strong>
+                </div>
+                <div class="live-box">
+                  <span class="live-label">Khuôn mặt</span>
+                  <strong id="live-face-value" class="live-value num">-</strong>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel recent-panel" aria-label="5 lượt vừa qua">
+              <header class="panel-header">
+                <h2>5 lượt vừa qua</h2>
+                <button id="btn-jump-ledger" class="card-link" type="button">Xem tất cả</button>
+              </header>
+
+              <div class="table-wrap">
+                <table aria-label="5 lượt nhận diện vừa qua">
+                  <thead>
+                    <tr>
+                      <th>Biển số</th>
+                      <th>Khuôn mặt</th>
+                      <th class="n">Đồng thuận</th>
+                      <th class="n">Thời gian</th>
+                    </tr>
+                  </thead>
+                  <tbody id="recent-mini-tbody">
+                    <tr>
+                      <td><strong class="num">-</strong></td>
+                      <td><span class="pill">Chưa có</span></td>
+                      <td class="n num">-</td>
+                      <td class="n num">-</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== SCREEN 2: MANAGEMENT & LEDGER ==================== -->
+      <section id="view-management" class="screen-view" aria-label="Lịch sử và quản lý">
+        <div id="management-alert-box" class="notice-banner hidden" role="status"></div>
+
+        <!-- COMPACT STATS STRIP -->
+        <div class="kpis" aria-label="Thống kê dữ liệu">
+          <div class="kpi">
+            <div class="kpi-label">Tổng lượt lưu trữ</div>
+            <div class="kpi-value num" id="stat-total-records">0</div>
+          </div>
+
+          <div class="kpi">
+            <div class="kpi-label">Hôm nay</div>
+            <div class="kpi-value num" id="stat-today-records">0</div>
+          </div>
+
+          <div class="kpi">
+            <div class="kpi-label">Tỷ lệ có khuôn mặt</div>
+            <div class="kpi-value num" id="stat-face-rate">0%</div>
+          </div>
+
+          <div class="kpi">
+            <div class="kpi-label">Chờ đồng bộ</div>
+            <div class="kpi-value num" id="stat-pending-records">0</div>
+          </div>
+        </div>
+
+        <!-- PENDING RECORDS QUEUE (SHOWN WHEN > 0) -->
+        <div id="pending-section" class="panel pending-card hidden">
+          <header class="panel-header">
+            <h2>Bản ghi chờ lưu MySQL</h2>
+            <button id="btn-flush-pending" class="btn primary" type="button">Đồng bộ ngay</button>
+          </header>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Biển số xe</th>
+                  <th>Khuôn mặt</th>
+                  <th class="n">Đồng thuận</th>
+                  <th class="n">Thời gian</th>
+                  <th class="n">Cổng</th>
+                </tr>
+              </thead>
+              <tbody id="pending-table-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- RECOGNITION LEDGER -->
+        <div class="panel ledger-panel">
+          <div class="ledger-toolbar">
+            <div class="tabs" role="tablist" aria-label="Lọc theo khuôn mặt">
+              <button type="button" class="tab-link" role="tab" data-face-filter="all" aria-selected="true">
+                Tất cả (<span id="tab-count-all" class="num">0</span>)
+              </button>
+              <button type="button" class="tab-link" role="tab" data-face-filter="with_face" aria-selected="false">
+                Có khuôn mặt (<span id="tab-count-face" class="num">0</span>)
+              </button>
+              <button type="button" class="tab-link" role="tab" data-face-filter="no_face" aria-selected="false">
+                Chưa rõ mặt (<span id="tab-count-noface" class="num">0</span>)
+              </button>
+            </div>
+
+            <div class="filters">
+              <label for="search-plate-input" class="sr-only">Tìm biển số xe</label>
+              <input
+                id="search-plate-input"
+                type="search"
+                class="input search-input"
+                placeholder="Tìm biển số xe..."
+              />
+              <span id="ledger-count-text" class="stamp num">0 bản ghi</span>
+              <button id="btn-refresh-management" class="btn" type="button">Làm mới</button>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table aria-label="Sổ nhật ký nhận diện">
+              <thead>
+                <tr>
+                  <th>Biển số xe</th>
+                  <th>Khuôn mặt</th>
+                  <th class="n">Mẫu đồng thuận</th>
+                  <th class="n">Tỷ lệ</th>
+                  <th class="n">Thời gian</th>
+                  <th class="n">Mã ghi</th>
+                </tr>
+              </thead>
+              <tbody id="history-table-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

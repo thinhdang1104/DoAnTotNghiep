@@ -1,19 +1,36 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+.env
+
+# Runtime data (bản ghi chờ đồng bộ MySQL)
+data/
 
 # Training outputs
 runs/
-datasets/
-*.jpg
-*.png
 
-# YOLO
+# Dataset (tải riêng từ Roboflow; chỉ giữ data.yaml)
+datasets/**/images/
+datasets/**/labels/
+*.cache
+
+# YOLO pretrained weights (weights/*.pt của dự án vẫn được commit)
 yolov8*.pt
+yolo11*.pt
 last.pt
+
+# Công cụ thiết kế / agent
+.agents/
+.taste-skill/
+skills-lock.json
 
 # OS
 .DS_Store
+Thumbs.db
 
 # VS Code
 .vscode/
+
+# Jupyter
+.ipynb_checkpoints/
