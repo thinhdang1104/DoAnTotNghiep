@@ -27,8 +27,14 @@ from database import (
     format_record_row,
     initialize_database,
     insert_plate_record,
+    verify_checkout_face,
 )
-from face_service import FaceData, FaceService
+from face_service import (
+    FACE_MATCH_THRESHOLD,
+    FaceData,
+    FaceService,
+    cosine_similarity,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,12 +51,17 @@ VOTE_WINDOW_SECONDS = 3.0
 VOTE_SAMPLE_INTERVAL_SECONDS = 0.25
 VOTE_MIN_SAMPLES = 3
 VOTE_MIN_SHARE = 0.70
-# Không còn thấy khung biển số nào trong khoảng này => xe đã rời khỏi khung hình
+
+# Cơ chế "Lưu hờ" (Two-Phase Latch): đợi khuôn mặt chuẩn nhất ở Camera đối diện
+FACE_MIN_CONFIDENCE = 0.85
+FACE_SAMPLE_WINDOW_SECONDS = 0.50
+LATCH_TIMEOUT_SECONDS = 25.0
+
+# Không còn thấy khung biển số nào trong khoảng này => reset bộ đếm phiếu
 PLATE_LOST_RESET_SECONDS = 1.5
-# Cùng một biển số không được ghi lại trong khoảng này (chống ghi trùng khi OCR chập chờn)
-PLATE_COOLDOWN_SECONDS = 60.0
-# Khi không có biển số, chỉ chạy MTCNN mỗi N khung hình để tiết kiệm CPU
-FACE_IDLE_EVERY_N_FRAMES = 3
+# Cùng một biển số + cùng một luồng (IN/OUT) không ghi trùng trong khoảng này
+PLATE_COOLDOWN_SECONDS = 20.0
+FACE_IDLE_EVERY_N_FRAMES = 2
 
 DB_RETRY_SECONDS = 15.0
 CAMERA_STOP_TIMEOUT_SECONDS = 5.0
@@ -65,25 +76,18 @@ CAMERA_BACKENDS = (
 # ============================================================================
 # Chuẩn hóa biển số Việt Nam
 # ============================================================================
-# 2 số tỉnh + 1-2 chữ seri + (tùy chọn) 1 số + 4-5 số thứ tự.
-# VD: 51G-12345 (ô tô), 59X1-23456 (xe máy), 29MD1-12345 (xe điện), 30LD-12345.
 PLATE_SERIES_RE = re.compile(r"^\d{2}[A-Z]{1,2}\d?$")
 PLATE_NUMBER_RE = re.compile(r"^\d{4,5}$")
 PLATE_PATTERNS = (
     re.compile(r"^(\d{2}[A-Z]{1,2}\d?)(\d{5})$"),
     re.compile(r"^(\d{2}[A-Z]{1,2}\d?)(\d{4})$"),
 )
-# Sửa nhầm lẫn ký tự theo vị trí bắt buộc (chỉ áp dụng cho các cặp dễ nhầm)
 TO_DIGIT = {"D": "0", "B": "8", "S": "5", "Z": "2", "G": "6"}
 TO_LETTER = {"0": "D", "8": "B", "5": "S", "2": "Z", "6": "G", "4": "A"}
 
 
 def normalize_plate(raw_text: str) -> tuple[str, str] | None:
-    """Trả về (khóa bỏ phiếu, chuỗi hiển thị) hoặc None nếu không giống biển số VN.
-
-    Khóa bỏ phiếu không chứa dấu phân cách, nên cùng một biển đọc thành 1 dòng
-    ("59X123456") hay 2 dòng ("59X1-23456") vẫn được tính là cùng một phiếu.
-    """
+    """Trả về (khóa bỏ phiếu, chuỗi hiển thị) hoặc None nếu không giống biển số VN."""
     if not raw_text:
         return None
     upper = raw_text.upper()
@@ -98,7 +102,6 @@ def normalize_plate(raw_text: str) -> tuple[str, str] | None:
         chars[i] = TO_DIGIT.get(chars[i], chars[i])
     key = "".join(chars)
 
-    # Ưu tiên vị trí xuống dòng thật của biển 2 dòng (dấu "-" do bước ghép ký tự tạo ra)
     if upper.count("-") == 1:
         split_at = sum(ch.isalnum() for ch in upper.split("-")[0])
         series, number = key[:split_at], key[split_at:]
@@ -130,7 +133,6 @@ def _box_iou(box_a, box_b) -> float:
 
 
 def _deduplicate_chars(raw_chars, iou_threshold: float = 0.55):
-    """Loại bỏ các box ký tự trùng lắp tại cùng vị trí, giữ box có confidence cao nhất."""
     kept = []
     for candidate in sorted(raw_chars, key=lambda item: item[3], reverse=True):
         if any(_box_iou(candidate[4], existing[4]) > iou_threshold for existing in kept):
@@ -140,7 +142,6 @@ def _deduplicate_chars(raw_chars, iou_threshold: float = 0.55):
 
 
 def _assemble_plate_text(chars) -> str:
-    """Ghép các ký tự thành chuỗi biển số, tự động phân biệt biển 1 dòng và 2 dòng."""
     if len(chars) == 1:
         return chars[0][2]
 
@@ -162,7 +163,6 @@ def _assemble_plate_text(chars) -> str:
 
 
 def detect_plates(frame, plate_model: YOLO, char_model: YOLO, annotated):
-    """Trả về danh sách chuỗi ký tự đọc được cho từng khung biển số ("" nếu không đọc được)."""
     results = plate_model.predict(frame, conf=CONF_PLATE, iou=0.5, verbose=False)[0]
     names = char_model.names
     height, width = frame.shape[:2]
@@ -234,7 +234,6 @@ def draw_faces(annotated, faces: list[FaceData]) -> None:
 
 
 def resize_camera_preview(frame, max_width: int = 1000, max_height: int = 640):
-    """Chỉ thu nhỏ khung hình xem trước, không phóng to."""
     height, width = frame.shape[:2]
     scale = min(max_width / width, max_height / height, 1.0)
     if scale < 1.0:
@@ -247,7 +246,6 @@ def resize_camera_preview(frame, max_width: int = 1000, max_height: int = 640):
 
 
 def get_vote_result(observations):
-    """observations: deque[(thời điểm, khóa, chuỗi hiển thị)]."""
     if not observations:
         return None
     votes = Counter(key for _, key, _ in observations)
@@ -264,7 +262,6 @@ def is_vote_confirmed(vote_result) -> bool:
 
 
 def _face_score(face: FaceData) -> float:
-    # Ưu tiên khuôn mặt to (gần camera, khả năng là người lái) và rõ nét.
     return face.confidence * math.sqrt(face.area)
 
 
@@ -298,10 +295,6 @@ def open_camera(device_index: int):
 
 
 class FrameGrabber:
-    """Đọc camera liên tục trên thread riêng và chỉ giữ khung hình mới nhất,
-    để AI luôn xử lý hình hiện tại thay vì hình cũ trong bộ đệm của driver.
-    Thread này sở hữu và tự giải phóng đối tượng capture."""
-
     MAX_CONSECUTIVE_FAILURES = 20
 
     def __init__(self, capture, first_frame) -> None:
@@ -357,11 +350,8 @@ class FrameGrabber:
 # ============================================================================
 class SystemState:
     def __init__(self) -> None:
-        # lock: bảo vệ trạng thái dùng chung, chỉ giữ trong thời gian rất ngắn (không I/O).
         self.lock = threading.Lock()
-        # control_lock: tuần tự hóa start / stop / scan camera.
         self.control_lock = threading.Lock()
-        # db_write_lock: tuần tự hóa ghi MySQL và thao tác trên hàng chờ.
         self.db_write_lock = threading.Lock()
 
         self.plate_model: YOLO | None = None
@@ -376,11 +366,15 @@ class SystemState:
         self.writer_stop = threading.Event()
         self.writer_thread: threading.Thread | None = None
 
-        # Camera
+        # Camera & Active Cam Switcher (Giải pháp 1: 1 điện thoại đóng vai Cam 1 / Cam 2)
+        # Mặc định bắt đầu ở Cam 2 (soi biển số xe ĐI VÀO)
         self.running = False
         self.session_id = 0
         self.device_index = 0
         self.backend_name: str | None = None
+        self.active_cam: int = 2
+        self.auto_switch_cam: bool = True
+
         self.worker_thread: threading.Thread | None = None
         self.latest_jpeg: bytes | None = None
         self.jpeg_seq = 0
@@ -393,9 +387,12 @@ class SystemState:
         self.last_confirmed: dict | None = None
         self.confirm_seq = 0
 
+        # Thông báo kết quả cổng & cảnh báo an ninh khi lệch mặt lúc ra
+        self.gate_feedback: dict | None = None
+        self.security_alert: dict | None = None
+
         self._reset_vote_state_locked()
 
-    # ------------------------------------------------------------------ setup
     def load_ai_models(self) -> None:
         if not PLATE_MODEL_PATH.is_file():
             raise RuntimeError(f"Không tìm thấy model biển số: {PLATE_MODEL_PATH}")
@@ -409,8 +406,10 @@ class SystemState:
         self.observations: deque = deque()
         self.last_sample_time = 0.0
         self.last_plate_seen: float | None = None
-        self.confirmed_key: str | None = None
         self.recent_confirms: dict[str, float] = {}
+        # Trạng thái Lưu hờ (Two-Phase Latch)
+        self.latched: dict | None = None
+        self.face_window_start: float | None = None
         self.best_face: tuple[float, float, object, tuple] | None = None
 
     # ---------------------------------------------------------- hàng chờ (file)
@@ -426,14 +425,16 @@ class SystemState:
             print(f"[WARN] Không đọc được {PENDING_FILE}: {error}")
 
     def _persist_pending(self) -> None:
-        """Gọi khi đang giữ db_write_lock."""
         try:
             if not self.pending_records:
                 PENDING_FILE.unlink(missing_ok=True)
                 return
             PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
             payload = [
-                {**rec, "recognized_at": rec["recognized_at"].isoformat()}
+                {
+                    **{k: v for k, v in rec.items() if k != "_seq"},
+                    "recognized_at": rec["recognized_at"].isoformat(),
+                }
                 for rec in self.pending_records
             ]
             tmp = PENDING_FILE.with_suffix(".tmp")
@@ -453,7 +454,6 @@ class SystemState:
             self.records_version += 1
 
     def connect_database(self) -> int:
-        """Kết nối / tạo bảng, rồi đồng bộ hàng chờ. Trả về số bản ghi đã đồng bộ."""
         try:
             initialize_database()
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
@@ -502,6 +502,16 @@ class SystemState:
                 except (DatabaseConfigurationError, DatabaseOperationError) as error:
                     self._set_db_status(False, str(error))
 
+            # Nếu mất MySQL mà là lượt RA, cập nhật luôn phiên IN_PARKING trong pending_records nếu có
+            if str(record.get("direction", "IN")).upper() == "OUT":
+                for pending_rec in self.pending_records:
+                    if (
+                        pending_rec.get("plate_number") == record.get("plate_number")
+                        and pending_rec.get("direction") == "IN"
+                        and pending_rec.get("parking_status") == "IN_PARKING"
+                    ):
+                        pending_rec["parking_status"] = "COMPLETED"
+
             self.pending_records.append(record)
             self._persist_pending()
             self._bump_version()
@@ -515,8 +525,7 @@ class SystemState:
                 record = None
 
             if record is not None:
-                record = {k: v for k, v in record.items()}
-                self._store_record(record)
+                self._store_record(dict(record))
                 continue
 
             with self.lock:
@@ -538,6 +547,70 @@ class SystemState:
         self.writer_stop.set()
         if self.writer_thread is not None:
             self.writer_thread.join(timeout=3.0)
+
+    # ------------------------------------------------- Active Cam & Latch APIs
+    def switch_active_cam(
+        self, active_cam: int | None = None, auto_switch: bool | None = None
+    ) -> dict:
+        with self.lock:
+            if active_cam in (1, 2):
+                if self.active_cam != active_cam:
+                    self.active_cam = active_cam
+                    self.observations.clear()
+            if auto_switch is not None:
+                self.auto_switch_cam = bool(auto_switch)
+            return {
+                "active_cam": self.active_cam,
+                "auto_switch_cam": self.auto_switch_cam,
+            }
+
+    def cancel_latch(self) -> None:
+        with self.lock:
+            self.latched = None
+            self.face_window_start = None
+            self.best_face = None
+            self.observations.clear()
+
+    def resolve_security_alert(self, approve: bool) -> dict:
+        record_to_save = None
+        with self.lock:
+            alert = self.security_alert
+            if alert is None:
+                return {"status": "none"}
+            self.security_alert = None
+            if approve:
+                record_to_save = alert["record"]
+                self.gate_feedback = {
+                    "type": "warn",
+                    "message": (
+                        f"Bảo vệ đã cho phép xe {record_to_save['plate_number']} "
+                        "ra bãi (ngoại lệ lệch khuôn mặt)."
+                    ),
+                }
+            else:
+                self.gate_feedback = {
+                    "type": "error",
+                    "message": (
+                        f"Đã TỪ CHỐI cho xe {alert['record']['plate_number']} ra bãi "
+                        "— Xe vẫn giữ trạng thái Đang gửi trong bãi."
+                    ),
+                }
+
+        if record_to_save is not None:
+            preview = format_record_row("Mới", record_to_save)
+            with self.lock:
+                self.last_confirmed = {
+                    "seq": record_to_save["_seq"],
+                    "plate_number": record_to_save["plate_number"],
+                    "direction": preview["Luồng"],
+                    "recognized_at": preview["Thời gian nhận diện"],
+                    "consensus": preview["Đồng thuận biển số"],
+                    "face_status": preview["Khuôn mặt"],
+                    "match_status": preview["Đối chiếu"],
+                }
+            self.write_queue.put(record_to_save)
+            return {"status": "approved"}
+        return {"status": "rejected"}
 
     # ---------------------------------------------------------------- camera
     def start_camera(self, device_index: int) -> None:
@@ -573,6 +646,7 @@ class SystemState:
                 self.plate_in_view = False
                 self.current_faces = []
                 self.ambiguous_frame = False
+                self.security_alert = None
                 self._reset_vote_state_locked()
 
             self.worker_thread = threading.Thread(
@@ -584,7 +658,7 @@ class SystemState:
         with self.control_lock:
             with self.lock:
                 self.running = False
-                self.session_id += 1  # vô hiệu hóa worker của phiên cũ
+                self.session_id += 1
                 worker = self.worker_thread
                 self.worker_thread = None
 
@@ -626,7 +700,7 @@ class SystemState:
 
                 try:
                     self._process_frame(session_id, frame)
-                except Exception as error:  # noqa: BLE001 - không để thread chết âm thầm
+                except Exception as error:  # noqa: BLE001
                     self._end_session_with_error(
                         session_id, f"Lỗi xử lý AI trên khung hình: {error}"
                     )
@@ -641,7 +715,9 @@ class SystemState:
 
         faces: list[FaceData] = []
         if self.face_service is not None and (
-            plate_present or self.frame_count % FACE_IDLE_EVERY_N_FRAMES == 0
+            plate_present
+            or self.latched is not None
+            or self.frame_count % FACE_IDLE_EVERY_N_FRAMES == 0
         ):
             faces = self.face_service.detect_from_bgr(frame)
             draw_faces(annotated, faces)
@@ -657,7 +733,7 @@ class SystemState:
                 readings[normalized[0]] = normalized[1]
 
         now = time.monotonic()
-        to_save = None
+        commit_pair = None
 
         with self.lock:
             if self.session_id != session_id:
@@ -671,7 +747,6 @@ class SystemState:
                 if now - t < PLATE_COOLDOWN_SECONDS
             }
 
-            # "Có xe" được tính theo việc còn thấy khung biển số, kể cả khi chưa đọc rõ chữ.
             if plate_present:
                 self.last_plate_seen = now
             elif (
@@ -679,53 +754,125 @@ class SystemState:
                 and now - self.last_plate_seen >= PLATE_LOST_RESET_SECONDS
             ):
                 self.observations.clear()
-                self.confirmed_key = None
-                self.best_face = None
                 self.last_plate_seen = None
 
-            if plate_present and faces:
-                candidate = max(faces, key=_face_score)
-                score = _face_score(candidate)
-                if self.best_face is None or score > self.best_face[0]:
-                    self.best_face = (score, candidate.confidence, frame, candidate.box)
+            # Nếu đang có cảnh báo an ninh chờ bảo vệ quyết định thì tạm dừng chốt lượt mới
+            if self.security_alert is None:
+                # --------------------------------------------------------------
+                # PHA 1: Chưa có biển số Lưu hờ -> Đọc và bỏ phiếu Biển số
+                #   - Cam 2 thấy Biển số => Luồng ĐI VÀO (đợi Khuôn mặt ở Cam 1)
+                #   - Cam 1 thấy Biển số => Luồng ĐI RA  (đợi Khuôn mặt ở Cam 2)
+                # --------------------------------------------------------------
+                if self.latched is None:
+                    if (
+                        len(readings) == 1
+                        and now - self.last_sample_time >= VOTE_SAMPLE_INTERVAL_SECONDS
+                    ):
+                        key, display = next(iter(readings.items()))
+                        self.observations.append((now, key, display))
+                        self.last_sample_time = now
 
-            if len(readings) == 1 and now - self.last_sample_time >= VOTE_SAMPLE_INTERVAL_SECONDS:
-                key, display = next(iter(readings.items()))
-                self.observations.append((now, key, display))
-                self.last_sample_time = now
+                    vote = get_vote_result(self.observations)
+                    if is_vote_confirmed(vote):
+                        key, display, vote_count, vote_share, sample_count = vote
+                        direction = "IN" if self.active_cam == 2 else "OUT"
+                        cooldown_token = f"{key}:{direction}"
 
-            vote = get_vote_result(self.observations)
-            if is_vote_confirmed(vote):
-                key, display, vote_count, vote_share, sample_count = vote
-                if key == self.confirmed_key:
-                    # Vẫn là xe vừa ghi nhận: khuôn mặt đang theo dõi thuộc về xe này.
-                    self.best_face = None
-                elif key in self.recent_confirms:
-                    # Xe này vừa được ghi trong thời gian chờ: coi như cùng một lượt.
-                    self.confirmed_key = key
-                    self.best_face = None
-                    self.observations.clear()
+                        if cooldown_token in self.recent_confirms:
+                            self.observations.clear()
+                        else:
+                            plate_cam = self.active_cam
+                            required_face_cam = 1 if direction == "IN" else 2
+                            self.latched = {
+                                "direction": direction,
+                                "plate_key": key,
+                                "plate_number": display,
+                                "vote_count": vote_count,
+                                "sample_count": sample_count,
+                                "consensus_rate": round(vote_share, 4),
+                                "plate_cam": plate_cam,
+                                "required_face_cam": required_face_cam,
+                                "latched_at": now,
+                            }
+                            self.face_window_start = None
+                            self.best_face = None
+                            self.observations.clear()
+                            # Chế độ 1 điện thoại đóng vai 2 Cam: tự động chuyển sang Cam đối diện để đón khuôn mặt
+                            if self.auto_switch_cam:
+                                self.active_cam = required_face_cam
+
+                # --------------------------------------------------------------
+                # PHA 2: Đã Lưu hờ Biển số -> Đợi Khuôn mặt chuẩn nhất ở Cam đối diện
+                # --------------------------------------------------------------
                 else:
-                    best_face = self.best_face
-                    self.confirm_seq += 1
-                    to_save = (
-                        {
-                            "_seq": self.confirm_seq,
-                            "plate_number": display,
-                            "recognized_at": datetime.now().replace(microsecond=0),
-                            "vote_count": vote_count,
-                            "sample_count": sample_count,
-                            "consensus_rate": round(vote_share, 4),
-                            "face_detected": best_face is not None,
-                            "face_confidence": best_face[1] if best_face else None,
-                            "camera_index": self.device_index,
-                        },
-                        best_face,
-                    )
-                    self.confirmed_key = key
-                    self.recent_confirms[key] = now
-                    self.best_face = None
-                    self.observations.clear()
+                    elapsed_latch = now - self.latched["latched_at"]
+                    if elapsed_latch > LATCH_TIMEOUT_SECONDS:
+                        self.gate_feedback = {
+                            "type": "warn",
+                            "message": (
+                                f"Đã hủy lưu hờ biển số {self.latched['plate_number']} "
+                                "do quá thời gian chờ khuôn mặt."
+                            ),
+                        }
+                        self.latched = None
+                        self.face_window_start = None
+                        self.best_face = None
+                    elif self.active_cam == self.latched["required_face_cam"]:
+                        valid_faces = [
+                            f for f in faces if f.confidence >= FACE_MIN_CONFIDENCE
+                        ]
+                        if valid_faces:
+                            candidate = max(valid_faces, key=_face_score)
+                            score = _face_score(candidate)
+                            if self.face_window_start is None:
+                                self.face_window_start = now
+                            if self.best_face is None or score > self.best_face[0]:
+                                self.best_face = (
+                                    score,
+                                    candidate.confidence,
+                                    frame,
+                                    candidate.box,
+                                )
+
+                        if (
+                            self.best_face is not None
+                            and self.face_window_start is not None
+                            and now - self.face_window_start
+                            >= FACE_SAMPLE_WINDOW_SECONDS
+                        ):
+                            latched_info = self.latched
+                            best_face = self.best_face
+                            self.confirm_seq += 1
+                            cooldown_token = (
+                                f"{latched_info['plate_key']}:{latched_info['direction']}"
+                            )
+                            self.recent_confirms[cooldown_token] = now
+
+                            commit_pair = (
+                                {
+                                    "_seq": self.confirm_seq,
+                                    "plate_number": latched_info["plate_number"],
+                                    "direction": latched_info["direction"],
+                                    "parking_status": (
+                                        "IN_PARKING"
+                                        if latched_info["direction"] == "IN"
+                                        else "EXITED"
+                                    ),
+                                    "recognized_at": datetime.now().replace(
+                                        microsecond=0
+                                    ),
+                                    "vote_count": latched_info["vote_count"],
+                                    "sample_count": latched_info["sample_count"],
+                                    "consensus_rate": latched_info["consensus_rate"],
+                                    "face_detected": True,
+                                    "face_confidence": best_face[1],
+                                    "camera_index": self.device_index,
+                                },
+                                best_face,
+                            )
+                            self.latched = None
+                            self.face_window_start = None
+                            self.best_face = None
 
             self.ambiguous_frame = len(readings) > 1
             self.plate_in_view = plate_present
@@ -736,11 +883,29 @@ class SystemState:
                 self.latest_jpeg = buffer.tobytes()
                 self.jpeg_seq += 1
 
-        if to_save is not None:
-            self._confirm_record(*to_save)
+        if commit_pair is not None:
+            self._commit_latched_pair(*commit_pair)
 
-    def _confirm_record(self, record: dict, best_face) -> None:
-        """Chạy ngoài lock: trích vector khuôn mặt rồi chuyển cho thread ghi DB."""
+    def _find_pending_active_session(self, plate_number: str) -> dict | None:
+        with self.db_write_lock:
+            for rec in reversed(self.pending_records):
+                if (
+                    rec.get("plate_number") == plate_number
+                    and rec.get("direction") == "IN"
+                    and rec.get("parking_status") == "IN_PARKING"
+                ):
+                    return {
+                        "id": None,
+                        "recognized_at": str(rec.get("recognized_at")),
+                        "embedding": rec.get("face_embedding"),
+                    }
+        return None
+
+    def _commit_latched_pair(self, record: dict, best_face) -> None:
+        """Trích xuất vector 512 chiều của Khuôn mặt chuẩn nhất và:
+        - Nếu là chiều VÀO ('IN'): Lưu đồng thời (Biển số + Khuôn mặt + VÀO) vào MySQL.
+        - Nếu là chiều RA ('OUT'): Đối chiếu Cosine với lượt VÀO; nếu Khớp >= 45% thì ghi vào MySQL,
+          nếu Lệch < 45% thì bật Cảnh báo an ninh chờ bảo vệ quyết định."""
         embedding = None
         if best_face is not None and self.face_service is not None:
             try:
@@ -749,15 +914,92 @@ class SystemState:
                 print(f"[WARN] Không trích xuất được vector khuôn mặt: {error}")
         record["face_embedding"] = embedding
 
+        direction = record["direction"]
+        plate = record["plate_number"]
+
+        if direction == "OUT":
+            check = None
+            with self.lock:
+                db_ready = self.database_ready
+            if db_ready:
+                try:
+                    check = verify_checkout_face(plate, embedding)
+                except (DatabaseConfigurationError, DatabaseOperationError) as error:
+                    self._set_db_status(False, str(error))
+
+            if check is None or not check.get("has_active_session"):
+                pending_sess = self._find_pending_active_session(plate)
+                if pending_sess is not None:
+                    prev_emb = pending_sess.get("embedding")
+                    if embedding and prev_emb:
+                        score = max(
+                            -1.0, min(1.0, cosine_similarity(embedding, prev_emb))
+                        )
+                        check = {
+                            "has_active_session": True,
+                            "entry_id": None,
+                            "entry_time": pending_sess["recognized_at"],
+                            "match_score": score,
+                            "matched": score >= FACE_MATCH_THRESHOLD,
+                        }
+
+            if check and check.get("has_active_session"):
+                record["entry_record_id"] = check.get("entry_id")
+                record["face_match_score"] = check.get("match_score")
+                score_val = check.get("match_score")
+                score_pct = (
+                    f"{max(0.0, float(score_val)):.0%}"
+                    if score_val is not None
+                    else "0%"
+                )
+
+                if not check.get("matched", False):
+                    with self.lock:
+                        self.security_alert = {
+                            "plate_number": plate,
+                            "entry_time": check.get("entry_time") or "-",
+                            "match_score_pct": score_pct,
+                            "face_confidence_pct": f"{record['face_confidence']:.0%}",
+                            "record": record,
+                        }
+                    return
+
+                with self.lock:
+                    self.gate_feedback = {
+                        "type": "success",
+                        "message": (
+                            f"RA BÃI THÀNH CÔNG: Xe {plate} — Khớp khuôn mặt người gửi "
+                            f"({score_pct}). Đã mở cổng cho xe ra!"
+                        ),
+                    }
+            else:
+                with self.lock:
+                    self.gate_feedback = {
+                        "type": "warn",
+                        "message": (
+                            f"Đã ghi nhận xe {plate} RA BÃI (không tìm thấy phiên gửi vào trước đó)."
+                        ),
+                    }
+        else:
+            with self.lock:
+                self.gate_feedback = {
+                    "type": "success",
+                    "message": (
+                        f"VÀO BÃI THÀNH CÔNG: Đã lưu đồng thời Biển số {plate} "
+                        f"+ Khuôn mặt ({record['face_confidence']:.0%}) vào MySQL!"
+                    ),
+                }
+
         preview = format_record_row("Mới", record)
         with self.lock:
             self.last_confirmed = {
                 "seq": record["_seq"],
                 "plate_number": record["plate_number"],
+                "direction": preview["Luồng"],
                 "recognized_at": preview["Thời gian nhận diện"],
                 "consensus": preview["Đồng thuận biển số"],
                 "face_status": preview["Khuôn mặt"],
-                "match_status": "Đang đối chiếu" if embedding else preview["Đối chiếu"],
+                "match_status": preview["Đối chiếu"],
             }
         self.write_queue.put(record)
 
@@ -793,6 +1035,15 @@ class StartCameraRequest(BaseModel):
     device_index: int = 0
 
 
+class SwitchCameraRequest(BaseModel):
+    active_cam: int | None = None
+    auto_switch: bool | None = None
+
+
+class ResolveAlertRequest(BaseModel):
+    action: str
+
+
 @app.get("/")
 def serve_index():
     return FileResponse(str(FRONTEND_DIR / "index.html"))
@@ -810,6 +1061,7 @@ def serve_app_js():
 
 @app.get("/api/camera/status")
 def get_camera_status():
+    now = time.monotonic()
     with state.lock:
         vote_info = None
         vote_res = get_vote_result(state.observations)
@@ -822,15 +1074,49 @@ def get_camera_status():
                 "vote_share": vote_share,
             }
 
+        latched_info = None
+        if state.latched is not None:
+            remaining = max(
+                0,
+                round(LATCH_TIMEOUT_SECONDS - (now - state.latched["latched_at"])),
+            )
+            latched_info = {
+                "direction": state.latched["direction"],
+                "direction_label": (
+                    "ĐI VÀO (Check-in)"
+                    if state.latched["direction"] == "IN"
+                    else "ĐI RA (Check-out)"
+                ),
+                "plate_number": state.latched["plate_number"],
+                "plate_cam": state.latched["plate_cam"],
+                "required_face_cam": state.latched["required_face_cam"],
+                "remaining_seconds": remaining,
+                "sampling_face": state.face_window_start is not None,
+            }
+
+        alert_info = None
+        if state.security_alert is not None:
+            alert_info = {
+                "plate_number": state.security_alert["plate_number"],
+                "entry_time": state.security_alert["entry_time"],
+                "match_score_pct": state.security_alert["match_score_pct"],
+                "face_confidence_pct": state.security_alert["face_confidence_pct"],
+            }
+
         return {
             "running": state.running,
             "device_index": state.device_index,
             "backend": state.backend_name,
+            "active_cam": state.active_cam,
+            "auto_switch_cam": state.auto_switch_cam,
             "frame_count": state.frame_count,
             "plate_in_view": state.plate_in_view,
             "current_plates": list(state.current_plates),
             "current_faces": list(state.current_faces),
             "vote": vote_info,
+            "latched": latched_info,
+            "security_alert": alert_info,
+            "gate_feedback": state.gate_feedback,
             "ambiguous_frame": state.ambiguous_frame,
             "error": state.camera_error,
             "last_confirmed": state.last_confirmed,
@@ -839,6 +1125,23 @@ def get_camera_status():
             "pending_count": len(state.pending_records),
             "face_matching": bool(state.face_service and state.face_service.can_embed),
         }
+
+
+@app.post("/api/camera/switch")
+def api_switch_camera(req: SwitchCameraRequest):
+    return state.switch_active_cam(req.active_cam, req.auto_switch)
+
+
+@app.post("/api/camera/cancel-latch")
+def api_cancel_latch():
+    state.cancel_latch()
+    return {"status": "cancelled"}
+
+
+@app.post("/api/camera/resolve-alert")
+def api_resolve_alert(req: ResolveAlertRequest):
+    approve = req.action.strip().lower() == "approve"
+    return state.resolve_security_alert(approve)
 
 
 @app.post("/api/camera/scan")
@@ -885,7 +1188,6 @@ def stream_camera():
                 seq = state.jpeg_seq
                 jpeg_bytes = state.latest_jpeg
 
-            # Chỉ gửi khi có khung hình mới, tránh gửi lặp cùng một ảnh.
             if jpeg_bytes is not None and seq != last_seq:
                 last_seq = seq
                 yield (
@@ -901,20 +1203,21 @@ def stream_camera():
 
 
 @app.get("/api/management/overview")
-def get_management_overview(q: str = "", face: str = "all", limit: int = HISTORY_LIMIT):
+def get_management_overview(
+    q: str = "", status: str = "all", limit: int = HISTORY_LIMIT
+):
     limit = max(1, min(limit, 1000))
     with state.lock:
         ready = state.database_ready
         pending_rows = []
         for rec in reversed(state.pending_records):
             row = format_record_row("Chờ lưu", rec)
-            row["Đối chiếu"] = "Chờ lưu" if rec.get("face_embedding") else "-"
             pending_rows.append(row)
 
     overview = None
     if ready:
         try:
-            overview = fetch_overview(q, face, limit)
+            overview = fetch_overview(q, status, limit)
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
             state._set_db_status(False, str(error))
 

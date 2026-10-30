@@ -52,7 +52,26 @@
           <!-- LEFT: 4:3 CAMERA PANEL -->
           <article class="panel camera-panel">
             <header class="panel-header">
-              <h2>Camera</h2>
+              <div class="cam-switcher" role="group" aria-label="Chọn góc nhìn Camera">
+                <button
+                  id="btn-cam-1"
+                  type="button"
+                  class="cam-switch-btn"
+                  data-cam="1"
+                  aria-pressed="false"
+                >
+                  Cam 1 · Phía trong
+                </button>
+                <button
+                  id="btn-cam-2"
+                  type="button"
+                  class="cam-switch-btn"
+                  data-cam="2"
+                  aria-pressed="true"
+                >
+                  Cam 2 · Phía ngoài
+                </button>
+              </div>
 
               <div class="camera-controls">
                 <label class="port-field" for="camera-index-input">
@@ -78,13 +97,39 @@
             </div>
           </article>
 
-          <!-- RIGHT: LIVE READOUT + RECENT 5 VEHICLES -->
+          <!-- RIGHT: LIVE READOUT + LATCH + ALERT + RECENT 5 VEHICLES -->
           <div class="side-stack">
+            <!-- SECURITY ALERT BOX (WHEN FACE MISMATCH ON EXIT) -->
+            <section id="security-alert-box" class="panel alert-panel hidden" role="alert">
+              <header class="panel-header">
+                <h2 class="alert-title">Cảnh báo lệch khuôn mặt khi lấy xe</h2>
+                <span id="alert-score-pill" class="pill neg num">Lệch 0%</span>
+              </header>
+              <p id="alert-detail-text" class="alert-desc"></p>
+              <div class="alert-actions">
+                <button id="btn-approve-exit" class="btn" type="button">Cho phép ra (Ngoại lệ)</button>
+                <button id="btn-reject-exit" class="btn danger" type="button">Từ chối (Giữ xe)</button>
+              </div>
+            </section>
+
             <section class="panel live-panel" aria-label="Đang nhận diện">
               <header class="panel-header">
-                <h2>Đang nhận diện</h2>
+                <div class="live-title-group">
+                  <h2>Đang nhận diện</h2>
+                  <span id="active-cam-role-pill" class="pill warn">Cam 2: Soi biển VÀO / Mặt RA</span>
+                </div>
                 <span id="live-vote-pill" class="pill num">0/3 mẫu</span>
               </header>
+
+              <!-- TWO-PHASE LATCH STATUS BOX -->
+              <div id="latch-status-box" class="latch-banner hidden">
+                <div class="latch-info">
+                  <span id="latch-direction-badge" class="pill pos">ĐI VÀO</span>
+                  <strong id="latch-plate-text" class="plate-cell-main num">-</strong>
+                  <span id="latch-step-text" class="latch-step">Chờ khuôn mặt ở Cam 1...</span>
+                </div>
+                <button id="btn-cancel-latch" class="btn btn-sm" type="button">Hủy</button>
+              </div>
 
               <div class="live-readout-grid">
                 <div class="live-box">
@@ -109,6 +154,7 @@
                   <thead>
                     <tr>
                       <th>Biển số</th>
+                      <th>Luồng</th>
                       <th>Khuôn mặt</th>
                       <th>Đối chiếu</th>
                       <th class="n">Thời gian</th>
@@ -116,7 +162,7 @@
                   </thead>
                   <tbody id="recent-mini-tbody">
                     <tr>
-                      <td colspan="4">Đang tải dữ liệu...</td>
+                      <td colspan="5">Đang tải dữ liệu...</td>
                     </tr>
                   </tbody>
                 </table>
@@ -133,18 +179,18 @@
         <!-- COMPACT STATS STRIP -->
         <div class="kpis" aria-label="Thống kê dữ liệu">
           <div class="kpi">
-            <div class="kpi-label">Tổng lượt lưu trữ</div>
-            <div class="kpi-value num" id="stat-total-records">0</div>
+            <div class="kpi-label">Đang gửi trong bãi</div>
+            <div class="kpi-value num" id="stat-in-parking">0</div>
           </div>
 
           <div class="kpi">
-            <div class="kpi-label">Hôm nay</div>
+            <div class="kpi-label">Lượt vào / ra hôm nay</div>
             <div class="kpi-value num" id="stat-today-records">0</div>
           </div>
 
           <div class="kpi">
-            <div class="kpi-label">Tỷ lệ có khuôn mặt</div>
-            <div class="kpi-value num" id="stat-face-rate">0%</div>
+            <div class="kpi-label">Tổng lượt lưu trữ</div>
+            <div class="kpi-value num" id="stat-total-records">0</div>
           </div>
 
           <div class="kpi">
@@ -164,10 +210,10 @@
               <thead>
                 <tr>
                   <th>Biển số xe</th>
+                  <th>Luồng</th>
                   <th>Khuôn mặt</th>
                   <th class="n">Đồng thuận</th>
                   <th class="n">Thời gian</th>
-                  <th class="n">Cổng</th>
                 </tr>
               </thead>
               <tbody id="pending-table-body"></tbody>
@@ -178,15 +224,18 @@
         <!-- RECOGNITION LEDGER -->
         <div class="panel ledger-panel">
           <div class="ledger-toolbar">
-            <div class="tabs" role="tablist" aria-label="Lọc theo khuôn mặt">
-              <button type="button" class="tab-link" role="tab" data-face-filter="all" aria-selected="true">
+            <div class="tabs" role="tablist" aria-label="Lọc theo trạng thái">
+              <button type="button" class="tab-link" role="tab" data-status-filter="all" aria-selected="true">
                 Tất cả (<span id="tab-count-all" class="num">0</span>)
               </button>
-              <button type="button" class="tab-link" role="tab" data-face-filter="with_face" aria-selected="false">
-                Có khuôn mặt (<span id="tab-count-face" class="num">0</span>)
+              <button type="button" class="tab-link" role="tab" data-status-filter="in_parking" aria-selected="false">
+                Đang gửi trong bãi (<span id="tab-count-parking" class="num">0</span>)
               </button>
-              <button type="button" class="tab-link" role="tab" data-face-filter="no_face" aria-selected="false">
-                Chưa rõ mặt (<span id="tab-count-noface" class="num">0</span>)
+              <button type="button" class="tab-link" role="tab" data-status-filter="direction_in" aria-selected="false">
+                Lượt vào (<span id="tab-count-in" class="num">0</span>)
+              </button>
+              <button type="button" class="tab-link" role="tab" data-status-filter="direction_out" aria-selected="false">
+                Lượt ra (<span id="tab-count-out" class="num">0</span>)
               </button>
             </div>
 
@@ -208,10 +257,11 @@
               <thead>
                 <tr>
                   <th>Biển số xe</th>
+                  <th>Luồng</th>
+                  <th>Trạng thái bãi</th>
                   <th>Khuôn mặt</th>
                   <th>Đối chiếu FaceNet</th>
-                  <th class="n">Mẫu đồng thuận</th>
-                  <th class="n">Tỷ lệ</th>
+                  <th class="n">Đồng thuận</th>
                   <th class="n">Thời gian</th>
                   <th class="n">Mã ghi</th>
                 </tr>

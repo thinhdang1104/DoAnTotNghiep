@@ -209,6 +209,12 @@ th.n,
   white-space: nowrap;
 }
 
+.btn-sm {
+  height: 28px;
+  padding: 0 10px;
+  font-size: var(--s-small);
+}
+
 .btn:hover:not(:disabled) {
   background: #252a32;
   border-color: #464e5c;
@@ -231,6 +237,52 @@ th.n,
 .btn.primary:hover:not(:disabled) {
   background: #dce1e8;
   border-color: #dce1e8;
+}
+
+.btn.danger {
+  background: var(--negative);
+  color: #ffffff;
+  border-color: var(--negative);
+  font-weight: 600;
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: #c94242;
+  border-color: #c94242;
+}
+
+/* Active Cam Switcher (Cam 1 / Cam 2) */
+.cam-switcher {
+  display: inline-flex;
+  align-items: center;
+  background: var(--ground);
+  padding: 3px;
+  border-radius: var(--r-ctl);
+  border: 1px solid var(--border);
+  gap: 4px;
+}
+
+.cam-switch-btn {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: var(--s-small);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.cam-switch-btn:hover {
+  color: var(--text);
+}
+
+.cam-switch-btn[aria-pressed="true"] {
+  background: var(--raised);
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .port-field {
@@ -288,6 +340,13 @@ th.n,
   color: var(--text);
 }
 
+.live-title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .camera-panel {
   display: flex;
   flex-direction: column;
@@ -335,6 +394,54 @@ th.n,
   flex: 1;
   display: flex;
   flex-direction: column;
+}
+
+/* Two-Phase Latch Banner */
+.latch-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  border-radius: var(--r-ctl);
+  background: #1d2116;
+  border: 1px solid #494220;
+}
+
+.latch-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.latch-step {
+  font-size: var(--s-small);
+  color: var(--text);
+}
+
+/* Security Alert Box */
+.alert-panel {
+  background: #231215;
+  border-color: #6b2930;
+}
+
+.alert-title {
+  color: #f27474 !important;
+}
+
+.alert-desc {
+  margin: 0 0 14px 0;
+  color: var(--text);
+  font-size: var(--s-body);
+}
+
+.alert-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
 }
 
 .live-readout-grid {
