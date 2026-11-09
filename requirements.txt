@@ -1,14 +1,8 @@
-# Lưu ý khi cài trên Python 3.12+ / Torch 2.3+:
-# facenet-pytorch==2.6.0 ghim cứng torch<2.3 và numpy<2.0 trong metadata dù chạy tốt với bản mới.
-# Vì vậy hãy cài các thư viện chính trước, sau đó cài facenet-pytorch với cờ --no-deps:
-#   pip install -r requirements.txt
-#   pip install --no-deps facenet-pytorch==2.6.0
-
 ultralytics>=8.0.0
 torch>=2.2.0
 torchvision>=0.17.0
 pillow>=10.2.0
-opencv-python>=4.9.0
+opencv-python-headless>=4.9.0
 numpy>=1.26.0
 fastapi>=0.110.0
 uvicorn>=0.30.0

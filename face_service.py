@@ -1,12 +1,20 @@
 """Phát hiện khuôn mặt (MTCNN) và trích xuất / đối chiếu đặc trưng khuôn mặt (FaceNet)."""
 
 from dataclasses import dataclass
+import os
+import subprocess
+import sys
 
 import cv2
 import numpy as np
 import torch
-from facenet_pytorch import InceptionResnetV1, MTCNN
 from PIL import Image
+
+try:
+    from facenet_pytorch import InceptionResnetV1, MTCNN
+except ImportError:
+    InceptionResnetV1 = None
+    MTCNN = None
 
 
 # Ngưỡng Cosine Similarity để coi hai vector là cùng một người.
@@ -49,8 +57,32 @@ def embedding_from_bytes(raw: bytes | None) -> list[float] | None:
 
 class FaceService:
     def __init__(self) -> None:
-        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.detector = MTCNN(keep_all=True, device=self.device, min_face_size=40)
+        global InceptionResnetV1, MTCNN
+        if MTCNN is None or InceptionResnetV1 is None:
+            print("[SYS] Đang cài đặt facenet-pytorch==2.6.0 (--no-deps) trong luồng nền...")
+            subprocess.check_call(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "-q",
+                    "--no-deps",
+                    "--root-user-action=ignore",
+                    "facenet-pytorch==2.6.0",
+                ]
+            )
+            from facenet_pytorch import InceptionResnetV1 as _IRV1, MTCNN as _MTCNN
+
+            InceptionResnetV1, MTCNN = _IRV1, _MTCNN
+
+        # Trên Hugging Face Spaces (đặc biệt ZeroGPU), không gọi torch.cuda.is_available() ở main process
+        if os.getenv("SPACE_ID") or os.getenv("FORCE_CPU") == "1":
+            self.device = "cpu"
+        else:
+            self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        min_face = 24 if self.device == "cpu" else 40
+        self.detector = MTCNN(keep_all=True, device=self.device, min_face_size=min_face)
         self.encoder: InceptionResnetV1 | None = None
         self.encoder_error: str | None = None
         try:
@@ -71,19 +103,29 @@ class FaceService:
 
     def detect_from_bgr(self, frame: np.ndarray) -> list[FaceData]:
         """Phát hiện khuôn mặt trên khung hình BGR, sắp xếp theo độ tin cậy giảm dần."""
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(rgb_frame)
         height, width = frame.shape[:2]
+        scale = 1.0
+        if self.device == "cpu" and width > 320:
+            scale = 320.0 / float(width)
+            small_w = 320
+            small_h = max(60, int(round(height * scale)))
+            small_bgr = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            rgb_frame = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2RGB)
+        else:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        boxes, probabilities = self.detector.detect(image)
+        image = Image.fromarray(rgb_frame)
+        with torch.inference_mode():
+            boxes, probabilities = self.detector.detect(image)
         if boxes is None or probabilities is None:
             return []
 
+        inv_scale = 1.0 / scale
         results: list[FaceData] = []
         for raw_box, probability in zip(boxes, probabilities):
             if probability is None or np.isnan(probability):
                 continue
-            x1, y1, x2, y2 = [int(round(float(val))) for val in raw_box]
+            x1, y1, x2, y2 = [int(round(float(val) * inv_scale)) for val in raw_box]
             x1, x2 = max(0, x1), min(width, x2)
             y1, y2 = max(0, y1), min(height, y2)
             if x1 >= x2 or y1 >= y2:

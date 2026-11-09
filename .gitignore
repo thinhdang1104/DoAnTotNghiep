@@ -24,6 +24,7 @@ last.pt
 .agents/
 .taste-skill/
 skills-lock.json
+GEMINI.md
 
 # OS
 .DS_Store
