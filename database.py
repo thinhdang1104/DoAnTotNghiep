@@ -226,6 +226,36 @@ def _make_demo_embedding(seed_idx: int, shift: float = 0.0) -> list[float]:
     return [v / norm for v in raw]
 
 
+def _make_demo_row(
+    plate: str,
+    direction: str,
+    rec_time: datetime,
+    vc: int,
+    sc: int,
+    rate: float,
+    f_conf: float,
+    seed_idx: int,
+    shift: float = 0.0,
+    m_score: float | None = None,
+) -> dict:
+    is_in = direction == "IN"
+    return {
+        "plate_number": plate,
+        "direction": direction,
+        "parking_status": "IN_PARKING" if is_in else "EXITED",
+        "fee_amount": PARKING_FEE_VND if is_in else 0,
+        "recognized_at": rec_time,
+        "vote_count": vc,
+        "sample_count": sc,
+        "consensus_rate": rate,
+        "face_detected": True,
+        "face_confidence": f_conf,
+        "face_embedding": _make_demo_embedding(seed_idx, shift),
+        "face_match_score": m_score,
+        "camera_index": 2 if is_in else 1,
+    }
+
+
 def _build_demo_records_list() -> list[dict]:
     now = datetime.now().replace(microsecond=0)
     records: list[dict] = []
@@ -248,41 +278,11 @@ def _build_demo_records_list() -> list[dict]:
             hour=7, minute=(s_idx * 7) % 55, second=12
         )
         out_time = in_time + timedelta(minutes=dur_min)
-        emb_in = _make_demo_embedding(s_idx, 0.0)
-        emb_out = _make_demo_embedding(s_idx, 0.06)
+        records.append(_make_demo_row(plate, "IN", in_time, vc, sc, rate, f_conf, s_idx, 0.0))
         records.append(
-            {
-                "plate_number": plate,
-                "direction": "IN",
-                "parking_status": "IN_PARKING",
-                "fee_amount": PARKING_FEE_VND,
-                "recognized_at": in_time,
-                "vote_count": vc,
-                "sample_count": sc,
-                "consensus_rate": rate,
-                "face_detected": True,
-                "face_confidence": f_conf,
-                "face_embedding": emb_in,
-                "face_match_score": None,
-                "camera_index": 2,
-            }
-        )
-        records.append(
-            {
-                "plate_number": plate,
-                "direction": "OUT",
-                "parking_status": "EXITED",
-                "fee_amount": 0,
-                "recognized_at": out_time,
-                "vote_count": vc,
-                "sample_count": sc,
-                "consensus_rate": rate,
-                "face_detected": True,
-                "face_confidence": round(max(0.92, f_conf - 0.01), 2),
-                "face_embedding": emb_out,
-                "face_match_score": m_score,
-                "camera_index": 1,
-            }
+            _make_demo_row(
+                plate, "OUT", out_time, vc, sc, rate, round(max(0.92, f_conf - 0.01), 2), s_idx, 0.06, m_score
+            )
         )
 
     # 2. Các lượt xe đã gửi và đã lấy xe RA trong ngày HÔM NAY
@@ -301,41 +301,11 @@ def _build_demo_records_list() -> list[dict]:
         out_time = now - timedelta(minutes=out_mins_ago)
         if out_time <= in_time:
             out_time = in_time + timedelta(minutes=25)
-        emb_in = _make_demo_embedding(s_idx, 0.0)
-        emb_out = _make_demo_embedding(s_idx, 0.05)
+        records.append(_make_demo_row(plate, "IN", in_time, vc, sc, rate, f_conf, s_idx, 0.0))
         records.append(
-            {
-                "plate_number": plate,
-                "direction": "IN",
-                "parking_status": "IN_PARKING",
-                "fee_amount": PARKING_FEE_VND,
-                "recognized_at": in_time,
-                "vote_count": vc,
-                "sample_count": sc,
-                "consensus_rate": rate,
-                "face_detected": True,
-                "face_confidence": f_conf,
-                "face_embedding": emb_in,
-                "face_match_score": None,
-                "camera_index": 2,
-            }
-        )
-        records.append(
-            {
-                "plate_number": plate,
-                "direction": "OUT",
-                "parking_status": "EXITED",
-                "fee_amount": 0,
-                "recognized_at": out_time,
-                "vote_count": vc,
-                "sample_count": sc,
-                "consensus_rate": rate,
-                "face_detected": True,
-                "face_confidence": round(max(0.93, f_conf - 0.01), 2),
-                "face_embedding": emb_out,
-                "face_match_score": m_score,
-                "camera_index": 1,
-            }
+            _make_demo_row(
+                plate, "OUT", out_time, vc, sc, rate, round(max(0.93, f_conf - 0.01), 2), s_idx, 0.05, m_score
+            )
         )
 
     # 3. Các xe hiện ĐANG GỬI TRONG BÃI (IN_PARKING) hôm nay
@@ -351,23 +321,7 @@ def _build_demo_records_list() -> list[dict]:
         in_time = now - timedelta(minutes=mins_ago)
         if in_time.date() != now.date():
             in_time = now.replace(hour=max(0, now.hour - 1), minute=35, second=0)
-        records.append(
-            {
-                "plate_number": plate,
-                "direction": "IN",
-                "parking_status": "IN_PARKING",
-                "fee_amount": PARKING_FEE_VND,
-                "recognized_at": in_time,
-                "vote_count": vc,
-                "sample_count": sc,
-                "consensus_rate": rate,
-                "face_detected": True,
-                "face_confidence": f_conf,
-                "face_embedding": _make_demo_embedding(s_idx, 0.0),
-                "face_match_score": None,
-                "camera_index": 2,
-            }
-        )
+        records.append(_make_demo_row(plate, "IN", in_time, vc, sc, rate, f_conf, s_idx, 0.0))
 
     return records
 
@@ -762,7 +716,6 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
     daily_rows = [
         {
             "period": row["period_label"],
-            "label": row["period_label"],
             "tickets": int(row["ticket_count"] or 0),
             "unit_price": PARKING_FEE_VND,
             "revenue": int(row["total_vnd"] or 0),
@@ -787,7 +740,6 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
     monthly_rows = [
         {
             "period": f"Tháng {row['period_label']}",
-            "label": f"Tháng {row['period_label']}",
             "tickets": int(row["ticket_count"] or 0),
             "unit_price": PARKING_FEE_VND,
             "revenue": int(row["total_vnd"] or 0),
@@ -812,7 +764,6 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
     yearly_rows = [
         {
             "period": f"Năm {row['period_label']}",
-            "label": f"Năm {row['period_label']}",
             "tickets": int(row["ticket_count"] or 0),
             "unit_price": PARKING_FEE_VND,
             "revenue": int(row["total_vnd"] or 0),
@@ -822,7 +773,6 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
 
     return {
         "unit_price": PARKING_FEE_VND,
-        "unit_fee": PARKING_FEE_VND,
         "today": {
             "tickets": int(summary.get("tickets_today") or 0),
             "revenue": int(summary.get("revenue_today") or 0),
@@ -886,7 +836,6 @@ def _fetch_revenue_report_sqlite(cur: sqlite3.Cursor) -> dict:
     daily_rows = [
         {
             "period": row["period_label"] or row["sort_date"],
-            "label": row["period_label"] or row["sort_date"],
             "tickets": int(row["ticket_count"] or 0),
             "unit_price": PARKING_FEE_VND,
             "revenue": int(row["total_vnd"] or 0),
@@ -911,7 +860,6 @@ def _fetch_revenue_report_sqlite(cur: sqlite3.Cursor) -> dict:
     monthly_rows = [
         {
             "period": f"Tháng {row['period_label'] or row['sort_month']}",
-            "label": f"Tháng {row['period_label'] or row['sort_month']}",
             "tickets": int(row["ticket_count"] or 0),
             "unit_price": PARKING_FEE_VND,
             "revenue": int(row["total_vnd"] or 0),
@@ -935,7 +883,6 @@ def _fetch_revenue_report_sqlite(cur: sqlite3.Cursor) -> dict:
     yearly_rows = [
         {
             "period": f"Năm {row['period_label']}",
-            "label": f"Năm {row['period_label']}",
             "tickets": int(row["ticket_count"] or 0),
             "unit_price": PARKING_FEE_VND,
             "revenue": int(row["total_vnd"] or 0),
@@ -945,7 +892,6 @@ def _fetch_revenue_report_sqlite(cur: sqlite3.Cursor) -> dict:
 
     return {
         "unit_price": PARKING_FEE_VND,
-        "unit_fee": PARKING_FEE_VND,
         "today": {
             "tickets": int(summary["tickets_today"] or 0) if summary else 0,
             "revenue": int(summary["revenue_today"] or 0) if summary else 0,

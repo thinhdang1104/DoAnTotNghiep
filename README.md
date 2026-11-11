@@ -48,8 +48,9 @@ Hệ thống tự động hóa quy trình kiểm soát phương tiện ra/vào b
 ├── face_service.py          # Module AI Khuôn mặt (MTCNN + InceptionResnetV1 512-D & Cosine Similarity)
 ├── database.py              # Tầng lưu trữ dữ liệu (Hỗ trợ MySQL Local & SQLite Cloud Fallback)
 ├── app.py                   # Entrypoint tích hợp Gradio + FastAPI cho Hugging Face Spaces (ZeroGPU)
-├── train.py                 # Script huấn luyện mô hình YOLOv8 nhận diện biển số & ký tự
-├── test.py                  # Script kiểm thử nhanh mô hình YOLOv8 trên ảnh/video
+├── training/
+│   ├── train_plates.py      # Script huấn luyện mô hình YOLOv8 phát hiện biển số
+│   └── train_chars.py       # Script huấn luyện mô hình YOLOv8 phân đoạn & đọc ký tự OCR
 ├── weights/
 │   ├── plate_best.pt        # Trọng số YOLOv8 phát hiện biển số xe
 │   └── chars_best.pt        # Trọng số YOLOv8 phân đoạn & nhận diện ký tự OCR
@@ -85,7 +86,7 @@ pip install -r requirements.txt
    MYSQL_PASSWORD=your_password
    MYSQL_DATABASE=license_plate_db
    ```
-   *(Lưu ý: Hệ thống sẽ tự động tạo database `license_plate_db` và bảng `parking_history` khi khởi động. Nếu chưa bật MySQL, hệ thống có cơ chế lưu tạm thông minh và tự động đồng bộ khi MySQL kết nối lại).*
+   *(Lưu ý: Hệ thống sẽ tự động tạo bảng `plate_recognition_history` khi khởi động. Nếu chưa bật MySQL, hệ thống có cơ chế lưu tạm thông minh hoặc chuyển sang SQLite dự phòng).*
 
 ### Bước 3: Khởi chạy ứng dụng
 ```bash

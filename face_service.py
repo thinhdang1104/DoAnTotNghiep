@@ -18,7 +18,7 @@ except ImportError:
 
 
 # Ngưỡng Cosine Similarity để coi hai vector là cùng một người.
-FACE_MATCH_THRESHOLD = 0.45
+FACE_MATCH_THRESHOLD = 0.65
 EMBEDDING_SIZE = 512
 
 

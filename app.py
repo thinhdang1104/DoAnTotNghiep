@@ -6,7 +6,6 @@ Chạy cục bộ thì dùng `python main.py` như bình thường.
 """
 
 import os
-import threading
 
 # Tắt Node SSR proxy của Gradio 6 (proxy này chặn các route FastAPI được gắn thêm).
 os.environ["GRADIO_SSR_MODE"] = "false"
@@ -24,8 +23,6 @@ except ImportError:
 
 import gradio as gr
 from main import (
-    DatabaseConfigurationError,
-    DatabaseOperationError,
     app as fastapi_app,
     state,
 )
@@ -70,15 +67,7 @@ with gr.Blocks(title="Hệ thống Quản lý Bãi giữ xe AI (2 Camera)") as d
 
 def _init_backend_services() -> None:
     """Tương đương `lifespan` của FastAPI (lifespan không chạy khi route được gắn vào Gradio)."""
-    state.load_pending_from_disk()
-    try:
-        flushed = state.connect_database()
-        if flushed:
-            print(f"[DB] Đã đồng bộ {flushed} bản ghi chờ từ lần chạy trước.")
-    except (DatabaseConfigurationError, DatabaseOperationError) as error:
-        print(f"[WARN] Chưa kết nối được DB, bản ghi sẽ được lưu tạm: {error}")
-    state.start_db_writer()
-    threading.Thread(target=state.load_ai_models, daemon=True).start()
+    state.startup()
 
 
 def _attach_fastapi_routes(gr_app) -> None:

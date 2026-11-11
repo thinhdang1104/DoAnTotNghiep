@@ -1308,7 +1308,7 @@ class SystemState:
         """Trích xuất vector 512 chiều của Khuôn mặt chuẩn nhất và:
         - Nếu là chiều VÀO ('IN'): Lưu đồng thời (Biển số Cam 2 + Khuôn mặt Cam 1 + VÀO) vào MySQL.
         - Nếu là chiều RA ('OUT'): Đối chiếu Cosine giữa Khuôn mặt Cam 2 với lượt VÀO;
-          nếu Khớp >= 45% thì ghi vào MySQL, nếu Lệch < 45% thì bật Cảnh báo an ninh."""
+          nếu Khớp >= 65% thì ghi vào MySQL, nếu Lệch < 65% thì bật Cảnh báo an ninh."""
         plate_key = record.pop("_plate_key", "")
         embedding = None
         if best_face is not None and self.face_service is not None:
@@ -1410,22 +1410,25 @@ class SystemState:
             }
         self.write_queue.put(record)
 
+    def startup(self) -> None:
+        self.load_pending_from_disk()
+        try:
+            flushed = self.connect_database()
+            if flushed:
+                print(f"[DB] Đã đồng bộ {flushed} bản ghi chờ từ lần chạy trước.")
+        except (DatabaseConfigurationError, DatabaseOperationError) as error:
+            print(f"[WARN] Chưa kết nối được MySQL, bản ghi sẽ được lưu tạm: {error}")
+        self.start_db_writer()
+        # Tải mô hình AI trong luồng nền để cổng HTTP mở ngay lập tức (tránh timeout trên Cloud)
+        threading.Thread(target=self.load_ai_models, daemon=True).start()
+
 
 state = SystemState()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    state.load_pending_from_disk()
-    try:
-        flushed = state.connect_database()
-        if flushed:
-            print(f"[DB] Đã đồng bộ {flushed} bản ghi chờ từ lần chạy trước.")
-    except (DatabaseConfigurationError, DatabaseOperationError) as error:
-        print(f"[WARN] Chưa kết nối được MySQL, bản ghi sẽ được lưu tạm: {error}")
-    state.start_db_writer()
-    # Tải mô hình AI trong luồng nền để cổng HTTP 7860 mở ngay lập tức (tránh timeout trên Cloud)
-    threading.Thread(target=state.load_ai_models, daemon=True).start()
+    state.startup()
     try:
         yield
     finally:

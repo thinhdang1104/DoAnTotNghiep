@@ -161,7 +161,7 @@
     activateView("view-management");
   }
 
-  function updateDatabaseStatusUI(serverOnline, dbReady, pendingCount) {
+  function updatePendingBadgeUI(pendingCount) {
     if (navPendingBadge) {
       if (pendingCount > 0) {
         navPendingBadge.textContent = String(pendingCount);
@@ -874,7 +874,7 @@
       const state = await res.json();
       if (isStartingCamera) return;
 
-      updateDatabaseStatusUI(true, state.database_ready, state.pending_count);
+      updatePendingBadgeUI(state.pending_count);
 
       if (!didInitialStaleCheck) {
         didInitialStaleCheck = true;
@@ -998,7 +998,7 @@
         alertScorePill.textContent = `Độ khớp: ${state.security_alert.match_score_pct}`;
         alertDetailText.textContent =
           `Xe ${state.security_alert.plate_number} (gửi lúc ${state.security_alert.entry_time}) ` +
-          `có khuôn mặt người lấy xe tại Cam 2 LỆCH so với lúc gửi vào ở Cam 1 (Cosine ${state.security_alert.match_score_pct} < 45%).`;
+          `có khuôn mặt người lấy xe tại Cam 2 LỆCH so với lúc gửi vào ở Cam 1 (Cosine ${state.security_alert.match_score_pct} < 65%).`;
       } else {
         securityAlertBox.classList.add("hidden");
       }
@@ -1013,7 +1013,7 @@
         fetchManagementOverview();
       }
     } catch {
-      updateDatabaseStatusUI(false, false, 0);
+      updatePendingBadgeUI(0);
     }
   }
 
@@ -1040,9 +1040,7 @@
       revenuePeriodColTitle.textContent = titleMap[activeRevenuePeriod] || "Kỳ thống kê";
     }
 
-    const unitFee =
-      (cachedRevenueData && (cachedRevenueData.unit_price || cachedRevenueData.unit_fee)) ||
-      2000;
+    const unitFee = (cachedRevenueData && cachedRevenueData.unit_price) || 2000;
     const unitFeeText = formatVnd(unitFee);
     const rows =
       (cachedRevenueData && cachedRevenueData[activeRevenuePeriod]) || [];
@@ -1060,10 +1058,10 @@
       .map(
         (item) => `
           <tr>
-            <td class="mono-num num"><strong>${escapeHtml(item.period || item.label)}</strong></td>
+            <td class="mono-num num"><strong>${escapeHtml(item.period)}</strong></td>
             <td class="n mono-num num">${escapeHtml(item.tickets)} lượt</td>
             <td class="n mono-num num">${escapeHtml(unitFeeText)}</td>
-            <td class="n mono-num num"><span class="fee-cell-amount">${escapeHtml(item.revenue_formatted || formatVnd(item.revenue))}</span></td>
+            <td class="n mono-num num"><span class="fee-cell-amount">${escapeHtml(formatVnd(item.revenue))}</span></td>
           </tr>
         `
       )
@@ -1072,21 +1070,21 @@
 
   function renderRevenueSection(revenue) {
     cachedRevenueData = revenue || null;
-    const today = (revenue && revenue.today) || { tickets: 0, revenue: 0, revenue_formatted: "0 đ" };
-    const month = (revenue && revenue.month) || { tickets: 0, revenue: 0, revenue_formatted: "0 đ" };
-    const year = (revenue && revenue.year) || { tickets: 0, revenue: 0, revenue_formatted: "0 đ" };
-    const total = (revenue && revenue.total) || { tickets: 0, revenue: 0, revenue_formatted: "0 đ" };
+    const today = (revenue && revenue.today) || { tickets: 0, revenue: 0 };
+    const month = (revenue && revenue.month) || { tickets: 0, revenue: 0 };
+    const year = (revenue && revenue.year) || { tickets: 0, revenue: 0 };
+    const total = (revenue && revenue.total) || { tickets: 0, revenue: 0 };
 
-    if (revTodayAmount) revTodayAmount.textContent = today.revenue_formatted || formatVnd(today.revenue);
+    if (revTodayAmount) revTodayAmount.textContent = formatVnd(today.revenue);
     if (revTodayTickets) revTodayTickets.textContent = `${today.tickets ?? 0} lượt gửi xe`;
 
-    if (revMonthAmount) revMonthAmount.textContent = month.revenue_formatted || formatVnd(month.revenue);
+    if (revMonthAmount) revMonthAmount.textContent = formatVnd(month.revenue);
     if (revMonthTickets) revMonthTickets.textContent = `${month.tickets ?? 0} lượt gửi xe`;
 
-    if (revYearAmount) revYearAmount.textContent = year.revenue_formatted || formatVnd(year.revenue);
+    if (revYearAmount) revYearAmount.textContent = formatVnd(year.revenue);
     if (revYearTickets) revYearTickets.textContent = `${year.tickets ?? 0} lượt gửi xe`;
 
-    if (revTotalAmount) revTotalAmount.textContent = total.revenue_formatted || formatVnd(total.revenue);
+    if (revTotalAmount) revTotalAmount.textContent = formatVnd(total.revenue);
     if (revTotalTickets) revTotalTickets.textContent = `${total.tickets ?? 0} lượt gửi xe`;
 
     renderRevenueBreakdownTable();
@@ -1256,7 +1254,7 @@
       total_out: 0,
     };
 
-    updateDatabaseStatusUI(true, data.database_ready, pending.length);
+    updatePendingBadgeUI(pending.length);
 
     if (statInParking) statInParking.textContent = String(stats.in_parking ?? 0);
     statTodayRecords.textContent = String(stats.today_records ?? 0);
@@ -1319,7 +1317,7 @@
       }
       applyManagementData(data);
     } catch {
-      updateDatabaseStatusUI(false, false, 0);
+      updatePendingBadgeUI(0);
       showBanner(managementAlertBox, "error", "Không kết nối được tới máy chủ FastAPI.");
     }
   }
