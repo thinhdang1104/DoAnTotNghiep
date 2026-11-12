@@ -63,7 +63,8 @@ def _connection_config():
         "user": os.environ["MYSQL_USER"],
         "password": os.environ["MYSQL_PASSWORD"],
         "database": os.environ["MYSQL_DATABASE"],
-        "connection_timeout": 10,
+        "connection_timeout": 8,
+        "use_pure": True,
     }
 
 
@@ -102,11 +103,19 @@ def _ensure_sqlite_table(conn: sqlite3.Connection) -> None:
                 face_confidence REAL NULL,
                 face_embedding BLOB NULL,
                 face_match_score REAL NULL,
+                plate_image TEXT NULL,
+                face_image TEXT NULL,
                 camera_index INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
             )
             """
         )
+        cur.execute("PRAGMA table_info(plate_recognition_history)")
+        sqlite_cols = {row[1] for row in cur.fetchall()}
+        if "plate_image" not in sqlite_cols:
+            cur.execute("ALTER TABLE plate_recognition_history ADD COLUMN plate_image TEXT NULL")
+        if "face_image" not in sqlite_cols:
+            cur.execute("ALTER TABLE plate_recognition_history ADD COLUMN face_image TEXT NULL")
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_sqlite_plate_rec ON plate_recognition_history (plate_number, recognized_at)"
         )
@@ -140,6 +149,8 @@ def _ensure_mysql_table(cursor):
             face_confidence DECIMAL(5, 4) NULL,
             face_embedding BLOB NULL,
             face_match_score DECIMAL(5, 4) NULL,
+            plate_image LONGTEXT NULL,
+            face_image LONGTEXT NULL,
             camera_index SMALLINT UNSIGNED NOT NULL,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_plate_recognized_at (plate_number, recognized_at),
@@ -192,6 +203,14 @@ def _ensure_mysql_table(cursor):
             "face_match_score",
             "ALTER TABLE plate_recognition_history "
             "ADD COLUMN face_match_score DECIMAL(5, 4) NULL",
+        ),
+        (
+            "plate_image",
+            "ALTER TABLE plate_recognition_history ADD COLUMN plate_image LONGTEXT NULL",
+        ),
+        (
+            "face_image",
+            "ALTER TABLE plate_recognition_history ADD COLUMN face_image LONGTEXT NULL",
         ),
     ]
     for col_name, ddl in column_migrations:
@@ -327,11 +346,11 @@ def _build_demo_records_list() -> list[dict]:
 
 
 def _demo_seeding_enabled() -> bool:
-    """Mặc định chỉ tự nạp dữ liệu demo khi chạy trên Hugging Face Spaces; có thể ép bằng SEED_DEMO_DATA."""
+    """Mặc định chỉ tự nạp dữ liệu demo khi dùng SQLite dự phòng trên Cloud; có thể ép bằng SEED_DEMO_DATA."""
     flag = os.getenv("SEED_DEMO_DATA")
     if flag is not None:
         return flag.strip().lower() in ("1", "true", "yes")
-    return bool(os.getenv("SPACE_ID"))
+    return bool(os.getenv("SPACE_ID")) and _ACTIVE_BACKEND == "sqlite"
 
 
 def seed_demo_records_if_empty() -> int:
@@ -496,6 +515,8 @@ def format_record_row(record_id, record: dict) -> dict:
         "Đối chiếu": format_match_label(
             direction, record.get("face_match_score"), has_emb
         ),
+        "plate_image": record.get("plate_image"),
+        "face_image": record.get("face_image"),
         "Camera index": record["camera_index"],
     }
 
@@ -982,7 +1003,7 @@ def fetch_overview(
                            fee_amount, recognized_at, vote_count, sample_count,
                            consensus_rate, face_detected, face_confidence,
                            (face_embedding IS NOT NULL) AS face_embedding, face_match_score,
-                           camera_index
+                           plate_image, face_image, camera_index
                     FROM plate_recognition_history
                     {where_sql}
                     ORDER BY recognized_at DESC, id DESC
@@ -1070,7 +1091,7 @@ def fetch_overview(
                    fee_amount, recognized_at, vote_count, sample_count,
                    consensus_rate, face_detected, face_confidence,
                    face_embedding IS NOT NULL AS face_embedding, face_match_score,
-                   camera_index
+                   plate_image, face_image, camera_index
             FROM plate_recognition_history
             {where_sql}
             ORDER BY recognized_at DESC, id DESC
@@ -1159,9 +1180,9 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                         plate_number, direction, parking_status, entry_record_id,
                         fee_amount, recognized_at, vote_count, sample_count,
                         consensus_rate, face_detected, face_confidence,
-                        face_embedding, face_match_score, camera_index
+                        face_embedding, face_match_score, plate_image, face_image, camera_index
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["plate_number"],
@@ -1177,6 +1198,8 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                         record.get("face_confidence"),
                         embedding_to_bytes(embedding) if embedding else None,
                         match_score,
+                        record.get("plate_image"),
+                        record.get("face_image"),
                         record["camera_index"],
                     ),
                 )
@@ -1239,9 +1262,9 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                 plate_number, direction, parking_status, entry_record_id,
                 fee_amount, recognized_at, vote_count, sample_count,
                 consensus_rate, face_detected, face_confidence,
-                face_embedding, face_match_score, camera_index
+                face_embedding, face_match_score, plate_image, face_image, camera_index
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 record["plate_number"],
@@ -1257,6 +1280,8 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                 record.get("face_confidence"),
                 embedding_to_bytes(embedding) if embedding else None,
                 match_score,
+                record.get("plate_image"),
+                record.get("face_image"),
                 record["camera_index"],
             ),
         )

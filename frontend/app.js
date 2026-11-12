@@ -2,7 +2,8 @@
   // Navigation & Topbar elements
   const navRecognition = document.getElementById("nav-recognition");
   const navManagement = document.getElementById("nav-management");
-  const navItems = [navRecognition, navManagement];
+  const navRevenue = document.getElementById("nav-revenue");
+  const navItems = [navRecognition, navManagement, navRevenue];
   const views = document.querySelectorAll(".screen-view");
   const navPendingBadge = document.getElementById("nav-pending-badge");
   const streamLiveDot = document.getElementById("stream-live-dot");
@@ -89,6 +90,14 @@
   const pageSizeSelect = document.getElementById("page-size-select");
   const paginationControls = document.getElementById("pagination-controls");
 
+  // Snapshot modal elements
+  const snapshotModal = document.getElementById("snapshot-modal");
+  const snapshotModalTitle = document.getElementById("snapshot-modal-title");
+  const snapshotModalMeta = document.getElementById("snapshot-modal-meta");
+  const modalPlateImg = document.getElementById("modal-plate-img");
+  const modalFaceImg = document.getElementById("modal-face-img");
+  const btnCloseSnapshotModal = document.getElementById("btn-close-snapshot-modal");
+
   let activeStatusFilter = "all";
   let activeRevenuePeriod = "daily";
   let cachedRevenueData = null;
@@ -113,8 +122,12 @@
       .replace(/'/g, "&#039;");
   }
 
-  function showBanner(box, type, message) {
+  function showBanner(box, type, message, durationMs = 0) {
     if (!box) return;
+    if (box._hideTimer) {
+      clearTimeout(box._hideTimer);
+      box._hideTimer = null;
+    }
     if (!message) {
       box.className = "notice-banner hidden";
       box.textContent = "";
@@ -122,6 +135,13 @@
     }
     box.className = type ? `notice-banner notice-${type}` : "notice-banner";
     box.textContent = message;
+    if (durationMs > 0) {
+      box._hideTimer = setTimeout(() => {
+        box.className = "notice-banner hidden";
+        box.textContent = "";
+        box._hideTimer = null;
+      }, durationMs);
+    }
   }
 
   function activateView(targetId) {
@@ -139,7 +159,7 @@
       section.classList.toggle("active", section.id === targetId);
     });
 
-    if (targetId === "view-management") {
+    if (targetId === "view-management" || targetId === "view-revenue") {
       fetchManagementOverview();
     }
   }
@@ -178,36 +198,6 @@
       return `<span class="pill warn">${escapeHtml(str)}</span>`;
     }
     return `<span class="pill pos">${escapeHtml(str)}</span>`;
-  }
-
-  function renderParkingStatusPill(statusText) {
-    const str = String(statusText || "-");
-    if (str === "Đang gửi") {
-      return `<span class="pill warn">${escapeHtml(str)}</span>`;
-    }
-    return `<span class="pill">${escapeHtml(str)}</span>`;
-  }
-
-  function renderFacePill(faceText) {
-    const str = String(faceText || "");
-    if (str.startsWith("Có")) {
-      return `<span class="pill pos">${escapeHtml(str)}</span>`;
-    }
-    return `<span class="pill">${escapeHtml(str || "Không rõ")}</span>`;
-  }
-
-  function renderMatchPill(matchText) {
-    const str = String(matchText || "-");
-    if (str.startsWith("Khớp")) {
-      return `<span class="pill pos">${escapeHtml(str)}</span>`;
-    }
-    if (str.startsWith("Lệch")) {
-      return `<span class="pill neg">${escapeHtml(str)}</span>`;
-    }
-    if (str === "Đã lưu mẫu mặt" || str === "Chờ lưu") {
-      return `<span class="pill warn">${escapeHtml(str)}</span>`;
-    }
-    return `<span class="pill">${escapeHtml(str)}</span>`;
   }
 
   // ==================== LATCH & ALERT CONTROLS ====================
@@ -923,7 +913,8 @@
         showBanner(
           cameraAlertBox,
           state.gate_feedback.type || "success",
-          state.gate_feedback.message
+          state.gate_feedback.message,
+          1000
         );
       }
 
@@ -1100,13 +1091,103 @@
   });
 
   // ==================== MANAGEMENT & HISTORY TABLE (WITH PAGINATION) ====================
-  function renderFeeCell(feeText) {
-    const str = String(feeText || "-");
-    if (str.endsWith("đ")) {
-      return `<span class="fee-cell-amount mono-num num">${escapeHtml(str)}</span>`;
-    }
-    return `<span class="stamp">${escapeHtml(str)}</span>`;
+  function makeFallbackPlateSvg(plateText) {
+    const raw = String(plateText || "59A1-12345").trim();
+    const parts = raw.split("-");
+    const topLine = escapeHtml(parts[0] || raw);
+    const botLine = escapeHtml(parts[1] || "");
+    const svg = botLine
+      ? `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="96" viewBox="0 0 200 96">
+          <rect x="3" y="3" width="194" height="90" rx="8" fill="#f8fafc" stroke="#1e293b" stroke-width="4"/>
+          <rect x="7" y="7" width="186" height="82" rx="5" fill="none" stroke="#0f172a" stroke-width="1.5"/>
+          <text x="100" y="42" text-anchor="middle" font-family="JetBrains Mono, monospace" font-weight="800" font-size="28" fill="#0f172a">${topLine}</text>
+          <text x="100" y="78" text-anchor="middle" font-family="JetBrains Mono, monospace" font-weight="800" font-size="28" fill="#0f172a">${botLine}</text>
+        </svg>`
+      : `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="96" viewBox="0 0 200 96">
+          <rect x="3" y="3" width="194" height="90" rx="8" fill="#f8fafc" stroke="#1e293b" stroke-width="4"/>
+          <text x="100" y="58" text-anchor="middle" font-family="JetBrains Mono, monospace" font-weight="800" font-size="24" fill="#0f172a">${topLine}</text>
+        </svg>`;
+    return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
   }
+
+  function makeFallbackFaceSvg(plateText, faceLabel) {
+    const seed = Array.from(String(plateText || "X")).reduce((s, c) => s + c.charCodeAt(0), 0);
+    const hues = [200, 265, 150, 32, 330, 185];
+    const hue = hues[seed % hues.length];
+    const conf = escapeHtml(String(faceLabel || "98%").replace(/[^0-9%]/g, "") || "AI");
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+      <rect width="160" height="160" rx="16" fill="hsl(${hue}, 35%, 16%)"/>
+      <circle cx="80" cy="58" r="28" fill="hsl(${hue}, 70%, 65%)"/>
+      <path d="M32 138 C32 102, 128 102, 128 138" fill="hsl(${hue}, 70%, 65%)"/>
+      <rect x="14" y="14" width="132" height="132" rx="10" fill="none" stroke="#d946ef" stroke-width="3" stroke-dasharray="10 6"/>
+      <rect x="86" y="118" width="56" height="24" rx="5" fill="rgba(6,7,9,0.82)"/>
+      <text x="114" y="135" text-anchor="middle" font-family="JetBrains Mono, monospace" font-weight="700" font-size="13" fill="#f0abfc">${conf}</text>
+    </svg>`;
+    return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+  }
+
+  function getRowSnapshots(row) {
+    const plateImg = row.plate_image || makeFallbackPlateSvg(row["Biển số"]);
+    const faceImg = row.face_image || makeFallbackFaceSvg(row["Biển số"], row["Khuôn mặt"]);
+    return { plateImg, faceImg };
+  }
+
+  function renderSnapshotCell(row) {
+    const { plateImg, faceImg } = getRowSnapshots(row);
+    const payload = encodeURIComponent(
+      JSON.stringify({
+        plate: row["Biển số"],
+        direction: row["Luồng"],
+        time: row["Thời gian nhận diện"],
+        match: row["Đối chiếu"] || "-",
+        plateImg,
+        faceImg,
+      })
+    );
+    return `
+      <div class="snapshot-cell">
+        <button type="button" class="snap-thumb-btn" data-snapshot="${payload}" title="Bấm để phóng to ảnh cắt Biển số & Khuôn mặt">
+          <img class="snap-plate-img" src="${plateImg}" alt="Biển số ${escapeHtml(row["Biển số"])}" loading="lazy" />
+          <img class="snap-face-img" src="${faceImg}" alt="Khuôn mặt ${escapeHtml(row["Biển số"])}" loading="lazy" />
+        </button>
+      </div>
+    `;
+  }
+
+  function openSnapshotModal(info) {
+    if (!snapshotModal || !info) return;
+    if (snapshotModalTitle) {
+      snapshotModalTitle.textContent = `Ảnh cắt: ${info.plate} (${info.direction})`;
+    }
+    if (snapshotModalMeta) {
+      snapshotModalMeta.textContent = `Thời gian: ${info.time} · Đối chiếu FaceNet: ${info.match}`;
+    }
+    if (modalPlateImg) modalPlateImg.src = info.plateImg || "";
+    if (modalFaceImg) modalFaceImg.src = info.faceImg || "";
+    snapshotModal.classList.remove("hidden");
+  }
+
+  function closeSnapshotModal() {
+    if (!snapshotModal) return;
+    snapshotModal.classList.add("hidden");
+  }
+
+  if (btnCloseSnapshotModal) {
+    btnCloseSnapshotModal.addEventListener("click", closeSnapshotModal);
+  }
+  if (snapshotModal) {
+    snapshotModal.addEventListener("click", (e) => {
+      if (e.target === snapshotModal) closeSnapshotModal();
+    });
+  }
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-snapshot]");
+    if (!btn) return;
+    try {
+      const info = JSON.parse(decodeURIComponent(btn.getAttribute("data-snapshot") || ""));
+      openSnapshotModal(info);
+    } catch (_) {}
+  });
 
   function buildPageNumbers(totalPages, current) {
     if (totalPages <= 7) {
@@ -1191,7 +1272,7 @@
     if (totalItems === 0) {
       historyTableBody.innerHTML = `
         <tr>
-          <td colspan="9">Không có bản ghi nào khớp điều kiện lọc.</td>
+          <td colspan="5">Không có bản ghi nào khớp điều kiện lọc.</td>
         </tr>
       `;
       renderPaginationControls(0, 1);
@@ -1206,12 +1287,8 @@
         (row) => `
           <tr>
             <td><span class="plate-cell-main mono-num num">${escapeHtml(row["Biển số"])}</span></td>
+            <td>${renderSnapshotCell(row)}</td>
             <td>${renderDirectionPill(row["Luồng"])}</td>
-            <td>${renderParkingStatusPill(row["Trạng thái bãi"])}</td>
-            <td>${renderFacePill(row["Khuôn mặt"])}</td>
-            <td>${renderMatchPill(row["Đối chiếu"])}</td>
-            <td class="n mono-num num">${renderFeeCell(row["Phí giữ xe"])}</td>
-            <td class="n mono-num num">${escapeHtml(row["Đồng thuận biển số"] || "-")}</td>
             <td class="n mono-num num">${escapeHtml(row["Thời gian nhận diện"])}</td>
             <td class="n mono-num num">#${escapeHtml(row["ID"])}</td>
           </tr>
@@ -1281,9 +1358,8 @@
           (row) => `
           <tr>
             <td><span class="plate-cell-main mono-num num">${escapeHtml(row["Biển số"])}</span></td>
+            <td>${renderSnapshotCell(row)}</td>
             <td>${renderDirectionPill(row["Luồng"])}</td>
-            <td>${renderFacePill(row["Khuôn mặt"])}</td>
-            <td class="n mono-num num">${escapeHtml(row["Đồng thuận biển số"])}</td>
             <td class="n mono-num num">${escapeHtml(row["Thời gian nhận diện"])}</td>
           </tr>
         `

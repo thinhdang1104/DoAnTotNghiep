@@ -6,9 +6,30 @@ Chạy cục bộ thì dùng `python main.py` như bình thường.
 """
 
 import os
+import subprocess
+import sys
 
 # Tắt Node SSR proxy của Gradio 6 (proxy này chặn các route FastAPI được gắn thêm).
 os.environ["GRADIO_SSR_MODE"] = "false"
+
+# Cài đặt facenet-pytorch ngay từ đầu (trước khi tạo bất kỳ luồng hay event loop nào của Uvicorn/Gradio)
+# để tránh lỗi fork() làm hỏng file descriptor của asyncio event loop trên Linux.
+try:
+    import facenet_pytorch  # noqa: F401
+except ImportError:
+    print("[SYS] Cài đặt nhanh facenet-pytorch==2.6.0 (--no-deps) trước khi mở server...")
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--no-deps",
+            "--root-user-action=ignore",
+            "facenet-pytorch==2.6.0",
+        ]
+    )
 
 import torch
 
@@ -89,7 +110,6 @@ def _attach_fastapi_routes(gr_app) -> None:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
     print(f"\n[SYS] Khởi động Hệ thống Quản lý Bãi giữ xe AI (Gradio + ZeroGPU) trên cổng {port}...\n")
-    _init_backend_services()
     launched = demo.launch(
         server_name="0.0.0.0",
         server_port=port,
@@ -99,4 +119,5 @@ if __name__ == "__main__":
     )
     gr_server_app = launched[0] if isinstance(launched, tuple) else getattr(demo, "server_app", None)
     _attach_fastapi_routes(gr_server_app)
+    _init_backend_services()
     demo.block_thread()
