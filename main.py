@@ -55,13 +55,13 @@ VOTE_SAMPLE_INTERVAL_SECONDS = 0.25
 VOTE_MIN_SAMPLES = 3
 VOTE_MIN_SHARE = 0.70
 
-# Cơ chế "Lưu hờ" (Two-Phase Latch): đợi khuôn mặt chuẩn nhất ở Camera đối diện
+# Cơ chế "Lưu hờ" (Two-Phase Latch): đợi khuôn mặt chuẩn nhất ở Camera đối diện (tối đa 4 giây)
 FACE_MIN_CONFIDENCE = 0.88
 FACE_MIN_SHARPNESS = 48.0
 FACE_SAMPLE_WINDOW_SECONDS = 0.65
 FACE_MAX_SHARPNESS_WAIT_SECONDS = 1.80
 FACE_RECENT_BUFFER_SECONDS = 1.20
-LATCH_TIMEOUT_SECONDS = 15.0
+LATCH_TIMEOUT_SECONDS = 4.0
 
 # Không còn thấy khung biển số nào trong khoảng này => reset bộ đếm phiếu của cam đó
 PLATE_LOST_RESET_SECONDS = 1.5
@@ -838,40 +838,34 @@ class SystemState:
                 other = self.cams[3 - cam_id]
                 if cam.active:
                     return cam.mode or "local"
-                shared_grabber = (
-                    other.grabber
-                    if other.active
-                    and other.mode == "local"
-                    and other.device_index == device_index
-                    else None
-                )
-                shared_backend = other.backend_name
+                if other.active and other.device_index == device_index:
+                    msg = (
+                        f"Cổng {device_index} đang được dùng bởi Cam {other.cam_id}. "
+                        "Khi bật 2 Camera, mỗi Camera phải dùng 1 cổng thiết bị riêng (hoặc chỉ bật 1 Camera)."
+                    )
+                    self.camera_error = msg
+                    raise ValueError(msg)
 
             use_browser = prefer_browser or os.getenv("SPACE_ID") is not None
             grabber = None
             backend = "WebRTC (trình duyệt)"
 
             if not use_browser:
-                if shared_grabber is not None:
-                    # Cổng này đang được camera còn lại dùng -> dùng chung luồng hình
-                    grabber = shared_grabber
-                    backend = shared_backend
-                else:
-                    cap, frame, backend, errors = open_camera(device_index)
-                    if cap is None:
-                        if os.getenv("ALLOW_BROWSER_CAMERA", "1") == "1":
-                            use_browser = True
-                            backend = "WebRTC (trình duyệt)"
-                        else:
-                            msg = (
-                                f"Không mở được Cam {cam_id} tại cổng {device_index} "
-                                f"({'; '.join(errors)}). Hãy bấm 'Dò cổng' để xem các cổng đang hoạt động."
-                            )
-                            with self.lock:
-                                self.camera_error = msg
-                            raise ValueError(msg)
+                cap, frame, backend, errors = open_camera(device_index)
+                if cap is None:
+                    if os.getenv("ALLOW_BROWSER_CAMERA", "1") == "1":
+                        use_browser = True
+                        backend = "WebRTC (trình duyệt)"
                     else:
-                        grabber = FrameGrabber(cam_id, device_index, cap, frame, backend)
+                        msg = (
+                            f"Không mở được Cam {cam_id} tại cổng {device_index} "
+                            f"({'; '.join(errors)}). Hãy bấm 'Dò cổng' để xem các cổng đang hoạt động."
+                        )
+                        with self.lock:
+                            self.camera_error = msg
+                        raise ValueError(msg)
+                else:
+                    grabber = FrameGrabber(cam_id, device_index, cap, frame, backend)
 
             with self.lock:
                 was_running = self.running
@@ -980,8 +974,9 @@ class SystemState:
             session_id = self.session_id
 
         frame1 = self._decode_b64_frame(cam1_b64) if b1 else None
-        if b2 and cam2_b64 and cam2_b64 == cam1_b64 and frame1 is not None:
-            frame2 = frame1
+        if b1 and b2 and cam1_b64 and cam2_b64 and cam2_b64 == cam1_b64:
+            # Chặn gửi trùng cùng 1 khung hình cho cả 2 camera ở chế độ 2 luồng
+            frame2 = None
         else:
             frame2 = self._decode_b64_frame(cam2_b64) if b2 else None
         if frame1 is None and frame2 is None:
@@ -1138,47 +1133,31 @@ class SystemState:
             active1 = self.cams[1].active
             active2 = self.cams[2].active
 
-        # Chỉ 1 camera đang bật -> dùng khung hình của camera đó cho cả 2 vai trò (Biển số + Khuôn mặt)
-        if active1 and not active2 and frame1 is not None:
-            frame2 = frame1
-        elif active2 and not active1 and frame2 is not None:
-            frame1 = frame2
-
+        dual_cam_mode = bool(active1 and active2)
         run_face_idle = current_frame_idx % FACE_IDLE_EVERY_N_FRAMES == 0
-        same_feed = frame1 is not None and frame1 is frame2
 
-        if same_feed:
-            res1 = self._analyze_single_cam_frame(
+        res1 = (
+            self._analyze_single_cam_frame(
                 1,
                 frame1,
                 run_face_idle,
-                required_face_cam in (1, 2),
+                required_face_cam == 1 or not dual_cam_mode,
                 encode_jpeg=encode_jpeg,
             )
-            res2 = res1
-        else:
-            res1 = (
-                self._analyze_single_cam_frame(
-                    1,
-                    frame1,
-                    run_face_idle,
-                    required_face_cam == 1,
-                    encode_jpeg=encode_jpeg,
-                )
-                if frame1 is not None
-                else None
+            if (active1 and frame1 is not None)
+            else None
+        )
+        res2 = (
+            self._analyze_single_cam_frame(
+                2,
+                frame2,
+                run_face_idle,
+                required_face_cam == 2 or not dual_cam_mode,
+                encode_jpeg=encode_jpeg,
             )
-            res2 = (
-                self._analyze_single_cam_frame(
-                    2,
-                    frame2,
-                    run_face_idle,
-                    required_face_cam == 2,
-                    encode_jpeg=encode_jpeg,
-                )
-                if frame2 is not None
-                else None
-            )
+            if (active2 and frame2 is not None)
+            else None
+        )
 
         now = time.monotonic()
         commit_pair = None
@@ -1285,41 +1264,35 @@ class SystemState:
                 return
 
             # ------------------------------------------------------------------
-            # Xử lý máy trạng thái 2 Pha (Lưu hờ Biển số -> Chốt Khuôn mặt Cam đối diện)
-            #   - Cam 2 (Phía ngoài) chốt Biển số => Luồng ĐI VÀO (IN), lấy mặt ở Cam 1
-            #   - Cam 1 (Phía trong) chốt Biển số => Luồng ĐI RA  (OUT), lấy mặt ở Cam 2
+            # Xử lý máy trạng thái 2 Pha đối xứng (Lưu hờ Biển số -> Chốt Khuôn mặt):
+            #   - Khi bật cả 2 Camera (dual_cam_mode = True):
+            #       + Cam 1 chốt Biển số => BẮT BUỘC Cam 2 phải thấy Khuôn mặt
+            #       + Cam 2 chốt Biển số => BẮT BUỘC Cam 1 phải thấy Khuôn mặt
+            #   - Khi chỉ bật 1 Camera dự phòng (dual_cam_mode = False):
+            #       + Cam đang bật vừa chốt Biển số vừa lấy Khuôn mặt
+            #   - Chiều VÀO (IN) / RA (OUT) tự động xác định theo trạng thái xe trong bãi:
+            #       + Chưa có trong bãi => VÀO BÃI (IN)
+            #       + Đang gửi trong bãi (IN_PARKING) => RA BÃI (OUT, đối chiếu FaceNet >= 65%)
             # ------------------------------------------------------------------
             if self.security_alert is None:
                 if self.latched is None:
-                    shared_cam_mode = same_feed
-                    if shared_cam_mode:
-                        cand_disp = confirmed_candidates.get(2) or confirmed_candidates.get(1)
-                        is_cand_in = in_parking_map.get(cand_disp, False) if cand_disp else False
-                        scan_order = [(1, "OUT", 2)] if is_cand_in else [(2, "IN", 1)]
-                    else:
-                        scan_order = [(2, "IN", 1), (1, "OUT", 2)]
-
-                    # Kiểm tra lần lượt theo thứ tự ưu tiên
-                    for plate_cam_id, direction, target_face_cam_id in scan_order:
+                    active_cam_ids = [cid for cid in (2, 1) if self.cams[cid].active]
+                    for plate_cam_id in active_cam_ids:
                         cam = self.cams[plate_cam_id]
                         vote = get_vote_result(cam.observations)
                         if not is_vote_confirmed(vote):
                             continue
 
                         key, display, vote_count, vote_share, sample_count = vote
+                        is_in_parking = in_parking_map.get(display, False)
+                        direction = "OUT" if is_in_parking else "IN"
+                        target_face_cam_id = (
+                            (3 - plate_cam_id) if dual_cam_mode else plate_cam_id
+                        )
+
                         cooldown_token = f"{key}:{direction}"
                         if cooldown_token in self.recent_confirms:
                             cam.observations.clear()
-                            continue
-
-                        # Chặn quét trùng VÀO BÃI nếu xe này hiện đang ở trong bãi (IN_PARKING)
-                        if not shared_cam_mode and direction == "IN" and in_parking_map.get(display, False):
-                            self.recent_confirms[cooldown_token] = now + 6.0
-                            cam.observations.clear()
-                            self._set_feedback_locked(
-                                "warn",
-                                f"XE {display} VÀO BÃI ĐÃ CÓ TRONG BÃI",
-                            )
                             continue
 
                         best_plate_crop = cam.plate_crops.get(key)
@@ -1339,9 +1312,6 @@ class SystemState:
                         self.best_face = None
                         cam.observations.clear()
                         cam.plate_crops.clear()
-                        if shared_cam_mode:
-                            self.cams[target_face_cam_id].observations.clear()
-                            self.cams[target_face_cam_id].plate_crops.clear()
 
                         # Chỉ giữ lại các khuôn mặt vừa xuất hiện sát thời điểm chốt biển (<= 0.25s)
                         # và loại bỏ các khung hình mặt cũ trước đó để không đè điểm khung hình mới
@@ -1362,7 +1332,22 @@ class SystemState:
 
                 if self.latched is not None:
                     elapsed_latch = now - self.latched["latched_at"]
-                    if elapsed_latch > LATCH_TIMEOUT_SECONDS:
+                    plate_cam_obj = self.cams[self.latched["plate_cam"]]
+                    # Chống đánh tráo xe trong lúc đang Lưu hờ: nếu xuất hiện biển số hợp lệ khác thì hủy ngay
+                    swapped_plate = any(
+                        _clean_plate_key(p) != self.latched["plate_key"]
+                        for p in plate_cam_obj.current_plates
+                    )
+                    if swapped_plate:
+                        dir_text = "VÀO BÃI" if self.latched["direction"] == "IN" else "RA BÃI"
+                        self._set_feedback_locked(
+                            "warn",
+                            f"XE {self.latched['plate_number']} {dir_text} HỦY LƯU HỜ (ĐÃ ĐỔI XE MỚI)",
+                        )
+                        self.latched = None
+                        self.face_window_start = None
+                        self.best_face = None
+                    elif elapsed_latch > LATCH_TIMEOUT_SECONDS:
                         dir_text = "VÀO BÃI" if self.latched["direction"] == "IN" else "RA BÃI"
                         self._set_feedback_locked(
                             "warn",

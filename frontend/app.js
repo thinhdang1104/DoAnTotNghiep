@@ -294,7 +294,7 @@
     return { stream, video };
   }
 
-  async function openBrowserWebcamAtIndex(camIdx) {
+  async function openBrowserWebcamAtIndex(camIdx, excludeIndex = null) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error(
         "Trình duyệt chặn quyền Camera (cần chạy trên localhost hoặc HTTPS, hoặc mở trực tiếp https://minhthinh-doan.hf.space)."
@@ -307,11 +307,12 @@
     // Sắp xếp thứ tự ưu tiên thử mở:
     // 1. Đúng cổng camIdx người dùng chọn
     // 2. Các cổng có tên "DroidCam" (nếu cổng camIdx bị hỏng/trống)
-    // 3. Các cổng videoinput còn lại
+    // 3. Các cổng videoinput còn lại (trừ cổng excludeIndex đang được camera kia sử dụng)
     const candidates = [];
     const seenIds = new Set();
     const pushCandidate = (dev, idx) => {
       if (!dev) return;
+      if (excludeIndex !== null && idx === excludeIndex) return;
       const key = dev.deviceId || `idx-${idx}`;
       if (seenIds.has(key)) return;
       seenIds.add(key);
@@ -342,6 +343,15 @@
           lastErr = err;
         }
       }
+    }
+
+    if (excludeIndex !== null) {
+      throw (
+        lastErr ||
+        new Error(
+          `Không thể mở thiết bị Camera thứ 2 tại cổng ${camIdx}. Hãy kiểm tra kết nối hoặc sử dụng chế độ 1 Camera dự phòng.`
+        )
+      );
     }
 
     // Fallback cuối cùng: mở camera mặc định của trình duyệt
@@ -521,21 +531,28 @@
 
     stopBrowserWebRTCForCam(camId);
 
-    let camObj = null;
-    if (
-      browserVideos[otherSlot] &&
-      browserStreams[otherSlot] &&
-      (browserCamPorts[otherId] === portIdx || browserCamDevices.length <= 1)
-    ) {
-      // Dùng chung luồng webcam trình duyệt nếu 2 cam chọn cùng cổng hoặc máy chỉ có 1 webcam
-      camObj = {
-        stream: browserStreams[otherSlot],
-        video: browserVideos[otherSlot],
-        openedIndex: browserCamPorts[otherId] ?? portIdx,
-      };
-    } else {
-      camObj = await openBrowserWebcamAtIndex(portIdx);
+    if (!browserCamDevices.length) {
+      await scanBrowserWebcams();
     }
+
+    const otherActive = Boolean(browserVideos[otherSlot] && browserStreams[otherSlot]);
+    if (otherActive) {
+      if (browserCamDevices.length <= 1) {
+        throw new Error(
+          `Máy chỉ có 1 thiết bị Camera nên không thể bật đồng thời 2 luồng Camera độc lập. Vui lòng dùng chế độ 1 Camera dự phòng (chỉ bật Cam ${otherId}) hoặc kết nối thêm Camera thứ 2.`
+        );
+      }
+      if (browserCamPorts[otherId] === portIdx) {
+        throw new Error(
+          `Cổng ${portIdx} đang được sử dụng bởi Cam ${otherId}. Vui lòng chọn cổng khác cho Cam ${camId} để đảm bảo 2 luồng tách biệt.`
+        );
+      }
+    }
+
+    const camObj = await openBrowserWebcamAtIndex(
+      portIdx,
+      otherActive ? browserCamPorts[otherId] : null
+    );
 
     browserStreams[slot] = camObj.stream;
     browserVideos[slot] = camObj.video;
@@ -722,8 +739,11 @@
             (w.label || "").toLowerCase().includes("droidcam")
           );
           if (droidIdx >= 0) {
+            const otherIdx = webcams.findIndex((_, i) => i !== droidIdx);
             if (!camStreaming[1]) cam1IndexInput.value = droidIdx;
-            if (!camStreaming[2]) cam2IndexInput.value = droidIdx;
+            if (!camStreaming[2]) {
+              cam2IndexInput.value = otherIdx >= 0 ? otherIdx : droidIdx;
+            }
           } else {
             if (!camStreaming[1]) cam1IndexInput.value = 0;
             if (!camStreaming[2]) cam2IndexInput.value = webcams.length >= 2 ? 1 : 0;
@@ -958,9 +978,10 @@
         }
         if (liveFlowPill) {
           liveFlowPill.className = isIn ? "pill pos" : "pill warn";
-          liveFlowPill.textContent = isIn
-            ? "Đang đón xe VÀO (Biển Cam 2 + Mặt Cam 1)"
-            : "Đang đón xe RA (Biển Cam 1 + Mặt Cam 2)";
+          liveFlowPill.textContent =
+            state.latched.plate_cam === state.latched.required_face_cam
+              ? `Đang đón xe ${isIn ? "VÀO" : "RA"} (1 Cam · Cam ${state.latched.plate_cam})`
+              : `Đang đón xe ${isIn ? "VÀO" : "RA"} (Biển Cam ${state.latched.plate_cam} + Mặt Cam ${state.latched.required_face_cam})`;
         }
       } else {
         latchStatusBox.classList.add("hidden");
@@ -969,13 +990,13 @@
         if (liveFlowPill) {
           if (active1 && active2) {
             liveFlowPill.className = "pill pos";
-            liveFlowPill.textContent = "Đang bật cả 2 Camera";
+            liveFlowPill.textContent = "2 Camera đối xứng (Chéo luồng)";
           } else if (active1) {
             liveFlowPill.className = "pill warn";
-            liveFlowPill.textContent = "Đang bật Cam 1 (Cam 2 tắt)";
+            liveFlowPill.textContent = "Chế độ 1 Cam dự phòng (Cam 1)";
           } else if (active2) {
             liveFlowPill.className = "pill warn";
-            liveFlowPill.textContent = "Đang bật Cam 2 (Cam 1 tắt)";
+            liveFlowPill.textContent = "Chế độ 1 Cam dự phòng (Cam 2)";
           } else {
             liveFlowPill.className = "pill pos";
             liveFlowPill.textContent = "2 Camera độc lập";
@@ -989,7 +1010,7 @@
         alertScorePill.textContent = `Độ khớp: ${state.security_alert.match_score_pct}`;
         alertDetailText.textContent =
           `Xe ${state.security_alert.plate_number} (gửi lúc ${state.security_alert.entry_time}) ` +
-          `có khuôn mặt người lấy xe tại Cam 2 LỆCH so với lúc gửi vào ở Cam 1 (Cosine ${state.security_alert.match_score_pct} < 65%).`;
+          `có khuôn mặt người lấy xe LỆCH so với lúc gửi xe vào bãi (Cosine ${state.security_alert.match_score_pct} < 65%).`;
       } else {
         securityAlertBox.classList.add("hidden");
       }
