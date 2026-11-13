@@ -105,9 +105,9 @@ class FaceService:
         """Phát hiện khuôn mặt trên khung hình BGR, sắp xếp theo độ tin cậy giảm dần."""
         height, width = frame.shape[:2]
         scale = 1.0
-        if self.device == "cpu" and width > 320:
-            scale = 320.0 / float(width)
-            small_w = 320
+        if self.device == "cpu" and width > 480:
+            scale = 480.0 / float(width)
+            small_w = 480
             small_h = max(60, int(round(height * scale)))
             small_bgr = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
             rgb_frame = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2RGB)
@@ -146,12 +146,27 @@ class FaceService:
 
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb_frame)
-        face_tensor = self.detector.extract(
-            image, np.asarray([box], dtype=np.float32), save_path=None
-        )
+        face_tensor = None
+        try:
+            face_tensor = self.detector.extract(
+                image, np.asarray([box], dtype=np.float32), save_path=None
+            )
+        except Exception:
+            face_tensor = None
+
         if face_tensor is None:
-            return None
-        if face_tensor.dim() == 3:
+            # Dự phòng cắt trực tiếp vùng mặt 160x160 nếu detector.extract() trả về None ở sát biên ảnh
+            h, w = rgb_frame.shape[:2]
+            x1, y1, x2, y2 = [int(round(v)) for v in box]
+            x1, x2 = max(0, x1), min(w, x2)
+            y1, y2 = max(0, y1), min(h, y2)
+            if x1 >= x2 or y1 >= y2:
+                return None
+            crop = cv2.resize(rgb_frame[y1:y2, x1:x2], (160, 160), interpolation=cv2.INTER_AREA)
+            face_tensor = (
+                torch.from_numpy(crop).permute(2, 0, 1).float().unsqueeze(0) - 127.5
+            ) / 128.0
+        elif face_tensor.dim() == 3:
             face_tensor = face_tensor.unsqueeze(0)
 
         with torch.inference_mode():

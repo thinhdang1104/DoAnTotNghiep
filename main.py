@@ -87,12 +87,29 @@ CAMERA_BACKENDS = (
 # ============================================================================
 PLATE_SERIES_RE = re.compile(r"^\d{2}[A-Z]{1,2}\d?$")
 PLATE_NUMBER_RE = re.compile(r"^\d{4,5}$")
-PLATE_PATTERNS = (
-    re.compile(r"^(\d{2}[A-Z]{1,2}\d?)(\d{5})$"),
-    re.compile(r"^(\d{2}[A-Z]{1,2}\d?)(\d{4})$"),
-)
 TO_DIGIT = {"D": "0", "B": "8", "S": "5", "Z": "2", "G": "6"}
 TO_LETTER = {"0": "D", "8": "B", "5": "S", "2": "Z", "6": "G", "4": "A"}
+
+
+def _clean_plate_key(text: str | None) -> str:
+    return "".join(ch for ch in str(text or "").upper() if ch.isalnum())
+
+
+def _try_parse_series_number(raw_chars: list[str], split_at: int) -> tuple[str, str] | None:
+    if split_at < 3 or len(raw_chars) - split_at not in (4, 5):
+        return None
+    chars = list(raw_chars)
+    for i in (0, 1):
+        chars[i] = TO_DIGIT.get(chars[i], chars[i])
+    chars[2] = TO_LETTER.get(chars[2], chars[2])
+    # Toàn bộ 4 hoặc 5 ký tự của phần số phía sau đều ép về chữ số
+    for i in range(split_at, len(chars)):
+        chars[i] = TO_DIGIT.get(chars[i], chars[i])
+    series = "".join(chars[:split_at])
+    number = "".join(chars[split_at:])
+    if PLATE_SERIES_RE.match(series) and PLATE_NUMBER_RE.match(number):
+        return f"{series}{number}", f"{series}-{number}"
+    return None
 
 
 def normalize_plate(raw_text: str) -> tuple[str, str] | None:
@@ -104,23 +121,16 @@ def normalize_plate(raw_text: str) -> tuple[str, str] | None:
     if not 7 <= len(chars) <= 10:
         return None
 
-    for i in (0, 1):
-        chars[i] = TO_DIGIT.get(chars[i], chars[i])
-    chars[2] = TO_LETTER.get(chars[2], chars[2])
-    for i in range(len(chars) - 4, len(chars)):
-        chars[i] = TO_DIGIT.get(chars[i], chars[i])
-    key = "".join(chars)
-
     if upper.count("-") == 1:
         split_at = sum(ch.isalnum() for ch in upper.split("-")[0])
-        series, number = key[:split_at], key[split_at:]
-        if PLATE_SERIES_RE.match(series) and PLATE_NUMBER_RE.match(number):
-            return key, f"{series}-{number}"
+        parsed = _try_parse_series_number(chars, split_at)
+        if parsed:
+            return parsed
 
-    for pattern in PLATE_PATTERNS:
-        match = pattern.match(key)
-        if match:
-            return key, f"{match.group(1)}-{match.group(2)}"
+    for num_len in (5, 4):
+        parsed = _try_parse_series_number(chars, len(chars) - num_len)
+        if parsed:
+            return parsed
     return None
 
 
@@ -703,9 +713,10 @@ class SystemState:
                     self._set_db_status(False, str(error))
 
             if str(record.get("direction", "IN")).upper() == "OUT":
+                rec_key = _clean_plate_key(record.get("plate_number"))
                 for pending_rec in self.pending_records:
                     if (
-                        pending_rec.get("plate_number") == record.get("plate_number")
+                        _clean_plate_key(pending_rec.get("plate_number")) == rec_key
                         and pending_rec.get("direction") == "IN"
                         and pending_rec.get("parking_status") == "IN_PARKING"
                     ):
@@ -1256,20 +1267,18 @@ class SystemState:
                     cam.latest_jpeg = jpeg_bytes
                     cam.jpeg_seq += 1
 
-            check_cand_display = None
-            if self.security_alert is None and self.latched is None and same_feed:
-                v_check = get_vote_result(self.cams[2].observations) or get_vote_result(
-                    self.cams[1].observations
-                )
-                if is_vote_confirmed(v_check):
-                    _, check_cand_display, _, _, _ = v_check
+            confirmed_candidates: dict[int, str] = {}
+            if self.security_alert is None and self.latched is None:
+                for cid in (1, 2):
+                    v_check = get_vote_result(self.cams[cid].observations)
+                    if is_vote_confirmed(v_check):
+                        _, cand_display, _, _, _ = v_check
+                        confirmed_candidates[cid] = cand_display
 
         # Truy vấn DB kiểm tra xe đang gửi bên NGOÀI self.lock để tránh deadlock với db_write_lock
-        is_cand_in_parking = (
-            self._is_plate_currently_in_parking(check_cand_display)
-            if check_cand_display
-            else False
-        )
+        in_parking_map: dict[str, bool] = {}
+        for cand_plate in set(confirmed_candidates.values()):
+            in_parking_map[cand_plate] = self._is_plate_currently_in_parking(cand_plate)
 
         with self.lock:
             if self.session_id != session_id:
@@ -1283,11 +1292,12 @@ class SystemState:
             if self.security_alert is None:
                 if self.latched is None:
                     shared_cam_mode = same_feed
-                    scan_order = (
-                        [(1, "OUT", 2), (2, "IN", 1)]
-                        if (shared_cam_mode and is_cand_in_parking)
-                        else [(2, "IN", 1), (1, "OUT", 2)]
-                    )
+                    if shared_cam_mode:
+                        cand_disp = confirmed_candidates.get(2) or confirmed_candidates.get(1)
+                        is_cand_in = in_parking_map.get(cand_disp, False) if cand_disp else False
+                        scan_order = [(1, "OUT", 2)] if is_cand_in else [(2, "IN", 1)]
+                    else:
+                        scan_order = [(2, "IN", 1), (1, "OUT", 2)]
 
                     # Kiểm tra lần lượt theo thứ tự ưu tiên
                     for plate_cam_id, direction, target_face_cam_id in scan_order:
@@ -1300,6 +1310,16 @@ class SystemState:
                         cooldown_token = f"{key}:{direction}"
                         if cooldown_token in self.recent_confirms:
                             cam.observations.clear()
+                            continue
+
+                        # Chặn quét trùng VÀO BÃI nếu xe này hiện đang ở trong bãi (IN_PARKING)
+                        if not shared_cam_mode and direction == "IN" and in_parking_map.get(display, False):
+                            self.recent_confirms[cooldown_token] = now + 6.0
+                            cam.observations.clear()
+                            self._set_feedback_locked(
+                                "warn",
+                                f"XE {display} VÀO BÃI ĐÃ CÓ TRONG BÃI",
+                            )
                             continue
 
                         best_plate_crop = cam.plate_crops.get(key)
@@ -1323,9 +1343,11 @@ class SystemState:
                             self.cams[target_face_cam_id].observations.clear()
                             self.cams[target_face_cam_id].plate_crops.clear()
 
-                        # Nếu trên Camera đối diện đã có sẵn khuôn mặt, bắt đầu đếm cửa sổ từ `now`
-                        # (không dùng mốc thời gian cũ để tránh chốt vội khung hình đang di chuyển bị mờ)
+                        # Chỉ giữ lại các khuôn mặt vừa xuất hiện sát thời điểm chốt biển (<= 0.25s)
+                        # và loại bỏ các khung hình mặt cũ trước đó để không đè điểm khung hình mới
                         opp_cam = self.cams[target_face_cam_id]
+                        while opp_cam.recent_faces and now - opp_cam.recent_faces[0][0] > 0.25:
+                            opp_cam.recent_faces.popleft()
                         if opp_cam.recent_faces:
                             best_recent = max(opp_cam.recent_faces, key=lambda item: item[1])
                             self.face_window_start = now
@@ -1352,10 +1374,13 @@ class SystemState:
                     else:
                         req_cam_id = self.latched["required_face_cam"]
                         req_cam = self.cams[req_cam_id]
+                        latched_at = self.latched["latched_at"]
                         if req_cam.recent_faces:
                             if self.face_window_start is None:
                                 self.face_window_start = now
-                            for _, f_score, f_conf, f_frame, f_box, f_sharp in req_cam.recent_faces:
+                            for f_ts, f_score, f_conf, f_frame, f_box, f_sharp in req_cam.recent_faces:
+                                if f_ts < latched_at - 0.25:
+                                    continue
                                 if self.best_face is None or f_score > self.best_face[0]:
                                     self.best_face = (f_score, f_conf, f_frame, f_box, f_sharp)
 
@@ -1434,10 +1459,11 @@ class SystemState:
         return False
 
     def _find_pending_active_session(self, plate_number: str) -> dict | None:
+        target_key = _clean_plate_key(plate_number)
         with self.db_write_lock:
             for rec in reversed(self.pending_records):
                 if (
-                    rec.get("plate_number") == plate_number
+                    _clean_plate_key(rec.get("plate_number")) == target_key
                     and rec.get("direction") == "IN"
                     and rec.get("parking_status") == "IN_PARKING"
                 ):

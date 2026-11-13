@@ -530,6 +530,7 @@ def _normalize_search(text: str) -> str:
 # ----------------------------------------------------------------------------
 def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
     """Tìm phiên gửi xe đang ở trong bãi (IN_PARKING) gần nhất của biển số này."""
+    norm_plate = _normalize_search(plate_number)
     if _ACTIVE_BACKEND == "sqlite" and cursor is None:
         with _SQLITE_LOCK:
             conn = _connect_sqlite()
@@ -540,13 +541,13 @@ def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
                     """
                     SELECT id, plate_number, recognized_at, face_embedding
                     FROM plate_recognition_history
-                    WHERE plate_number = ?
+                    WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
                       AND direction = 'IN'
                       AND parking_status = 'IN_PARKING'
                     ORDER BY recognized_at DESC, id DESC
                     LIMIT 1
                     """,
-                    (plate_number,),
+                    (norm_plate,),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -573,13 +574,13 @@ def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
             """
             SELECT id, plate_number, recognized_at, face_embedding
             FROM plate_recognition_history
-            WHERE plate_number = %s
+            WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
               AND direction = 'IN'
               AND parking_status = 'IN_PARKING'
             ORDER BY recognized_at DESC, id DESC
             LIMIT 1
             """,
-            (plate_number,),
+            (norm_plate,),
         )
         row = cursor.fetchone()
         if not row:
@@ -613,15 +614,16 @@ def _find_last_embedding_mysql(cursor, plate_number: str) -> tuple[int | None, l
     if active and active.get("embedding") is not None:
         return active["id"], active["embedding"]
 
+    norm_plate = _normalize_search(plate_number)
     cursor.execute(
         """
         SELECT id, face_embedding
         FROM plate_recognition_history
-        WHERE plate_number = %s AND face_embedding IS NOT NULL
+        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s AND face_embedding IS NOT NULL
         ORDER BY recognized_at DESC, id DESC
         LIMIT 1
         """,
-        (plate_number,),
+        (norm_plate,),
     )
     row = cursor.fetchone()
     if not row:
@@ -634,17 +636,18 @@ def _find_last_embedding_mysql(cursor, plate_number: str) -> tuple[int | None, l
 
 
 def _find_last_embedding_sqlite(cur: sqlite3.Cursor, plate_number: str) -> tuple[int | None, list[float] | None]:
+    norm_plate = _normalize_search(plate_number)
     cur.execute(
         """
         SELECT id, face_embedding
         FROM plate_recognition_history
-        WHERE plate_number = ?
+        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
           AND direction = 'IN'
           AND parking_status = 'IN_PARKING'
         ORDER BY recognized_at DESC, id DESC
         LIMIT 1
         """,
-        (plate_number,),
+        (norm_plate,),
     )
     row = cur.fetchone()
     if row and row["face_embedding"] is not None:
@@ -655,11 +658,11 @@ def _find_last_embedding_sqlite(cur: sqlite3.Cursor, plate_number: str) -> tuple
         """
         SELECT id, face_embedding
         FROM plate_recognition_history
-        WHERE plate_number = ? AND face_embedding IS NOT NULL
+        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ? AND face_embedding IS NOT NULL
         ORDER BY recognized_at DESC, id DESC
         LIMIT 1
         """,
-        (plate_number,),
+        (norm_plate,),
     )
     row2 = cur.fetchone()
     if not row2:
@@ -1153,11 +1156,11 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                         """
                         UPDATE plate_recognition_history
                         SET parking_status = 'COMPLETED'
-                        WHERE plate_number = ?
+                        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
                           AND direction = 'IN'
                           AND parking_status = 'IN_PARKING'
                         """,
-                        (record["plate_number"],),
+                        (_normalize_search(record["plate_number"]),),
                     )
                 else:
                     direction = "IN"
@@ -1167,11 +1170,11 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                         """
                         UPDATE plate_recognition_history
                         SET parking_status = 'COMPLETED'
-                        WHERE plate_number = ?
+                        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
                           AND direction = 'IN'
                           AND parking_status = 'IN_PARKING'
                         """,
-                        (record["plate_number"],),
+                        (_normalize_search(record["plate_number"]),),
                     )
 
                 cur.execute(
@@ -1235,11 +1238,11 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                 """
                 UPDATE plate_recognition_history
                 SET parking_status = 'COMPLETED'
-                WHERE plate_number = %s
+                WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
                   AND direction = 'IN'
                   AND parking_status = 'IN_PARKING'
                 """,
-                (record["plate_number"],),
+                (_normalize_search(record["plate_number"]),),
             )
         else:
             direction = "IN"
@@ -1249,11 +1252,11 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                 """
                 UPDATE plate_recognition_history
                 SET parking_status = 'COMPLETED'
-                WHERE plate_number = %s
+                WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
                   AND direction = 'IN'
                   AND parking_status = 'IN_PARKING'
                 """,
-                (record["plate_number"],),
+                (_normalize_search(record["plate_number"]),),
             )
 
         cursor.execute(
