@@ -11,13 +11,14 @@ from collections import Counter, deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from ultralytics import YOLO
 
 from database import (
@@ -57,12 +58,18 @@ VOTE_MIN_SAMPLES = 3
 VOTE_MIN_SHARE = 0.70
 
 # Cơ chế "Lưu hờ" (Two-Phase Latch): đợi khuôn mặt chuẩn nhất ở Camera đối diện (tối đa 4 giây)
+# Ngưỡng độ nét (Laplacian Variance 128x128 trên vùng lõi 70% mặt):
+# - Ảnh mặt mờ thực tế (media_1794468081037_1e129541.png) đo được = 12.85
+# - Khuôn mặt rõ nét đạt >= 22.0 (chốt tức thì ở >= 28.0 kèm confidence >= 0.92)
 FACE_MIN_CONFIDENCE = 0.85
-FACE_MIN_SHARPNESS = 18.0
+FACE_MIN_SHARPNESS = 22.0
+FACE_INSTANT_SHARPNESS = 28.0
 FACE_SAMPLE_WINDOW_SECONDS = 0.18
 FACE_MAX_SHARPNESS_WAIT_SECONDS = 0.50
+FACE_PRE_LATCH_LOOKBACK_SECONDS = 0.85
 FACE_RECENT_BUFFER_SECONDS = 1.20
 LATCH_TIMEOUT_SECONDS = 4.0
+MAX_BROWSER_FRAME_B64_CHARS = 2_500_000
 
 # Không còn thấy khung biển số nào trong khoảng này => reset bộ đếm phiếu của cam đó
 PLATE_LOST_RESET_SECONDS = 1.5
@@ -190,12 +197,22 @@ def _yolo_kwargs() -> dict:
     return {"device": YOLO_DEVICE} if YOLO_DEVICE else {}
 
 
-def _region_sharpness(frame, box: tuple[int, int, int, int]) -> float:
-    """Đo độ sắc nét quang học (Laplacian Variance chuẩn hóa 128x128) để lọc bỏ ảnh bị rung/nhòe."""
+def _region_sharpness(
+    frame, box: tuple[int, int, int, int], inner_ratio: float = 1.0
+) -> float:
+    """Đo độ sắc nét quang học (Laplacian Variance chuẩn hóa 128x128) để lọc bỏ ảnh bị rung/nhòe.
+    Với khuôn mặt, dùng inner_ratio=0.70 để chỉ đo vùng lõi mặt, tránh nhiễu bởi rèm cửa/nền phía sau.
+    """
     if frame is None:
         return 0.0
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = map(int, box)
+    if 0.2 <= inner_ratio < 1.0:
+        bw, bh = x2 - x1, y2 - y1
+        mx = int(round(bw * (1.0 - inner_ratio) * 0.5))
+        my = int(round(bh * (1.0 - inner_ratio) * 0.5))
+        x1, x2 = x1 + mx, x2 - mx
+        y1, y2 = y1 + my, y2 - my
     x1, x2 = max(0, x1), min(w, x2)
     y1, y2 = max(0, y1), min(h, y2)
     if x2 - x1 < 8 or y2 - y1 < 8:
@@ -261,9 +278,10 @@ def detect_plates(frame, plate_model: YOLO, char_model: YOLO, annotated=None):
     )[0]
     names = char_model.names
     height, width = frame.shape[:2]
-    plate_reads: list[str] = []
+    plate_present = False
+    readings: dict[str, str] = {}
     plate_boxes: list[dict] = []
-    plate_crops: dict[str, str] = {}
+    plate_crops: dict[str, tuple[float, str]] = {}
 
     for box in results.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -272,6 +290,7 @@ def detect_plates(frame, plate_model: YOLO, char_model: YOLO, annotated=None):
         if x1 >= x2 or y1 >= y2:
             continue
 
+        plate_present = True
         crop = frame[y1:y2, x1:x2]
         char_res = char_model.predict(
             crop, conf=CONF_CHAR, iou=0.5, imgsz=640, verbose=False, **_yolo_kwargs()
@@ -292,11 +311,11 @@ def detect_plates(frame, plate_model: YOLO, char_model: YOLO, annotated=None):
 
         chars = _deduplicate_chars(raw_chars)
         raw_text = _assemble_plate_text(chars) if chars else ""
-        plate_reads.append(raw_text)
 
         normalized = normalize_plate(raw_text)
         label = normalized[1] if normalized else (raw_text or "?")
         if normalized:
+            readings[normalized[0]] = normalized[1]
             plate_sharpness = _region_sharpness(frame, (x1, y1, x2, y2))
             crop_url = _crop_to_data_url(
                 frame, (x1, y1, x2, y2), max_w=360, max_h=180, pad_ratio=0.06
@@ -334,7 +353,7 @@ def detect_plates(frame, plate_model: YOLO, char_model: YOLO, annotated=None):
                 2,
             )
 
-    return plate_reads, plate_boxes, plate_crops
+    return plate_present, readings, plate_boxes, plate_crops
 
 
 def draw_faces(annotated, faces: list[FaceData]) -> None:
@@ -380,9 +399,9 @@ def is_vote_confirmed(vote_result) -> bool:
     return sample_count >= VOTE_MIN_SAMPLES and vote_share >= VOTE_MIN_SHARE
 
 
-def _face_score(face: FaceData, frame=None) -> tuple[float, float]:
-    """Trả về (tổng điểm chất lượng, độ sắc nét Laplacian) của khuôn mặt."""
-    sharpness = _region_sharpness(frame, face.box) if frame is not None else 50.0
+def _face_score(face: FaceData, frame) -> tuple[float, float]:
+    """Trả về (tổng điểm chất lượng, độ sắc nét Laplacian vùng lõi 70%) của khuôn mặt."""
+    sharpness = _region_sharpness(frame, face.box, inner_ratio=0.70)
     score = (face.confidence ** 2) * math.pow(max(1.0, face.area), 0.25) * max(1.0, sharpness)
     return score, sharpness
 
@@ -503,15 +522,15 @@ class CameraUnitState:
 
     def reset_tracking(self) -> None:
         self.observations: deque = deque()
-        self.plate_crops: dict[str, str] = {}
+        self.plate_crops: dict[str, tuple[float, str]] = {}
         self.last_sample_time = 0.0
         self.last_plate_seen: float | None = None
-        # Lưu các khuôn mặt chuẩn gần nhất (now, score, confidence, frame, box)
+        # Lưu các khuôn mặt chuẩn gần nhất (now, score, confidence, frame, box, sharpness)
         self.recent_faces: deque = deque()
 
 
 # ============================================================================
-# Trạng thái hệ thống 2 Camera độc lập (Cam 1 · Phía trong + Cam 2 · Phía ngoài)
+# Trạng thái hệ thống 2 Camera đối xứng (Cam 1 ↔ Cam 2 chéo luồng)
 # ============================================================================
 class SystemState:
     def __init__(self) -> None:
@@ -532,9 +551,9 @@ class SystemState:
         self.writer_stop = threading.Event()
         self.writer_thread: threading.Thread | None = None
 
-        # Hai camera độc lập (bật/tắt riêng từng camera):
-        # - Cam 1 (Phía trong): Soi Khuôn mặt chiều VÀO / Biển số chiều RA
-        # - Cam 2 (Phía ngoài): Soi Biển số chiều VÀO / Khuôn mặt chiều RA
+        # Hai camera đối xứng (bật/tắt riêng từng camera, tách biệt cổng khi bật cả 2):
+        # - Cam nào chốt Biển số trước thì Cam đối diện (3 - plate_cam) bắt buộc xác thực Khuôn mặt
+        # - Chiều VÀO (IN) / RA (OUT) tự động xác định theo trạng thái xe đang trong bãi (IN_PARKING)
         self.running = False  # True khi có ít nhất 1 camera đang bật
         self.browser_mode = False  # True khi có ít nhất 1 camera chạy qua WebRTC trình duyệt
         self.infer_lock = threading.Lock()
@@ -583,7 +602,7 @@ class SystemState:
         # Trạng thái Lưu hờ (Two-Phase Latch)
         self.latched: dict | None = None
         self.face_window_start: float | None = None
-        self.best_face: tuple[float, float, object, tuple] | None = None
+        self.best_face: tuple[float, float, object, tuple, float] | None = None
 
     def _lock_plate_cooldown_locked(self, plate_key: str, direction: str, now: float) -> None:
         same_dir_token = f"{plate_key}:{direction}"
@@ -688,6 +707,7 @@ class SystemState:
             return flushed
 
     def _store_record(self, record: dict) -> None:
+        inserted_to_db = False
         with self.db_write_lock:
             with self.lock:
                 ready = self.database_ready
@@ -705,27 +725,30 @@ class SystemState:
                             )
                             self.last_confirmed["match_status"] = preview["Đối chiếu"]
                     self._bump_version()
-                    try:
-                        self.get_cached_overview("", "all", HISTORY_LIMIT)
-                    except Exception:
-                        pass
-                    return
+                    inserted_to_db = True
                 except (DatabaseConfigurationError, DatabaseOperationError) as error:
                     self._set_db_status(False, str(error))
 
-            if str(record.get("direction", "IN")).upper() == "OUT":
-                rec_key = _clean_plate_key(record.get("plate_number"))
-                for pending_rec in self.pending_records:
-                    if (
-                        _clean_plate_key(pending_rec.get("plate_number")) == rec_key
-                        and pending_rec.get("direction") == "IN"
-                        and pending_rec.get("parking_status") == "IN_PARKING"
-                    ):
-                        pending_rec["parking_status"] = "COMPLETED"
+            if not inserted_to_db:
+                if str(record.get("direction", "IN")).upper() == "OUT":
+                    rec_key = _clean_plate_key(record.get("plate_number"))
+                    for pending_rec in self.pending_records:
+                        if (
+                            _clean_plate_key(pending_rec.get("plate_number")) == rec_key
+                            and pending_rec.get("direction") == "IN"
+                            and pending_rec.get("parking_status") == "IN_PARKING"
+                        ):
+                            pending_rec["parking_status"] = "COMPLETED"
 
-            self.pending_records.append(record)
-            self._persist_pending()
-            self._bump_version()
+                self.pending_records.append(record)
+                self._persist_pending()
+                self._bump_version()
+
+        if inserted_to_db:
+            try:
+                self.get_cached_overview("", "all", HISTORY_LIMIT)
+            except Exception:
+                pass
 
     def _db_writer_loop(self) -> None:
         last_retry = time.monotonic()
@@ -762,9 +785,7 @@ class SystemState:
     # ------------------------------------------------- Latch & Security Alert APIs
     def cancel_latch(self) -> None:
         with self.lock:
-            self.latched = None
-            self.face_window_start = None
-            self.best_face = None
+            self._clear_latch_locked()
             for cam in self.cams.values():
                 cam.observations.clear()
 
@@ -929,8 +950,6 @@ class SystemState:
             self.session_id += 1
             self.security_alert = None
             self._reset_session_state_locked()
-        if grabber is not None and other.grabber is grabber:
-            return None  # camera còn lại vẫn đang dùng chung luồng hình này
         return grabber
 
     def stop_cameras(self) -> None:
@@ -943,7 +962,7 @@ class SystemState:
 
     @staticmethod
     def _decode_b64_frame(data_str: str | None):
-        if not data_str:
+        if not data_str or len(data_str) > MAX_BROWSER_FRAME_B64_CHARS:
             return None
         try:
             raw_b64 = data_str.split(",", 1)[1] if "," in data_str else data_str
@@ -958,16 +977,6 @@ class SystemState:
         self, cam1_b64: str | None, cam2_b64: str | None
     ) -> dict:
         with self.lock:
-            if cam1_b64 and not self.cams[1].active:
-                self.cams[1].active = True
-                self.cams[1].mode = "browser"
-                self.cams[1].backend_name = "WebRTC (trình duyệt)"
-                self._refresh_running_locked()
-            if cam2_b64 and not self.cams[2].active:
-                self.cams[2].active = True
-                self.cams[2].mode = "browser"
-                self.cams[2].backend_name = "WebRTC (trình duyệt)"
-                self._refresh_running_locked()
             b1 = self.cams[1].active and self.cams[1].mode == "browser"
             b2 = self.cams[2].active and self.cams[2].mode == "browser"
             if not (b1 or b2):
@@ -1044,10 +1053,7 @@ class SystemState:
                 if g1 is not None:
                     frame1, last_seq[id(g1)] = g1.get_latest(last_seq.get(id(g1), 0))
                 if g2 is not None:
-                    if g2 is g1:
-                        frame2 = frame1
-                    else:
-                        frame2, last_seq[id(g2)] = g2.get_latest(last_seq.get(id(g2), 0))
+                    frame2, last_seq[id(g2)] = g2.get_latest(last_seq.get(id(g2), 0))
 
                 if frame1 is None and frame2 is None:
                     time.sleep(0.015)
@@ -1068,7 +1074,6 @@ class SystemState:
 
     def _analyze_single_cam_frame(
         self,
-        cam_id: int,
         frame,
         run_face_idle: bool,
         is_required_face_cam: bool,
@@ -1081,12 +1086,11 @@ class SystemState:
             and self.plate_model is not None
             and self.char_model is not None
         ):
-            plate_reads, plate_boxes, plate_crops = detect_plates(
+            plate_present, readings, plate_boxes, plate_crops = detect_plates(
                 frame, self.plate_model, self.char_model, annotated
             )
         else:
-            plate_reads, plate_boxes, plate_crops = [], [], {}
-        plate_present = bool(plate_reads)
+            plate_present, readings, plate_boxes, plate_crops = False, {}, [], {}
 
         faces: list[FaceData] = []
         if self.face_service is not None and (
@@ -1117,12 +1121,6 @@ class SystemState:
             for idx, f in enumerate(faces, start=1)
         ]
         overlay_boxes = {"plates": plate_boxes, "faces": face_boxes}
-
-        readings: dict[str, str] = {}
-        for raw in plate_reads:
-            normalized = normalize_plate(raw)
-            if normalized:
-                readings[normalized[0]] = normalized[1]
 
         return plate_present, readings, plate_crops, faces, jpeg_bytes, overlay_boxes
 
@@ -1167,7 +1165,6 @@ class SystemState:
 
         res1 = (
             self._analyze_single_cam_frame(
-                1,
                 frame1,
                 run_face_idle and required_face_cam is None,
                 required_face_cam == 1 or not dual_cam_mode,
@@ -1179,7 +1176,6 @@ class SystemState:
         )
         res2 = (
             self._analyze_single_cam_frame(
-                2,
                 frame2,
                 run_face_idle and required_face_cam is None,
                 required_face_cam == 2 or not dual_cam_mode,
@@ -1282,17 +1278,25 @@ class SystemState:
                 for cid in (1, 2):
                     v_check = get_vote_result(self.cams[cid].observations)
                     if is_vote_confirmed(v_check):
-                        _, cand_display, _, _, _ = v_check
+                        cand_key, cand_display, _, _, _ = v_check
+                        # Bỏ qua ngay nếu cả 2 chiều IN & OUT đều đang trong thời gian khóa Cooldown (tránh query DB lặp)
+                        if (
+                            f"{cand_key}:IN" in self.recent_confirms
+                            and f"{cand_key}:OUT" in self.recent_confirms
+                        ):
+                            self.cams[cid].observations.clear()
+                            continue
                         confirmed_candidates[cid] = cand_display
 
         # Truy vấn DB kiểm tra phiên gửi xe bên NGOÀI self.lock (lấy luôn embedding lượt VÀO để không phải query lần 2)
-        active_session_map: dict[str, dict | None] = {}
+        active_session_map: dict[str, tuple[dict | None, bool]] = {}
         for cand_plate in set(confirmed_candidates.values()):
             active_session_map[cand_plate] = self._get_active_parking_session(cand_plate)
 
         with self.lock:
             if self.session_id != session_id:
                 return
+            dual_cam_mode = bool(self.cams[1].active and self.cams[2].active)
 
             # ------------------------------------------------------------------
             # Xử lý máy trạng thái 2 Pha đối xứng (Lưu hờ Biển số -> Chốt Khuôn mặt):
@@ -1315,7 +1319,18 @@ class SystemState:
                             continue
 
                         key, display, vote_count, vote_share, sample_count = vote
-                        active_session = active_session_map.get(display)
+                        active_session, db_ok = active_session_map.get(
+                            display, (None, True)
+                        )
+                        if not db_ok:
+                            # Không tự ý gán chiều IN khi lỗi kết nối MySQL (tránh thu phí 2 lần cho xe đang gửi)
+                            cam.observations.clear()
+                            self._set_feedback_locked(
+                                "error",
+                                f"LỖI KẾT NỐI CSDL — TẠM HOÃN XÁC THỰC XE {display}",
+                            )
+                            continue
+
                         direction = "OUT" if active_session is not None else "IN"
                         target_face_cam_id = (
                             (3 - plate_cam_id) if dual_cam_mode else plate_cam_id
@@ -1345,9 +1360,12 @@ class SystemState:
                         cam.observations.clear()
                         cam.plate_crops.clear()
 
-                        # Giữ lại các khuôn mặt vừa xuất hiện trên Cam đối diện trong lúc đang bỏ phiếu biển số (<= 0.85s)
+                        # Giữ lại các khuôn mặt vừa xuất hiện trên Cam đối diện trong lúc đang bỏ phiếu biển số
                         opp_cam = self.cams[target_face_cam_id]
-                        while opp_cam.recent_faces and now - opp_cam.recent_faces[0][0] > 0.85:
+                        while (
+                            opp_cam.recent_faces
+                            and now - opp_cam.recent_faces[0][0] > FACE_PRE_LATCH_LOOKBACK_SECONDS
+                        ):
                             opp_cam.recent_faces.popleft()
                         if opp_cam.recent_faces:
                             best_recent = max(opp_cam.recent_faces, key=lambda item: item[1])
@@ -1375,18 +1393,14 @@ class SystemState:
                             "warn",
                             f"XE {self.latched['plate_number']} {dir_text} HỦY LƯU HỜ (ĐÃ ĐỔI XE MỚI)",
                         )
-                        self.latched = None
-                        self.face_window_start = None
-                        self.best_face = None
+                        self._clear_latch_locked()
                     elif elapsed_latch > LATCH_TIMEOUT_SECONDS:
                         dir_text = "VÀO BÃI" if self.latched["direction"] == "IN" else "RA BÃI"
                         self._set_feedback_locked(
                             "warn",
                             f"XE {self.latched['plate_number']} {dir_text} HỦY LƯU HỜ (THIẾU KHUÔN MẶT)",
                         )
-                        self.latched = None
-                        self.face_window_start = None
-                        self.best_face = None
+                        self._clear_latch_locked()
                     else:
                         req_cam_id = self.latched["required_face_cam"]
                         req_cam = self.cams[req_cam_id]
@@ -1395,7 +1409,7 @@ class SystemState:
                             if self.face_window_start is None:
                                 self.face_window_start = now
                             for f_ts, f_score, f_conf, f_frame, f_box, f_sharp in req_cam.recent_faces:
-                                if f_ts < latched_at - 0.85:
+                                if f_ts < latched_at - FACE_PRE_LATCH_LOOKBACK_SECONDS:
                                     continue
                                 if self.best_face is None or f_score > self.best_face[0]:
                                     self.best_face = (f_score, f_conf, f_frame, f_box, f_sharp)
@@ -1408,7 +1422,7 @@ class SystemState:
                         is_instant_sharp = (
                             self.best_face is not None
                             and self.best_face[1] >= 0.92
-                            and self.best_face[4] >= FACE_MIN_SHARPNESS * 1.35
+                            and self.best_face[4] >= FACE_INSTANT_SHARPNESS
                         )
                         is_sharp_enough = (
                             self.best_face is not None
@@ -1433,6 +1447,7 @@ class SystemState:
                             commit_pair = (
                                 {
                                     "_seq": self.confirm_seq,
+                                    "_session_id": session_id,
                                     "_plate_key": latched_info["plate_key"],
                                     "_active_session": latched_info.get("active_session"),
                                     "plate_number": latched_info["plate_number"],
@@ -1462,9 +1477,7 @@ class SystemState:
                                 },
                                 best_face,
                             )
-                            self.latched = None
-                            self.face_window_start = None
-                            self.best_face = None
+                            self._clear_latch_locked()
                             req_cam.recent_faces.clear()
 
             self.frame_count += 1
@@ -1472,16 +1485,22 @@ class SystemState:
         if commit_pair is not None:
             self._commit_latched_pair(*commit_pair)
 
-    def _get_active_parking_session(self, plate_number: str) -> dict | None:
+    def _get_active_parking_session(
+        self, plate_number: str
+    ) -> tuple[dict | None, bool]:
+        """Trả về (active_session, db_ok). Nếu lỗi kết nối DB mà không có bản ghi pending thì db_ok = False."""
         pending_sess = self._find_pending_active_session(plate_number)
         if pending_sess is not None:
-            return pending_sess
-        if self.database_ready:
+            return pending_sess, True
+        with self.lock:
+            db_ready = self.database_ready
+        if db_ready:
             try:
-                return find_active_parking_session(plate_number)
-            except Exception:
-                return None
-        return None
+                return find_active_parking_session(plate_number), True
+            except (DatabaseConfigurationError, DatabaseOperationError) as error:
+                self._set_db_status(False, str(error))
+                return None, False
+        return None, True
 
     def _find_pending_active_session(self, plate_number: str) -> dict | None:
         target_key = _clean_plate_key(plate_number)
@@ -1500,10 +1519,11 @@ class SystemState:
         return None
 
     def _commit_latched_pair(self, record: dict, best_face) -> None:
-        """Trích xuất vector 512 chiều của Khuôn mặt chuẩn nhất và:
-        - Nếu là chiều VÀO ('IN'): Lưu đồng thời (Biển số Cam 2 + Khuôn mặt Cam 1 + VÀO) vào MySQL.
-        - Nếu là chiều RA ('OUT'): Đối chiếu Cosine giữa Khuôn mặt Cam 2 với lượt VÀO;
+        """Trích xuất vector 512 chiều của Khuôn mặt chuẩn nhất từ Camera đối diện và:
+        - Nếu là chiều VÀO ('IN'): Lưu đồng thời (Biển số + Khuôn mặt + VÀO) vào MySQL.
+        - Nếu là chiều RA ('OUT'): Đối chiếu Cosine giữa Khuôn mặt hiện tại với lượt VÀO;
           nếu Khớp >= 65% thì ghi vào MySQL, nếu Lệch < 65% thì bật Cảnh báo an ninh."""
+        commit_session_id = record.pop("_session_id", self.session_id)
         plate_key = record.pop("_plate_key", "")
         cached_active_session = record.pop("_active_session", None)
         embedding = None
@@ -1519,8 +1539,6 @@ class SystemState:
                     print(f"[WARN] Không trích xuất được vector khuôn mặt: {error}")
         record["face_embedding"] = embedding
         record["face_image"] = face_image
-        _save_snapshot_to_disk("plate", record["plate_number"], record.get("plate_image"))
-        _save_snapshot_to_disk("face", record["plate_number"], face_image)
 
         direction = record["direction"]
         plate = record["plate_number"]
@@ -1579,6 +1597,8 @@ class SystemState:
                 if not check.get("matched", False):
                     # Lệch khuôn mặt: Chưa đặt cooldown để nếu Từ chối thì chủ xe thật quét lại được ngay
                     with self.lock:
+                        if self.session_id != commit_session_id:
+                            return
                         self.security_alert = {
                             "plate_key": plate_key,
                             "plate_number": plate,
@@ -1590,6 +1610,8 @@ class SystemState:
                     return
 
                 with self.lock:
+                    if self.session_id != commit_session_id:
+                        return
                     if plate_key:
                         self._lock_plate_cooldown_locked(plate_key, "OUT", now)
                     self._set_feedback_locked(
@@ -1598,6 +1620,8 @@ class SystemState:
                     )
             else:
                 with self.lock:
+                    if self.session_id != commit_session_id:
+                        return
                     if plate_key:
                         self._lock_plate_cooldown_locked(plate_key, "OUT", now)
                     self._set_feedback_locked(
@@ -1606,12 +1630,17 @@ class SystemState:
                     )
         else:
             with self.lock:
+                if self.session_id != commit_session_id:
+                    return
                 if plate_key:
                     self._lock_plate_cooldown_locked(plate_key, "IN", now)
                 self._set_feedback_locked(
                     "success",
                     f"XE {plate} VÀO BÃI THÀNH CÔNG",
                 )
+
+        _save_snapshot_to_disk("plate", record["plate_number"], record.get("plate_image"))
+        _save_snapshot_to_disk("face", record["plate_number"], face_image)
 
         preview = format_record_row("Mới", record)
         with self.lock:
@@ -1663,13 +1692,13 @@ app = FastAPI(
 
 
 class StartDualCameraRequest(BaseModel):
-    cam1_index: int = 0
-    cam2_index: int = 1
+    cam1_index: int = Field(default=0, ge=0, le=10)
+    cam2_index: int = Field(default=1, ge=0, le=10)
     prefer_browser: bool = False
 
 
 class StartSingleCameraRequest(BaseModel):
-    device_index: int = 0
+    device_index: int = Field(default=0, ge=0, le=10)
     prefer_browser: bool = False
 
 
@@ -1679,7 +1708,7 @@ class BrowserDualFrameRequest(BaseModel):
 
 
 class ResolveAlertRequest(BaseModel):
-    action: str
+    action: Literal["approve", "reject"]
 
 
 NO_CACHE_HEADERS = {"Cache-Control": "no-cache, no-store, must-revalidate"}
@@ -1727,9 +1756,9 @@ def _serialize_cam_unit(cam: CameraUnitState) -> dict:
 
 
 @app.get("/api/camera/status")
-async def get_camera_status():
+def get_camera_status():
     now = time.monotonic()
-    pending_count = state.get_pending_count()
+    pending_count = len(state.pending_records)
     with state.lock:
         cam1_status = _serialize_cam_unit(state.cams[1])
         cam2_status = _serialize_cam_unit(state.cams[2])

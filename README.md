@@ -21,19 +21,18 @@ pinned: false
 Hệ thống tự động hóa quy trình kiểm soát phương tiện ra/vào bãi giữ xe trường học bằng **2 luồng Camera AI hoạt động song song hoặc độc lập**, kết hợp nhận diện biển số xe máy Việt Nam (**YOLOv8**) và xác thực sinh trắc học khuôn mặt người gửi (**FaceNet 512-D**). Hệ thống tự động đối chiếu biển số và khuôn mặt khi xe lấy ra khỏi bãi, cảnh báo tức thì nếu phát hiện bất thường và thống kê doanh thu tự động theo mức giá cố định (`2.000 VNĐ / lượt`).
 
 ### Tính năng nổi bật
-- **Giám sát 2 Camera AI thời gian thực (`Cam 1` Phía trong & `Cam 2` Phía ngoài)**:
-  - Hỗ trợ bật/tắt và chọn cổng độc lập cho từng camera (hoặc bật 1 camera, tắt 1 camera).
+- **Giám sát 2 Camera AI thời gian thực (`Cam 1` & `Cam 2` chéo luồng đối xứng)**:
+  - Hỗ trợ bật/tắt và chọn cổng độc lập cho từng camera (bắt buộc 2 luồng tách biệt khi bật cả 2 camera, hoặc hỗ trợ chế độ 1 Camera dự phòng khi chỉ bật 1 camera).
   - Hiển thị luồng `<video>` trực tiếp 60 FPS kết hợp lớp phủ `<canvas>` vẽ khung Bounding Box thời gian thực không giật lag.
 - **Nhận diện Biển số xe Việt Nam 2 giai đoạn (YOLOv8)**:
   - Model 1 (`weights/plate_best.pt`): Phát hiện vùng biển số xe máy trong khung hình.
   - Model 2 (`weights/chars_best.pt`): Phân đoạn và đọc ký tự OCR, hỗ trợ thuật toán gom dòng thông minh cho biển số xe máy 2 dòng và 1 dòng, tự động hậu xử lý định dạng chuẩn Việt Nam (VD: `59A1-12345`, `79N2-59633`).
 - **Xác thực Khuôn mặt Sinh trắc học (FaceNet 512-D)**:
-  - Sử dụng **MTCNN** phát hiện khuôn mặt lớn nhất trong khung hình và **InceptionResnetV1 (`vggface2`)** trích xuất vector đặc trưng `512` chiều chuẩn hóa L2.
+  - Sử dụng **MTCNN** phát hiện khuôn mặt và **InceptionResnetV1 (`vggface2`)** trích xuất vector đặc trưng `512` chiều chuẩn hóa L2, kết hợp đo độ sắc nét Laplacian trên vùng lõi khuôn mặt (`inner 70%`) để loại bỏ khung hình bị rung/nhòe.
   - Tự động tính độ tương đồng **Cosine Similarity** giữa khuôn mặt lúc gửi xe và lúc lấy xe (ngưỡng an toàn $\ge 0.65$). Nếu thấp hơn ngưỡng, hệ thống tự động kích hoạt **Cảnh báo An ninh** trên giao diện.
-- **Cơ chế Chốt 2 Pha (Two-Phase Latch)**:
-  - Tự động xác định chiều di chuyển (**Xe VÀO** hoặc **Xe RA**) dựa trên vị trí xuất hiện của khuôn mặt và biển số trên `Cam 1` và `Cam 2`:
-    - **Chiều VÀO**: `Cam 1` (Phía trong) chụp Khuôn mặt + `Cam 2` (Phía ngoài) đọc Biển số.
-    - **Chiều RA**: `Cam 1` (Phía trong) đọc Biển số + `Cam 2` (Phía ngoài) chụp Khuôn mặt đối chiếu.
+- **Cơ chế Chốt 2 Pha đối xứng (Symmetric Two-Phase Latch — `4.0 giây`)**:
+  - Bất kỳ camera nào (`Cam 1` hoặc `Cam 2`) chốt được biển số trước thì **camera đối diện (`3 - plate_cam`)** bắt buộc phải xác thực khuôn mặt người lái trong vòng tối đa `4.0 giây` (tự động hủy nếu quá hạn hoặc phát hiện đổi biển số xe khác).
+  - Tự động xác định chiều di chuyển (**Xe VÀO** hoặc **Xe RA**) theo trạng thái thực tế của xe trong bãi (`IN_PARKING` $\rightarrow$ **Xe RA**, chưa có trong bãi $\rightarrow$ **Xe VÀO**).
   - Bỏ phiếu đa số (*Majority Voting*) trong cửa sổ trượt để chống nhiễu OCR trước khi chốt vào cơ sở dữ liệu.
 - **Quản lý Lịch sử & Báo cáo Doanh thu**:
   - Tự động tính phí **`2.000 VNĐ / lượt`** ngay khi xe hoàn tất lượt vào.

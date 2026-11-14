@@ -126,6 +126,9 @@ def _ensure_sqlite_table(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_sqlite_plate_status ON plate_recognition_history (plate_number, parking_status)"
         )
         cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sqlite_status_dir ON plate_recognition_history (parking_status, direction)"
+        )
+        cur.execute(
             "UPDATE plate_recognition_history SET fee_amount = 0 WHERE direction = 'OUT' AND fee_amount <> 0"
         )
         conn.commit()
@@ -155,7 +158,8 @@ def _ensure_mysql_table(cursor):
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_plate_recognized_at (plate_number, recognized_at),
             INDEX idx_recognized_at (recognized_at),
-            INDEX idx_plate_status (plate_number, parking_status)
+            INDEX idx_plate_status (plate_number, parking_status),
+            INDEX idx_status_dir (parking_status, direction)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """
     )
@@ -235,6 +239,11 @@ def _ensure_mysql_table(cursor):
         cursor.execute(
             "ALTER TABLE plate_recognition_history "
             "ADD INDEX idx_plate_status (plate_number, parking_status)"
+        )
+    if "idx_status_dir" not in existing_indexes:
+        cursor.execute(
+            "ALTER TABLE plate_recognition_history "
+            "ADD INDEX idx_status_dir (parking_status, direction)"
         )
 
 
