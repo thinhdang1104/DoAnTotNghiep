@@ -26,6 +26,7 @@ from database import (
     DatabaseConfigurationError,
     DatabaseOperationError,
     fetch_overview,
+    find_active_parking_session,
     flush_pending_plate_records,
     format_record_row,
     initialize_database,
@@ -51,15 +52,15 @@ CONF_CHAR = 0.35
 
 # Bỏ phiếu đồng thuận biển số độc lập trên từng Camera
 VOTE_WINDOW_SECONDS = 3.0
-VOTE_SAMPLE_INTERVAL_SECONDS = 0.25
+VOTE_SAMPLE_INTERVAL_SECONDS = 0.12
 VOTE_MIN_SAMPLES = 3
 VOTE_MIN_SHARE = 0.70
 
 # Cơ chế "Lưu hờ" (Two-Phase Latch): đợi khuôn mặt chuẩn nhất ở Camera đối diện (tối đa 4 giây)
-FACE_MIN_CONFIDENCE = 0.88
-FACE_MIN_SHARPNESS = 48.0
-FACE_SAMPLE_WINDOW_SECONDS = 0.65
-FACE_MAX_SHARPNESS_WAIT_SECONDS = 1.80
+FACE_MIN_CONFIDENCE = 0.85
+FACE_MIN_SHARPNESS = 18.0
+FACE_SAMPLE_WINDOW_SECONDS = 0.18
+FACE_MAX_SHARPNESS_WAIT_SECONDS = 0.50
 FACE_RECENT_BUFFER_SECONDS = 1.20
 LATCH_TIMEOUT_SECONDS = 4.0
 
@@ -1072,9 +1073,14 @@ class SystemState:
         run_face_idle: bool,
         is_required_face_cam: bool,
         encode_jpeg: bool = True,
+        skip_plate_ocr: bool = False,
     ):
         annotated = frame.copy() if encode_jpeg else None
-        if self.plate_model is not None and self.char_model is not None:
+        if (
+            not skip_plate_ocr
+            and self.plate_model is not None
+            and self.char_model is not None
+        ):
             plate_reads, plate_boxes, plate_crops = detect_plates(
                 frame, self.plate_model, self.char_model, annotated
             )
@@ -1130,19 +1136,43 @@ class SystemState:
             required_face_cam = (
                 self.latched["required_face_cam"] if self.latched is not None else None
             )
+            latched_plate_cam = (
+                self.latched["plate_cam"] if self.latched is not None else None
+            )
             active1 = self.cams[1].active
             active2 = self.cams[2].active
 
         dual_cam_mode = bool(active1 and active2)
         run_face_idle = current_frame_idx % FACE_IDLE_EVERY_N_FRAMES == 0
 
+        # Khi đang Lưu hờ ở chế độ 2 Cam:
+        # - Cam lấy mặt (required_face_cam) bỏ qua YOLO biển số để dồn 100% tốc độ cho MTCNN bắt nét mặt tức thì.
+        # - Cam biển số (latched_plate_cam) chỉ quét YOLO cách nhịp (mỗi 2 frame) để kiểm tra chống tráo xe.
+        skip_plate_1 = bool(
+            dual_cam_mode
+            and required_face_cam is not None
+            and (
+                required_face_cam == 1
+                or (latched_plate_cam == 1 and current_frame_idx % 2 == 1)
+            )
+        )
+        skip_plate_2 = bool(
+            dual_cam_mode
+            and required_face_cam is not None
+            and (
+                required_face_cam == 2
+                or (latched_plate_cam == 2 and current_frame_idx % 2 == 1)
+            )
+        )
+
         res1 = (
             self._analyze_single_cam_frame(
                 1,
                 frame1,
-                run_face_idle,
+                run_face_idle and required_face_cam is None,
                 required_face_cam == 1 or not dual_cam_mode,
                 encode_jpeg=encode_jpeg,
+                skip_plate_ocr=skip_plate_1,
             )
             if (active1 and frame1 is not None)
             else None
@@ -1151,9 +1181,10 @@ class SystemState:
             self._analyze_single_cam_frame(
                 2,
                 frame2,
-                run_face_idle,
+                run_face_idle and required_face_cam is None,
                 required_face_cam == 2 or not dual_cam_mode,
                 encode_jpeg=encode_jpeg,
+                skip_plate_ocr=skip_plate_2,
             )
             if (active2 and frame2 is not None)
             else None
@@ -1254,10 +1285,10 @@ class SystemState:
                         _, cand_display, _, _, _ = v_check
                         confirmed_candidates[cid] = cand_display
 
-        # Truy vấn DB kiểm tra xe đang gửi bên NGOÀI self.lock để tránh deadlock với db_write_lock
-        in_parking_map: dict[str, bool] = {}
+        # Truy vấn DB kiểm tra phiên gửi xe bên NGOÀI self.lock (lấy luôn embedding lượt VÀO để không phải query lần 2)
+        active_session_map: dict[str, dict | None] = {}
         for cand_plate in set(confirmed_candidates.values()):
-            in_parking_map[cand_plate] = self._is_plate_currently_in_parking(cand_plate)
+            active_session_map[cand_plate] = self._get_active_parking_session(cand_plate)
 
         with self.lock:
             if self.session_id != session_id:
@@ -1284,8 +1315,8 @@ class SystemState:
                             continue
 
                         key, display, vote_count, vote_share, sample_count = vote
-                        is_in_parking = in_parking_map.get(display, False)
-                        direction = "OUT" if is_in_parking else "IN"
+                        active_session = active_session_map.get(display)
+                        direction = "OUT" if active_session is not None else "IN"
                         target_face_cam_id = (
                             (3 - plate_cam_id) if dual_cam_mode else plate_cam_id
                         )
@@ -1307,20 +1338,20 @@ class SystemState:
                             "plate_cam": plate_cam_id,
                             "required_face_cam": target_face_cam_id,
                             "latched_at": now,
+                            "active_session": active_session,
                         }
                         self.face_window_start = None
                         self.best_face = None
                         cam.observations.clear()
                         cam.plate_crops.clear()
 
-                        # Chỉ giữ lại các khuôn mặt vừa xuất hiện sát thời điểm chốt biển (<= 0.25s)
-                        # và loại bỏ các khung hình mặt cũ trước đó để không đè điểm khung hình mới
+                        # Giữ lại các khuôn mặt vừa xuất hiện trên Cam đối diện trong lúc đang bỏ phiếu biển số (<= 0.85s)
                         opp_cam = self.cams[target_face_cam_id]
-                        while opp_cam.recent_faces and now - opp_cam.recent_faces[0][0] > 0.25:
+                        while opp_cam.recent_faces and now - opp_cam.recent_faces[0][0] > 0.85:
                             opp_cam.recent_faces.popleft()
                         if opp_cam.recent_faces:
                             best_recent = max(opp_cam.recent_faces, key=lambda item: item[1])
-                            self.face_window_start = now
+                            self.face_window_start = opp_cam.recent_faces[0][0]
                             self.best_face = (
                                 best_recent[1],
                                 best_recent[2],
@@ -1364,7 +1395,7 @@ class SystemState:
                             if self.face_window_start is None:
                                 self.face_window_start = now
                             for f_ts, f_score, f_conf, f_frame, f_box, f_sharp in req_cam.recent_faces:
-                                if f_ts < latched_at - 0.25:
+                                if f_ts < latched_at - 0.85:
                                     continue
                                 if self.best_face is None or f_score > self.best_face[0]:
                                     self.best_face = (f_score, f_conf, f_frame, f_box, f_sharp)
@@ -1374,17 +1405,25 @@ class SystemState:
                             if self.face_window_start is not None
                             else 0.0
                         )
+                        is_instant_sharp = (
+                            self.best_face is not None
+                            and self.best_face[1] >= 0.92
+                            and self.best_face[4] >= FACE_MIN_SHARPNESS * 1.35
+                        )
                         is_sharp_enough = (
                             self.best_face is not None
                             and (
-                                self.best_face[4] >= FACE_MIN_SHARPNESS
+                                is_instant_sharp
+                                or (
+                                    face_wait_elapsed >= FACE_SAMPLE_WINDOW_SECONDS
+                                    and self.best_face[4] >= FACE_MIN_SHARPNESS
+                                )
                                 or face_wait_elapsed >= FACE_MAX_SHARPNESS_WAIT_SECONDS
                             )
                         )
                         if (
                             self.best_face is not None
                             and self.face_window_start is not None
-                            and face_wait_elapsed >= FACE_SAMPLE_WINDOW_SECONDS
                             and is_sharp_enough
                         ):
                             latched_info = self.latched
@@ -1395,6 +1434,7 @@ class SystemState:
                                 {
                                     "_seq": self.confirm_seq,
                                     "_plate_key": latched_info["plate_key"],
+                                    "_active_session": latched_info.get("active_session"),
                                     "plate_number": latched_info["plate_number"],
                                     "plate_image": latched_info.get("plate_image"),
                                     "direction": latched_info["direction"],
@@ -1432,16 +1472,16 @@ class SystemState:
         if commit_pair is not None:
             self._commit_latched_pair(*commit_pair)
 
-    def _is_plate_currently_in_parking(self, plate_number: str) -> bool:
-        if self._find_pending_active_session(plate_number) is not None:
-            return True
+    def _get_active_parking_session(self, plate_number: str) -> dict | None:
+        pending_sess = self._find_pending_active_session(plate_number)
+        if pending_sess is not None:
+            return pending_sess
         if self.database_ready:
             try:
-                check = verify_checkout_face(plate_number, None)
-                return bool(check and check.get("has_active_session"))
+                return find_active_parking_session(plate_number)
             except Exception:
-                return False
-        return False
+                return None
+        return None
 
     def _find_pending_active_session(self, plate_number: str) -> dict | None:
         target_key = _clean_plate_key(plate_number)
@@ -1465,6 +1505,7 @@ class SystemState:
         - Nếu là chiều RA ('OUT'): Đối chiếu Cosine giữa Khuôn mặt Cam 2 với lượt VÀO;
           nếu Khớp >= 65% thì ghi vào MySQL, nếu Lệch < 65% thì bật Cảnh báo an ninh."""
         plate_key = record.pop("_plate_key", "")
+        cached_active_session = record.pop("_active_session", None)
         embedding = None
         face_image = None
         if best_face is not None:
@@ -1487,13 +1528,27 @@ class SystemState:
 
         if direction == "OUT":
             check = None
-            with self.lock:
-                db_ready = self.database_ready
-            if db_ready:
-                try:
-                    check = verify_checkout_face(plate, embedding)
-                except (DatabaseConfigurationError, DatabaseOperationError) as error:
-                    self._set_db_status(False, str(error))
+            if cached_active_session is not None:
+                prev_emb = cached_active_session.get("embedding")
+                if embedding and prev_emb:
+                    score = max(
+                        -1.0, min(1.0, cosine_similarity(embedding, prev_emb))
+                    )
+                    check = {
+                        "has_active_session": True,
+                        "entry_id": cached_active_session.get("id"),
+                        "entry_time": cached_active_session.get("recognized_at"),
+                        "match_score": score,
+                        "matched": score >= FACE_MATCH_THRESHOLD,
+                    }
+            if check is None:
+                with self.lock:
+                    db_ready = self.database_ready
+                if db_ready:
+                    try:
+                        check = verify_checkout_face(plate, embedding)
+                    except (DatabaseConfigurationError, DatabaseOperationError) as error:
+                        self._set_db_status(False, str(error))
 
             if check is None or not check.get("has_active_session"):
                 pending_sess = self._find_pending_active_session(plate)

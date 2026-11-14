@@ -105,9 +105,9 @@ class FaceService:
         """Phát hiện khuôn mặt trên khung hình BGR, sắp xếp theo độ tin cậy giảm dần."""
         height, width = frame.shape[:2]
         scale = 1.0
-        if self.device == "cpu" and width > 480:
-            scale = 480.0 / float(width)
-            small_w = 480
+        if self.device == "cpu" and width > 360:
+            scale = 360.0 / float(width)
+            small_w = 360
             small_h = max(60, int(round(height * scale)))
             small_bgr = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
             rgb_frame = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2RGB)

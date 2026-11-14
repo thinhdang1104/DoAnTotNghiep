@@ -521,7 +521,7 @@
       } finally {
         browserInFlight = false;
       }
-    }, 220);
+    }, 140);
   }
 
   async function startBrowserWebRTCForCam(camId, portIdx) {
@@ -1031,7 +1031,7 @@
 
   async function pollLoop() {
     await pollCameraStatusOnce();
-    setTimeout(pollLoop, 400);
+    setTimeout(pollLoop, 260);
   }
 
   // ==================== REVENUE REPORT (NGÀY / THÁNG / NĂM) ====================
