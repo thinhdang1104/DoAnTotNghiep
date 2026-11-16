@@ -454,12 +454,16 @@ def initialize_database() -> None:
         if not _should_allow_sqlite_fallback():
             raise
         print(f"[WARN] Không kết nối được MySQL ({error}), chuyển sang SQLite dự phòng.")
-        conn = _connect_sqlite()
+        conn = None
         try:
+            conn = _connect_sqlite()
             _ensure_sqlite_table(conn, force=True)
             _ACTIVE_BACKEND = "sqlite"
+        except sqlite3.Error as sq_err:
+            raise DatabaseOperationError(str(sq_err)) from sq_err
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
         seed_demo_records_if_empty()
 
 
@@ -558,8 +562,9 @@ def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
     norm_plate = _normalize_search(plate_number)
     if _ACTIVE_BACKEND == "sqlite" and cursor is None:
         with _SQLITE_LOCK:
-            conn = _connect_sqlite()
+            conn = None
             try:
+                conn = _connect_sqlite()
                 _ensure_sqlite_table(conn)
                 cur = conn.cursor()
                 cur.execute(
@@ -586,8 +591,11 @@ def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
                         bytes(raw_emb) if raw_emb is not None else None
                     ),
                 }
+            except sqlite3.Error as error:
+                raise DatabaseOperationError(str(error)) from error
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
     own_conn = cursor is None
     connection = None
@@ -940,8 +948,9 @@ def fetch_overview(
     """Thống kê toàn bộ bảng + báo cáo doanh thu Ngày/Tháng/Năm + danh sách bản ghi."""
     if _ACTIVE_BACKEND == "sqlite":
         with _SQLITE_LOCK:
-            conn = _connect_sqlite()
+            conn = None
             try:
+                conn = _connect_sqlite()
                 _ensure_sqlite_table(conn)
                 cur = conn.cursor()
                 today_prefix = now_vn().strftime("%Y-%m-%d")
@@ -1029,8 +1038,11 @@ def fetch_overview(
                     "matched": matched,
                     "records": records,
                 }
+            except sqlite3.Error as error:
+                raise DatabaseOperationError(str(error)) from error
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
     connection = _connect_mysql()
     cursor = connection.cursor(dictionary=True)
@@ -1128,8 +1140,9 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
     """Lưu một lượt nhận diện (VÀO hoặc RA)."""
     if _ACTIVE_BACKEND == "sqlite" and connection is None:
         with _SQLITE_LOCK:
-            conn = _connect_sqlite()
+            conn = None
             try:
+                conn = _connect_sqlite()
                 _ensure_sqlite_table(conn)
                 cur = conn.cursor()
                 direction = str(record.get("direction") or "IN").upper()
@@ -1197,8 +1210,16 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                 )
                 conn.commit()
                 return int(cur.lastrowid), match_score
+            except sqlite3.Error as error:
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                raise DatabaseOperationError(str(error)) from error
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
     own_connection = connection is None
     if own_connection:

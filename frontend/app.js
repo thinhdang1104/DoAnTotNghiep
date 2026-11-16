@@ -246,7 +246,6 @@
   // ==================== DUAL CAMERA CONTROLS (LOCAL USB + CLOUD WEBRTC) ====================
   let browserWebRTCActive = false;
   let isStartingCamera = false;
-  let didInitialStaleCheck = false;
   let browserCamDevices = [];
   let browserStreams = [null, null];
   let browserVideos = [null, null];
@@ -926,16 +925,6 @@
 
     updatePendingBadgeUI(state.pending_count);
 
-    if (!didInitialStaleCheck) {
-      didInitialStaleCheck = true;
-      if (state.running && state.mode === "browser" && !browserWebRTCActive) {
-        await fetch("/api/camera/stop", { method: "POST" }).catch(() => {});
-        state.running = false;
-        if (state.cam1) state.cam1.active = false;
-        if (state.cam2) state.cam2.active = false;
-      }
-    }
-
     const active1 = syncSingleCamUI(
       1,
       state.cam1,
@@ -1279,7 +1268,7 @@
 
     if (totalItems === 0) {
       if (paginationRangeText) {
-        paginationRangeText.textContent = "Hiển thị 0–0 / 0 bản ghi";
+        paginationRangeText.textContent = "Hiển thị 0–0 / 0 bản ghi (tối đa 200 bản ghi mới nhất)";
       }
       paginationControls.innerHTML = "";
       return;
@@ -1288,7 +1277,7 @@
     const startIdx = (currentPage - 1) * pageSize + 1;
     const endIdx = Math.min(totalItems, currentPage * pageSize);
     if (paginationRangeText) {
-      paginationRangeText.textContent = `Hiển thị ${startIdx}–${endIdx} / ${totalItems} bản ghi`;
+      paginationRangeText.textContent = `Hiển thị ${startIdx}–${endIdx} / ${totalItems} bản ghi (tối đa 200 bản ghi mới nhất)`;
     }
 
     const pageItems = buildPageNumbers(totalPages, currentPage);
@@ -1326,7 +1315,7 @@
     cachedTotalRecords = typeof totalRecords === "number" ? totalRecords : cachedHistoryRecords.length;
 
     if (ledgerCountText) {
-      ledgerCountText.textContent = `${cachedMatchedCount} / ${cachedTotalRecords} bản ghi`;
+      ledgerCountText.textContent = `${cachedMatchedCount} / ${cachedTotalRecords} bản ghi (tối đa 200 bản ghi mới nhất)`;
     }
 
     const totalItems = cachedHistoryRecords.length;
@@ -1450,8 +1439,9 @@
     if (activeStatusFilter && activeStatusFilter !== "all") {
       params.set("status", activeStatusFilter);
     }
+    params.set("limit", "200");
     const qs = params.toString();
-    const url = qs ? `/api/management/overview?${qs}` : "/api/management/overview";
+    const url = `/api/management/overview?${qs}`;
 
     try {
       const res = await fetch(url);

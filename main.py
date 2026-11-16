@@ -60,9 +60,12 @@ VOTE_MIN_SHARE = 0.70
 
 # Cơ chế "Lưu hờ" (Two-Phase Latch): đợi khuôn mặt chuẩn nhất ở Camera đối diện (tối đa 4 giây)
 # Ngưỡng độ nét (Laplacian Variance 128x128 trên vùng lõi 70% mặt):
-# - Ảnh mặt mờ thực tế (media_1794468081037_1e129541.png) đo được = 12.85
-# - Khuôn mặt rõ nét đạt >= 22.0 (chốt tức thì ở >= 28.0 kèm confidence >= 0.92)
+# - Ảnh mặt mờ thực tế (media_1794468081037_1e129541.png) đo được = 13.95
+# - Ngưỡng sàn thử nghiệm: FACE_FLOOR_SHARPNESS = 15.0 (chấp nhận sau 0.50s chờ)
+# - Ngưỡng chuẩn: FACE_MIN_SHARPNESS = 22.0 (chấp nhận sau 0.18s lấy mẫu)
+# - Chốt tức thì: FACE_INSTANT_SHARPNESS = 28.0 kèm confidence >= 0.92
 FACE_MIN_CONFIDENCE = 0.85
+FACE_FLOOR_SHARPNESS = 15.0
 FACE_MIN_SHARPNESS = 22.0
 FACE_INSTANT_SHARPNESS = 28.0
 FACE_SAMPLE_WINDOW_SECONDS = 0.18
@@ -409,6 +412,18 @@ def _face_score(face: FaceData, frame) -> tuple[float, float]:
     return score, sharpness
 
 
+def _face_candidate_rank(score: float, sharpness: float) -> tuple[int, float]:
+    """Xếp hạng ứng viên khuôn mặt theo bậc độ nét (Chuẩn >= 22.0 > Sàn >= 15.0 > Mờ < 15.0)
+    để mặt lớn nhưng mờ (< 15.0) không bao giờ chiếm vị trí của mặt nhỏ nhưng đủ nét."""
+    if sharpness >= FACE_MIN_SHARPNESS:
+        tier = 2
+    elif sharpness >= FACE_FLOOR_SHARPNESS:
+        tier = 1
+    else:
+        tier = 0
+    return (tier, score)
+
+
 # ============================================================================
 # Camera
 # ============================================================================
@@ -550,6 +565,7 @@ class SystemState:
         self.pending_records: list[dict] = []
         self.records_version = 0
         self.overview_cache: dict[tuple, dict] = {}
+        self.overview_cache_date: str = ""
         self.write_queue: queue.Queue = queue.Queue()
         self.writer_stop = threading.Event()
         self.writer_thread: threading.Thread | None = None
@@ -674,15 +690,19 @@ class SystemState:
             self.overview_cache.clear()
 
     def get_cached_overview(self, q: str, status: str, limit: int) -> dict | None:
+        today_str = now_vn().strftime("%Y-%m-%d")
         with self.lock:
+            if self.overview_cache_date != today_str:
+                self.overview_cache.clear()
+                self.overview_cache_date = today_str
             ver = self.records_version
-            key = (ver, q.strip(), status.strip(), limit)
+            key = (today_str, ver, q.strip(), status.strip(), limit)
             cached = self.overview_cache.get(key)
         if cached is not None:
             return cached
         overview = fetch_overview(q, status, limit)
         with self.lock:
-            if self.records_version == ver:
+            if self.records_version == ver and self.overview_cache_date == today_str:
                 self.overview_cache[key] = overview
         return overview
 
@@ -693,6 +713,7 @@ class SystemState:
             self._set_db_status(False, str(error))
             raise
         self._set_db_status(True, None)
+        self._bump_version()
         return self.flush_pending()
 
     def flush_pending(self) -> int:
@@ -755,14 +776,22 @@ class SystemState:
 
     def _db_writer_loop(self) -> None:
         last_retry = time.monotonic()
-        while not self.writer_stop.is_set():
+        while not self.writer_stop.is_set() or not self.write_queue.empty():
             try:
-                record = self.write_queue.get(timeout=1.0)
+                timeout = 0.05 if self.writer_stop.is_set() else 1.0
+                record = self.write_queue.get(timeout=timeout)
             except queue.Empty:
+                if self.writer_stop.is_set():
+                    break
                 record = None
 
             if record is not None:
-                self._store_record(dict(record))
+                try:
+                    self._store_record(dict(record))
+                except Exception as error:  # noqa: BLE001
+                    print(f"[WARN] Lỗi không mong đợi trong luồng ghi DB: {error}")
+                finally:
+                    self.write_queue.task_done()
                 continue
 
             with self.lock:
@@ -777,13 +806,14 @@ class SystemState:
                     pass
 
     def start_db_writer(self) -> None:
+        self.writer_stop.clear()
         self.writer_thread = threading.Thread(target=self._db_writer_loop, daemon=True)
         self.writer_thread.start()
 
-    def stop_db_writer(self) -> None:
+    def stop_db_writer(self, timeout: float = 15.0) -> None:
         self.writer_stop.set()
-        if self.writer_thread is not None:
-            self.writer_thread.join(timeout=3.0)
+        if self.writer_thread is not None and self.writer_thread.is_alive():
+            self.writer_thread.join(timeout=timeout)
 
     # ------------------------------------------------- Latch & Security Alert APIs
     def cancel_latch(self) -> None:
@@ -793,6 +823,8 @@ class SystemState:
                 cam.observations.clear()
 
     def resolve_security_alert(self, approve: bool) -> dict:
+        if self.writer_stop.is_set():
+            return {"status": "none", "message": ""}
         record_to_save = None
         now = time.monotonic()
         with self.lock:
@@ -969,6 +1001,9 @@ class SystemState:
             worker = self.worker_thread
         if worker is not None and worker.is_alive():
             worker.join(timeout=CAMERA_STOP_TIMEOUT_SECONDS)
+        # Đợi khung hình trình duyệt (nếu đang chạy dở) kết thúc để ngừng hoàn toàn nguồn sinh bản ghi mới trước khi tắt writer
+        with self.infer_lock:
+            pass
 
     @staticmethod
     def _decode_b64_frame(data_str: str | None):
@@ -986,6 +1021,8 @@ class SystemState:
     def ingest_browser_frames(
         self, cam1_b64: str | None, cam2_b64: str | None
     ) -> dict:
+        if self.writer_stop.is_set():
+            return {"active": False}
         with self.lock:
             b1 = self.cams[1].active and self.cams[1].mode == "browser"
             b2 = self.cams[2].active and self.cams[2].mode == "browser"
@@ -1268,7 +1305,8 @@ class SystemState:
                         (*_face_score(f, raw_frame), f) for f in valid_faces
                     ]
                     best_score, best_sharpness, best_in_frame = max(
-                        scored_faces, key=lambda item: item[0]
+                        scored_faces,
+                        key=lambda item: _face_candidate_rank(item[0], item[1]),
                     )
                     cam.recent_faces.append(
                         (
@@ -1396,7 +1434,10 @@ class SystemState:
                         ):
                             opp_cam.recent_faces.popleft()
                         if opp_cam.recent_faces:
-                            best_recent = max(opp_cam.recent_faces, key=lambda item: item[1])
+                            best_recent = max(
+                                opp_cam.recent_faces,
+                                key=lambda item: _face_candidate_rank(item[1], item[5]),
+                            )
                             self.face_window_start = opp_cam.recent_faces[0][0]
                             self.best_face = (
                                 best_recent[1],
@@ -1424,9 +1465,16 @@ class SystemState:
                         self._clear_latch_locked()
                     elif elapsed_latch > LATCH_TIMEOUT_SECONDS:
                         dir_text = "VÀO BÃI" if self.latched["direction"] == "IN" else "RA BÃI"
+                        if (
+                            self.best_face is not None
+                            and self.best_face[4] < FACE_FLOOR_SHARPNESS
+                        ):
+                            reason = "KHUÔN MẶT BỊ MỜ, VUI LÒNG QUÉT LẠI"
+                        else:
+                            reason = "THIẾU KHUÔN MẶT"
                         self._set_feedback_locked(
                             "warn",
-                            f"XE {self.latched['plate_number']} {dir_text} HỦY LƯU HỜ (THIẾU KHUÔN MẶT)",
+                            f"XE {self.latched['plate_number']} {dir_text} HỦY LƯU HỜ ({reason})",
                         )
                         self._clear_latch_locked()
                     else:
@@ -1439,7 +1487,11 @@ class SystemState:
                             for f_ts, f_score, f_conf, f_frame, f_box, f_sharp in req_cam.recent_faces:
                                 if f_ts < latched_at - FACE_PRE_LATCH_LOOKBACK_SECONDS:
                                     continue
-                                if self.best_face is None or f_score > self.best_face[0]:
+                                if self.best_face is None or _face_candidate_rank(
+                                    f_score, f_sharp
+                                ) > _face_candidate_rank(
+                                    self.best_face[0], self.best_face[4]
+                                ):
                                     self.best_face = (f_score, f_conf, f_frame, f_box, f_sharp)
 
                         face_wait_elapsed = (
@@ -1460,7 +1512,10 @@ class SystemState:
                                     face_wait_elapsed >= FACE_SAMPLE_WINDOW_SECONDS
                                     and self.best_face[4] >= FACE_MIN_SHARPNESS
                                 )
-                                or face_wait_elapsed >= FACE_MAX_SHARPNESS_WAIT_SECONDS
+                                or (
+                                    face_wait_elapsed >= FACE_MAX_SHARPNESS_WAIT_SECONDS
+                                    and self.best_face[4] >= FACE_FLOOR_SHARPNESS
+                                )
                             )
                         )
                         if (
@@ -1545,23 +1600,49 @@ class SystemState:
 
     def _commit_latched_pair(self, record: dict, best_face) -> None:
         """Trích xuất vector 512 chiều của Khuôn mặt chuẩn nhất từ Camera đối diện và:
+        - Chặn cả chiều VÀO và RA nếu chưa trích xuất được vector đặc trưng khuôn mặt hợp lệ.
         - Nếu là chiều VÀO ('IN'): Lưu đồng thời (Biển số + Khuôn mặt + VÀO) vào MySQL.
         - Nếu là chiều RA ('OUT'): Đối chiếu Cosine giữa Khuôn mặt hiện tại với lượt VÀO;
           nếu Khớp >= 65% thì ghi vào MySQL, nếu Lệch < 65% thì bật Cảnh báo an ninh."""
         commit_session_id = record.pop("_session_id", self.session_id)
         plate_key = record.pop("_plate_key", "")
         cached_active_session = record.pop("_active_session", None)
+        if self.writer_stop.is_set():
+            return
+
+        if self.face_service is None or not self.face_service.can_embed:
+            with self.lock:
+                if self.session_id == commit_session_id:
+                    for cam in self.cams.values():
+                        cam.observations.clear()
+                    self._set_feedback_locked(
+                        "error",
+                        "Mô hình khuôn mặt chưa sẵn sàng, vui lòng đợi",
+                    )
+            return
+
         embedding = None
         face_image = None
         if best_face is not None:
             face_image = _crop_to_data_url(
                 best_face[2], best_face[3], max_w=320, max_h=320, pad_ratio=0.22
             )
-            if self.face_service is not None:
-                try:
-                    embedding = self.face_service.embed_face(best_face[2], best_face[3])
-                except Exception as error:  # noqa: BLE001
-                    print(f"[WARN] Không trích xuất được vector khuôn mặt: {error}")
+            try:
+                embedding = self.face_service.embed_face(best_face[2], best_face[3])
+            except Exception as error:  # noqa: BLE001
+                print(f"[WARN] Không trích xuất được vector khuôn mặt: {error}")
+
+        if not embedding:
+            with self.lock:
+                if self.session_id == commit_session_id:
+                    for cam in self.cams.values():
+                        cam.observations.clear()
+                    self._set_feedback_locked(
+                        "warn",
+                        "Không lấy được đặc trưng khuôn mặt, vui lòng quét lại",
+                    )
+            return
+
         record["face_embedding"] = embedding
         record["face_image"] = face_image
 

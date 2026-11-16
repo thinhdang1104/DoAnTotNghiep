@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=20261116d" />
+  <link rel="stylesheet" href="styles.css?v=20261116e" />
 </head>
 <body>
   <div class="app-shell">
@@ -349,7 +349,7 @@
                 class="input search-input"
                 placeholder="Tìm biển số xe..."
               />
-              <span id="ledger-count-text" class="stamp mono-num num">0 bản ghi</span>
+              <span id="ledger-count-text" class="stamp mono-num num">0 bản ghi (tối đa 200 bản ghi mới nhất)</span>
               <button id="btn-refresh-management" class="btn" type="button">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
@@ -379,7 +379,7 @@
 
           <div id="ledger-pagination" class="pagination-bar" aria-label="Phân trang danh sách bản ghi">
             <div class="pagination-meta">
-              <span id="pagination-range-text" class="stamp mono-num num">Hiển thị 0–0 / 0 bản ghi</span>
+              <span id="pagination-range-text" class="stamp mono-num num">Hiển thị 0–0 / 0 bản ghi (tối đa 200 bản ghi mới nhất)</span>
               <label for="page-size-select" class="pagination-size-label">
                 <span>Số dòng:</span>
                 <select id="page-size-select" class="input page-size-select mono-num num">
@@ -513,6 +513,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261116d"></script>
+  <script src="app.js?v=20261116e"></script>
 </body>
 </html>
