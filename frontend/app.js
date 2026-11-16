@@ -211,14 +211,23 @@
   async function resolveAlert(action) {
     btnApproveExit.disabled = true;
     btnRejectExit.disabled = true;
+    // Ẩn ngay hộp cảnh báo (Optimistic UI) để giao diện phản hồi tức thì khi bấm nút
+    if (securityAlertBox) {
+      securityAlertBox.classList.add("hidden");
+    }
     try {
-      await fetch("/api/camera/resolve-alert", {
+      const res = await fetch("/api/camera/resolve-alert", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action }),
       });
-      await pollCameraStatusOnce();
-      await fetchManagementOverview();
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.message) {
+          showBanner(cameraAlertBox, data.type || "warn", data.message, 1000);
+        }
+      }
+      pollCameraStatusOnce();
     } finally {
       btnApproveExit.disabled = false;
       btnRejectExit.disabled = false;

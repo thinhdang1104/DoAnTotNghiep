@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import mysql.connector
-from mysql.connector import Error as MySQLError
+from mysql.connector import Error as MySQLError, pooling
 from dotenv import load_dotenv
 
 from face_service import (
@@ -24,6 +24,8 @@ HISTORY_LIMIT = 200
 PARKING_FEE_VND = 2000  # 2.000 VNĐ / lượt giữ xe
 SQLITE_DB_PATH = BASE_DIR / "data" / "parking_history.db"
 _SQLITE_LOCK = threading.RLock()
+_MYSQL_POOL_LOCK = threading.Lock()
+_MYSQL_POOL: pooling.MySQLConnectionPool | None = None
 _ACTIVE_BACKEND = "mysql"  # "mysql" hoặc "sqlite"
 
 
@@ -69,9 +71,24 @@ def _connection_config():
 
 
 def _connect_mysql():
+    global _MYSQL_POOL
     config = _connection_config()
     try:
-        return mysql.connector.connect(**config)
+        with _MYSQL_POOL_LOCK:
+            if _MYSQL_POOL is None:
+                _MYSQL_POOL = pooling.MySQLConnectionPool(
+                    pool_name="datn_mysql_pool",
+                    pool_size=4,
+                    pool_reset_session=True,
+                    **config,
+                )
+        conn = _MYSQL_POOL.get_connection()
+        try:
+            conn.ping(reconnect=True, attempts=1, delay=0)
+        except Exception:
+            conn.close()
+            return mysql.connector.connect(**config)
+        return conn
     except MySQLError as error:
         raise DatabaseOperationError(str(error)) from error
 

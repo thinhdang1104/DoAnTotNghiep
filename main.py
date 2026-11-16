@@ -648,12 +648,10 @@ class SystemState:
             print(f"[WARN] Không ghi được {PENDING_FILE}: {error}")
 
     def get_pending_snapshot(self) -> list[dict]:
-        with self.db_write_lock:
-            return list(self.pending_records)
+        return list(self.pending_records)
 
     def get_pending_count(self) -> int:
-        with self.db_write_lock:
-            return len(self.pending_records)
+        return len(self.pending_records)
 
     # -------------------------------------------------------------- database
     def _set_db_status(self, ready: bool, error: str | None) -> None:
@@ -661,10 +659,14 @@ class SystemState:
             self.database_ready = ready
             self.database_error = error
 
-    def _bump_version(self) -> None:
+    def _bump_version(self, prewarmed_overview: dict | None = None) -> None:
         with self.lock:
             self.records_version += 1
             self.overview_cache.clear()
+            if prewarmed_overview is not None:
+                self.overview_cache[
+                    (self.records_version, "", "all", HISTORY_LIMIT)
+                ] = prewarmed_overview
 
     def get_cached_overview(self, q: str, status: str, limit: int) -> dict | None:
         with self.lock:
@@ -724,7 +726,6 @@ class SystemState:
                                 {**record, "face_match_score": match_score},
                             )
                             self.last_confirmed["match_status"] = preview["Đối chiếu"]
-                    self._bump_version()
                     inserted_to_db = True
                 except (DatabaseConfigurationError, DatabaseOperationError) as error:
                     self._set_db_status(False, str(error))
@@ -745,10 +746,12 @@ class SystemState:
                 self._bump_version()
 
         if inserted_to_db:
+            fresh_overview = None
             try:
-                self.get_cached_overview("", "all", HISTORY_LIMIT)
+                fresh_overview = fetch_overview("", "all", HISTORY_LIMIT)
             except Exception:
-                pass
+                fresh_overview = None
+            self._bump_version(prewarmed_overview=fresh_overview)
 
     def _db_writer_loop(self) -> None:
         last_retry = time.monotonic()
@@ -795,29 +798,26 @@ class SystemState:
         with self.lock:
             alert = self.security_alert
             if alert is None:
-                return {"status": "none"}
+                return {"status": "none", "message": ""}
             self.security_alert = None
             plate_key = alert.get("plate_key", "")
+            plate_number = alert["record"].get("plate_number", "")
             direction = alert["record"].get("direction", "OUT")
 
             if approve:
                 record_to_save = alert["record"]
+                msg = f"XE {plate_number} RA BÃI ĐƯỢC DUYỆT"
                 if plate_key:
                     self._lock_plate_cooldown_locked(plate_key, direction, now)
-                self._set_feedback_locked(
-                    "warn",
-                    f"XE {record_to_save['plate_number']} RA BÃI ĐƯỢC DUYỆT",
-                )
+                self._set_feedback_locked("warn", msg)
             else:
                 # Khi TỪ CHỐI: xóa cooldown của biển số này để chủ xe thật có thể quét lại ngay
+                msg = f"XE {plate_number} RA BÃI BỊ TỪ CHỐI"
                 if plate_key:
                     self.recent_confirms.pop(f"{plate_key}:OUT", None)
                 for cam in self.cams.values():
                     cam.observations.clear()
-                self._set_feedback_locked(
-                    "error",
-                    f"XE {alert['record']['plate_number']} RA BÃI BỊ TỪ CHỐI",
-                )
+                self._set_feedback_locked("error", msg)
 
         if record_to_save is not None:
             preview = format_record_row("Mới", record_to_save)
@@ -832,8 +832,8 @@ class SystemState:
                     "match_status": preview["Đối chiếu"],
                 }
             self.write_queue.put(record_to_save)
-            return {"status": "approved"}
-        return {"status": "rejected"}
+            return {"status": "approved", "message": msg, "type": "warn"}
+        return {"status": "rejected", "message": msg, "type": "error"}
 
     # ------------------------------------------------- Camera độc lập (bật/tắt riêng)
     def _refresh_running_locked(self) -> None:
@@ -1129,6 +1129,9 @@ class SystemState:
     ) -> None:
         with self.lock:
             if self.session_id != session_id:
+                return
+            if self.security_alert is not None and not encode_jpeg:
+                # Tạm ngưng chạy YOLO/MTCNN khi đang hiển thị Cảnh báo lệch mặt để nút Duyệt/Từ chối phản hồi tức thì
                 return
             current_frame_idx = self.frame_count
             required_face_cam = (
