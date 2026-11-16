@@ -2,11 +2,11 @@ import math
 import os
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import mysql.connector
-from mysql.connector import Error as MySQLError, pooling
+from mysql.connector import Error as MySQLError
 from dotenv import load_dotenv
 
 from face_service import (
@@ -22,11 +22,15 @@ load_dotenv(BASE_DIR / ".env")
 
 HISTORY_LIMIT = 200
 PARKING_FEE_VND = 2000  # 2.000 VNĐ / lượt giữ xe
+VN_TZ = timezone(timedelta(hours=7))
 SQLITE_DB_PATH = BASE_DIR / "data" / "parking_history.db"
 _SQLITE_LOCK = threading.RLock()
-_MYSQL_POOL_LOCK = threading.Lock()
-_MYSQL_POOL: pooling.MySQLConnectionPool | None = None
 _ACTIVE_BACKEND = "mysql"  # "mysql" hoặc "sqlite"
+
+
+def now_vn() -> datetime:
+    """Trả về thời gian hiện tại theo múi giờ Việt Nam (UTC+7, naive datetime) đồng nhất trên cả Local & Cloud."""
+    return datetime.now(VN_TZ).replace(tzinfo=None, microsecond=0)
 
 
 class DatabaseConfigurationError(RuntimeError):
@@ -38,10 +42,13 @@ class DatabaseOperationError(RuntimeError):
 
 
 def _should_allow_sqlite_fallback() -> bool:
-    """Cho phép tự động chuyển sang SQLite khi chạy trên Hugging Face Spaces hoặc khi bật cờ."""
-    if os.getenv("SPACE_ID"):
+    """Chỉ tự động chuyển sang SQLite khi chưa cấu hình MYSQL_HOST hoặc khi bật rõ cờ DB_FALLBACK_SQLITE=1."""
+    flag = os.getenv("DB_FALLBACK_SQLITE", "").strip().lower()
+    if flag in ("1", "true", "yes"):
         return True
-    return os.getenv("DB_FALLBACK_SQLITE", "1").strip().lower() in ("1", "true", "yes")
+    if flag in ("0", "false", "no"):
+        return False
+    return not bool(os.getenv("MYSQL_HOST", "").strip())
 
 
 def _connection_config():
@@ -71,24 +78,9 @@ def _connection_config():
 
 
 def _connect_mysql():
-    global _MYSQL_POOL
     config = _connection_config()
     try:
-        with _MYSQL_POOL_LOCK:
-            if _MYSQL_POOL is None:
-                _MYSQL_POOL = pooling.MySQLConnectionPool(
-                    pool_name="datn_mysql_pool",
-                    pool_size=4,
-                    pool_reset_session=True,
-                    **config,
-                )
-        conn = _MYSQL_POOL.get_connection()
-        try:
-            conn.ping(reconnect=True, attempts=1, delay=0)
-        except Exception:
-            conn.close()
-            return mysql.connector.connect(**config)
-        return conn
+        return mysql.connector.connect(**config)
     except MySQLError as error:
         raise DatabaseOperationError(str(error)) from error
 
@@ -302,7 +294,7 @@ def _make_demo_row(
 
 
 def _build_demo_records_list() -> list[dict]:
-    now = datetime.now().replace(microsecond=0)
+    now = now_vn()
     records: list[dict] = []
 
     # 1. Các lượt xe hoàn tất ở các tháng/ngày trước (để báo cáo Năm & Tháng sinh động)
@@ -513,7 +505,7 @@ def format_match_label(
         return f"{verdict} ({max(score, 0.0):.0%})"
     if dir_code == "IN":
         return "Đã lưu mẫu mặt" if has_embedding else "-"
-    return "Chưa có lượt vào" if has_embedding else "-"
+    return "Chưa đối chiếu" if has_embedding else "-"
 
 
 def format_record_row(record_id, record: dict) -> dict:
@@ -637,28 +629,9 @@ def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
 
 def _find_last_embedding_mysql(cursor, plate_number: str) -> tuple[int | None, list[float] | None]:
     active = find_active_parking_session(plate_number, cursor=cursor)
-    if active and active.get("embedding") is not None:
-        return active["id"], active["embedding"]
-
-    norm_plate = _normalize_search(plate_number)
-    cursor.execute(
-        """
-        SELECT id, face_embedding
-        FROM plate_recognition_history
-        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s AND face_embedding IS NOT NULL
-        ORDER BY recognized_at DESC, id DESC
-        LIMIT 1
-        """,
-        (norm_plate,),
-    )
-    row = cursor.fetchone()
-    if not row:
-        return (active["id"] if active else None), None
-    if isinstance(row, dict):
-        rec_id, raw = int(row["id"]), row["face_embedding"]
-    else:
-        rec_id, raw = int(row[0]), row[1]
-    return rec_id, embedding_from_bytes(bytes(raw) if raw is not None else None)
+    if active:
+        return active["id"], active.get("embedding")
+    return None, None
 
 
 def _find_last_embedding_sqlite(cur: sqlite3.Cursor, plate_number: str) -> tuple[int | None, list[float] | None]:
@@ -676,26 +649,10 @@ def _find_last_embedding_sqlite(cur: sqlite3.Cursor, plate_number: str) -> tuple
         (norm_plate,),
     )
     row = cur.fetchone()
-    if row and row["face_embedding"] is not None:
-        return int(row["id"]), embedding_from_bytes(bytes(row["face_embedding"]))
-    active_id = int(row["id"]) if row else None
-
-    cur.execute(
-        """
-        SELECT id, face_embedding
-        FROM plate_recognition_history
-        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ? AND face_embedding IS NOT NULL
-        ORDER BY recognized_at DESC, id DESC
-        LIMIT 1
-        """,
-        (norm_plate,),
-    )
-    row2 = cur.fetchone()
-    if not row2:
-        return active_id, None
-    return int(row2["id"]), embedding_from_bytes(
-        bytes(row2["face_embedding"]) if row2["face_embedding"] is not None else None
-    )
+    if not row:
+        return None, None
+    raw_emb = row["face_embedding"]
+    return int(row["id"]), embedding_from_bytes(bytes(raw_emb) if raw_emb is not None else None)
 
 
 def verify_checkout_face(
@@ -732,20 +689,26 @@ def verify_checkout_face(
 
 
 def _fetch_revenue_report_mysql(cursor) -> dict:
-    """Tính doanh thu giữ xe (2.000 đ / lượt gửi vào) theo Ngày, Tháng, Năm trên MySQL."""
+    """Tính doanh thu giữ xe (2.000 đ / lượt gửi vào) theo Ngày, Tháng, Năm trên MySQL (theo múi giờ VN UTC+7)."""
+    vn_now = now_vn()
+    today_start = vn_now.replace(hour=0, minute=0, second=0)
+    month_start = today_start.replace(day=1)
+    year_start = today_start.replace(month=1, day=1)
+
     cursor.execute(
         """
         SELECT
-            COALESCE(SUM(CASE WHEN DATE(recognized_at) = CURDATE() AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_today,
-            COALESCE(SUM(CASE WHEN DATE(recognized_at) = CURDATE() THEN fee_amount ELSE 0 END), 0) AS revenue_today,
-            COALESCE(SUM(CASE WHEN YEAR(recognized_at) = YEAR(CURDATE()) AND MONTH(recognized_at) = MONTH(CURDATE()) AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_month,
-            COALESCE(SUM(CASE WHEN YEAR(recognized_at) = YEAR(CURDATE()) AND MONTH(recognized_at) = MONTH(CURDATE()) THEN fee_amount ELSE 0 END), 0) AS revenue_month,
-            COALESCE(SUM(CASE WHEN YEAR(recognized_at) = YEAR(CURDATE()) AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_year,
-            COALESCE(SUM(CASE WHEN YEAR(recognized_at) = YEAR(CURDATE()) THEN fee_amount ELSE 0 END), 0) AS revenue_year,
+            COALESCE(SUM(CASE WHEN recognized_at >= %s AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_today,
+            COALESCE(SUM(CASE WHEN recognized_at >= %s THEN fee_amount ELSE 0 END), 0) AS revenue_today,
+            COALESCE(SUM(CASE WHEN recognized_at >= %s AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_month,
+            COALESCE(SUM(CASE WHEN recognized_at >= %s THEN fee_amount ELSE 0 END), 0) AS revenue_month,
+            COALESCE(SUM(CASE WHEN recognized_at >= %s AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_year,
+            COALESCE(SUM(CASE WHEN recognized_at >= %s THEN fee_amount ELSE 0 END), 0) AS revenue_year,
             COALESCE(SUM(CASE WHEN direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_total,
             COALESCE(SUM(fee_amount), 0) AS revenue_total
         FROM plate_recognition_history
-        """
+        """,
+        (today_start, today_start, month_start, month_start, year_start, year_start),
     )
     summary = cursor.fetchone() or {}
 
@@ -847,7 +810,7 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
 
 def _fetch_revenue_report_sqlite(cur: sqlite3.Cursor) -> dict:
     """Tính doanh thu giữ xe (2.000 đ / lượt gửi vào) theo Ngày, Tháng, Năm trên SQLite."""
-    now = datetime.now()
+    now = now_vn()
     today_prefix = now.strftime("%Y-%m-%d")
     month_prefix = now.strftime("%Y-%m")
     year_prefix = now.strftime("%Y")
@@ -974,7 +937,7 @@ def fetch_overview(
             try:
                 _ensure_sqlite_table(conn)
                 cur = conn.cursor()
-                today_prefix = datetime.now().strftime("%Y-%m-%d")
+                today_prefix = now_vn().strftime("%Y-%m-%d")
                 cur.execute(
                     """
                     SELECT
@@ -1065,17 +1028,19 @@ def fetch_overview(
     connection = _connect_mysql()
     cursor = connection.cursor(dictionary=True)
     try:
+        today_start = now_vn().replace(hour=0, minute=0, second=0)
         cursor.execute(
             """
             SELECT
                 COUNT(*) AS total,
-                COALESCE(SUM(recognized_at >= CURDATE()), 0) AS today,
+                COALESCE(SUM(recognized_at >= %s), 0) AS today,
                 COALESCE(SUM(direction = 'IN' AND parking_status = 'IN_PARKING'), 0) AS in_parking,
                 COALESCE(SUM(direction = 'IN'), 0) AS total_in,
                 COALESCE(SUM(direction = 'OUT'), 0) AS total_out,
                 COALESCE(SUM(face_detected = 1), 0) AS with_face
             FROM plate_recognition_history
-            """
+            """,
+            (today_start,),
         )
         stats_row = cursor.fetchone() or {}
         total = int(stats_row.get("total") or 0)

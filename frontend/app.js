@@ -1074,7 +1074,7 @@
       const state = await res.json();
       await applyCameraStatus(state);
     } catch {
-      updatePendingBadgeUI(0);
+      // Giữ nguyên số lượng bản ghi chờ hiện tại nếu lỗi mạng tạm thời
     }
   }
 
@@ -1179,7 +1179,7 @@
     const seed = Array.from(String(plateText || "X")).reduce((s, c) => s + c.charCodeAt(0), 0);
     const hues = [200, 265, 150, 32, 330, 185];
     const hue = hues[seed % hues.length];
-    const conf = escapeHtml(String(faceLabel || "98%").replace(/[^0-9%]/g, "") || "AI");
+    const conf = escapeHtml(String(faceLabel || "").replace(/[^0-9%]/g, "") || "-");
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
       <rect width="160" height="160" rx="16" fill="hsl(${hue}, 35%, 16%)"/>
       <circle cx="80" cy="58" r="28" fill="hsl(${hue}, 70%, 65%)"/>

@@ -32,6 +32,7 @@ from database import (
     format_record_row,
     initialize_database,
     insert_plate_record,
+    now_vn,
     verify_checkout_face,
 )
 from face_service import (
@@ -265,7 +266,7 @@ def _save_snapshot_to_disk(kind: str, plate_number: str, data_url: str | None) -
         snap_dir = BASE_DIR / "data" / "snapshots"
         snap_dir.mkdir(parents=True, exist_ok=True)
         safe_plate = "".join(ch for ch in str(plate_number) if ch.isalnum() or ch in "-_")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = now_vn().strftime("%Y%m%d_%H%M%S")
         raw_bytes = base64.b64decode(data_url.split(",", 1)[1])
         (snap_dir / f"{ts}_{safe_plate}_{kind}.jpg").write_bytes(raw_bytes)
     except Exception:
@@ -599,6 +600,9 @@ class SystemState:
             cam.reset_tracking()
         # recent_confirms lưu thời điểm hết hạn khóa: token -> expire_monotonic_time
         self.recent_confirms: dict[str, float] = {}
+        # Danh sách biển số vừa hoàn tất phiên và bắt buộc phải rời khỏi khung hình >= 1.5s mới xét lượt tiếp theo
+        self.plates_must_leave: set[str] = set()
+        self.plate_last_seen_global: dict[str, float] = {}
         # Trạng thái Lưu hờ (Two-Phase Latch)
         self.latched: dict | None = None
         self.face_window_start: float | None = None
@@ -614,6 +618,9 @@ class SystemState:
             self.recent_confirms.get(opp_dir_token, 0.0),
             now + CROSS_DIRECTION_COOLDOWN_SECONDS,
         )
+        # Bắt buộc biển số phải rời khỏi khung hình trước khi xét lượt mới (tránh đứng yên >12s tự nhảy sang RA BÃI)
+        self.plates_must_leave.add(plate_key)
+        self.plate_last_seen_global[plate_key] = now
 
     # ---------------------------------------------------------- hàng chờ (file)
     def load_pending_from_disk(self) -> None:
@@ -820,6 +827,16 @@ class SystemState:
                 self._set_feedback_locked("error", msg)
 
         if record_to_save is not None:
+            _save_snapshot_to_disk(
+                "plate",
+                record_to_save["plate_number"],
+                record_to_save.get("plate_image"),
+            )
+            _save_snapshot_to_disk(
+                "face",
+                record_to_save["plate_number"],
+                record_to_save.get("face_image"),
+            )
             preview = format_record_row("Mới", record_to_save)
             with self.lock:
                 self.last_confirmed = {
@@ -1235,8 +1252,13 @@ class SystemState:
                     and now - cam.last_sample_time >= VOTE_SAMPLE_INTERVAL_SECONDS
                 ):
                     key, display = next(iter(readings.items()))
-                    cam.observations.append((now, key, display))
-                    cam.last_sample_time = now
+                    self.plate_last_seen_global[key] = now
+                    if key not in self.plates_must_leave:
+                        cam.observations.append((now, key, display))
+                        cam.last_sample_time = now
+                elif readings:
+                    for r_key in readings:
+                        self.plate_last_seen_global[r_key] = now
 
                 # Cập nhật bộ đệm khuôn mặt chuẩn gần nhất trên Cam này
                 while (
@@ -1278,14 +1300,19 @@ class SystemState:
                     cam.latest_jpeg = jpeg_bytes
                     cam.jpeg_seq += 1
 
+            # Chỉ gỡ biển số khỏi danh sách bắt buộc rời cổng khi đã biến mất khỏi mọi camera >= PLATE_LOST_RESET_SECONDS (1.5s)
+            for pk in list(self.plates_must_leave):
+                if now - self.plate_last_seen_global.get(pk, 0.0) >= PLATE_LOST_RESET_SECONDS:
+                    self.plates_must_leave.discard(pk)
+
             confirmed_candidates: dict[int, str] = {}
             if self.security_alert is None and self.latched is None:
                 for cid in (1, 2):
                     v_check = get_vote_result(self.cams[cid].observations)
                     if is_vote_confirmed(v_check):
                         cand_key, cand_display, _, _, _ = v_check
-                        # Bỏ qua ngay nếu cả 2 chiều IN & OUT đều đang trong thời gian khóa Cooldown (tránh query DB lặp)
-                        if (
+                        # Bỏ qua ngay nếu xe chưa rời khỏi khung hình hoặc cả 2 chiều IN & OUT đều đang khóa Cooldown
+                        if cand_key in self.plates_must_leave or (
                             f"{cand_key}:IN" in self.recent_confirms
                             and f"{cand_key}:OUT" in self.recent_confirms
                         ):
@@ -1342,7 +1369,10 @@ class SystemState:
                         )
 
                         cooldown_token = f"{key}:{direction}"
-                        if cooldown_token in self.recent_confirms:
+                        if (
+                            key in self.plates_must_leave
+                            or cooldown_token in self.recent_confirms
+                        ):
                             cam.observations.clear()
                             continue
 
@@ -1468,9 +1498,7 @@ class SystemState:
                                         if latched_info["direction"] == "IN"
                                         else 0
                                     ),
-                                    "recognized_at": datetime.now().replace(
-                                        microsecond=0
-                                    ),
+                                    "recognized_at": now_vn(),
                                     "vote_count": latched_info["vote_count"],
                                     "sample_count": latched_info["sample_count"],
                                     "consensus_rate": latched_info["consensus_rate"],
@@ -1499,28 +1527,27 @@ class SystemState:
             return pending_sess, True
         with self.lock:
             db_ready = self.database_ready
-        if db_ready:
-            try:
-                return find_active_parking_session(plate_number), True
-            except (DatabaseConfigurationError, DatabaseOperationError) as error:
-                self._set_db_status(False, str(error))
-                return None, False
-        return None, True
+        if not db_ready:
+            return None, False
+        try:
+            return find_active_parking_session(plate_number), True
+        except (DatabaseConfigurationError, DatabaseOperationError) as error:
+            self._set_db_status(False, str(error))
+            return None, False
 
     def _find_pending_active_session(self, plate_number: str) -> dict | None:
         target_key = _clean_plate_key(plate_number)
-        with self.db_write_lock:
-            for rec in reversed(self.pending_records):
-                if (
-                    _clean_plate_key(rec.get("plate_number")) == target_key
-                    and rec.get("direction") == "IN"
-                    and rec.get("parking_status") == "IN_PARKING"
-                ):
-                    return {
-                        "id": None,
-                        "recognized_at": str(rec.get("recognized_at")),
-                        "embedding": rec.get("face_embedding"),
-                    }
+        for rec in reversed(list(self.pending_records)):
+            if (
+                _clean_plate_key(rec.get("plate_number")) == target_key
+                and rec.get("direction") == "IN"
+                and rec.get("parking_status") == "IN_PARKING"
+            ):
+                return {
+                    "id": None,
+                    "recognized_at": str(rec.get("recognized_at")),
+                    "embedding": rec.get("face_embedding"),
+                }
         return None
 
     def _commit_latched_pair(self, record: dict, best_face) -> None:
@@ -1563,6 +1590,14 @@ class SystemState:
                         "entry_time": cached_active_session.get("recognized_at"),
                         "match_score": score,
                         "matched": score >= FACE_MATCH_THRESHOLD,
+                    }
+                else:
+                    check = {
+                        "has_active_session": True,
+                        "entry_id": cached_active_session.get("id"),
+                        "entry_time": cached_active_session.get("recognized_at"),
+                        "match_score": None,
+                        "matched": False,
                     }
             if check is None:
                 with self.lock:
@@ -1676,6 +1711,71 @@ class SystemState:
         # Khởi tạo kết nối MySQL Aiven + tải mô hình AI trong luồng nền để cổng HTTP mở tức thì
         threading.Thread(target=self._background_startup, daemon=True).start()
 
+    def get_status_payload(self) -> dict:
+        now = time.monotonic()
+        pending_count = len(self.pending_records)
+        with self.lock:
+            cam1_status = _serialize_cam_unit(self.cams[1])
+            cam2_status = _serialize_cam_unit(self.cams[2])
+
+            active_vote = cam2_status["vote"] or cam1_status["vote"]
+
+            latched_info = None
+            if self.latched is not None:
+                remaining = max(
+                    0,
+                    round(LATCH_TIMEOUT_SECONDS - (now - self.latched["latched_at"])),
+                )
+                latched_info = {
+                    "direction": self.latched["direction"],
+                    "direction_label": (
+                        "ĐI VÀO (Check-in)"
+                        if self.latched["direction"] == "IN"
+                        else "ĐI RA (Check-out)"
+                    ),
+                    "plate_number": self.latched["plate_number"],
+                    "plate_cam": self.latched["plate_cam"],
+                    "required_face_cam": self.latched["required_face_cam"],
+                    "remaining_seconds": remaining,
+                    "sampling_face": self.face_window_start is not None,
+                }
+
+            alert_info = None
+            if self.security_alert is not None:
+                alert_info = {
+                    "plate_number": self.security_alert["plate_number"],
+                    "entry_time": self.security_alert["entry_time"],
+                    "match_score_pct": self.security_alert["match_score_pct"],
+                    "face_confidence_pct": self.security_alert["face_confidence_pct"],
+                }
+
+            if (
+                self.gate_feedback is not None
+                and now >= self.gate_feedback.get("expires_at", 0.0)
+            ):
+                self.gate_feedback = None
+
+            return {
+                "running": self.running,
+                "mode": "browser" if self.browser_mode else "local",
+                "frame_count": self.frame_count,
+                "cam1": cam1_status,
+                "cam2": cam2_status,
+                "vote": active_vote,
+                "latched": latched_info,
+                "security_alert": alert_info,
+                "gate_feedback": self.gate_feedback,
+                "ambiguous_frame": (
+                    cam1_status["ambiguous_frame"] or cam2_status["ambiguous_frame"]
+                ),
+                "error": self.camera_error,
+                "last_confirmed": self.last_confirmed,
+                "records_version": self.records_version,
+                "database_ready": self.database_ready,
+                "pending_count": pending_count,
+                "face_matching": bool(self.face_service and self.face_service.can_embed),
+            }
+
 
 state = SystemState()
 
@@ -1760,75 +1860,6 @@ def _serialize_cam_unit(cam: CameraUnitState) -> dict:
     }
 
 
-def _build_status_payload(self: SystemState) -> dict:
-    now = time.monotonic()
-    pending_count = len(self.pending_records)
-    with self.lock:
-        cam1_status = _serialize_cam_unit(self.cams[1])
-        cam2_status = _serialize_cam_unit(self.cams[2])
-
-        active_vote = cam2_status["vote"] or cam1_status["vote"]
-
-        latched_info = None
-        if self.latched is not None:
-            remaining = max(
-                0,
-                round(LATCH_TIMEOUT_SECONDS - (now - self.latched["latched_at"])),
-            )
-            latched_info = {
-                "direction": self.latched["direction"],
-                "direction_label": (
-                    "ĐI VÀO (Check-in)"
-                    if self.latched["direction"] == "IN"
-                    else "ĐI RA (Check-out)"
-                ),
-                "plate_number": self.latched["plate_number"],
-                "plate_cam": self.latched["plate_cam"],
-                "required_face_cam": self.latched["required_face_cam"],
-                "remaining_seconds": remaining,
-                "sampling_face": self.face_window_start is not None,
-            }
-
-        alert_info = None
-        if self.security_alert is not None:
-            alert_info = {
-                "plate_number": self.security_alert["plate_number"],
-                "entry_time": self.security_alert["entry_time"],
-                "match_score_pct": self.security_alert["match_score_pct"],
-                "face_confidence_pct": self.security_alert["face_confidence_pct"],
-            }
-
-        if (
-            self.gate_feedback is not None
-            and now >= self.gate_feedback.get("expires_at", 0.0)
-        ):
-            self.gate_feedback = None
-
-        return {
-            "running": self.running,
-            "mode": "browser" if self.browser_mode else "local",
-            "frame_count": self.frame_count,
-            "cam1": cam1_status,
-            "cam2": cam2_status,
-            "vote": active_vote,
-            "latched": latched_info,
-            "security_alert": alert_info,
-            "gate_feedback": self.gate_feedback,
-            "ambiguous_frame": (
-                cam1_status["ambiguous_frame"] or cam2_status["ambiguous_frame"]
-            ),
-            "error": self.camera_error,
-            "last_confirmed": self.last_confirmed,
-            "records_version": self.records_version,
-            "database_ready": self.database_ready,
-            "pending_count": pending_count,
-            "face_matching": bool(self.face_service and self.face_service.can_embed),
-        }
-
-
-SystemState.get_status_payload = _build_status_payload
-
-
 @app.get("/api/camera/status")
 def get_camera_status():
     return state.get_status_payload()
@@ -1842,8 +1873,7 @@ def api_cancel_latch():
 
 @app.post("/api/camera/resolve-alert")
 def api_resolve_alert(req: ResolveAlertRequest):
-    approve = req.action.strip().lower() == "approve"
-    return state.resolve_security_alert(approve)
+    return state.resolve_security_alert(req.action == "approve")
 
 
 @app.post("/api/camera/scan")

@@ -25,7 +25,6 @@ ALLOW_PATTERNS = [
     "packages.txt",
     "frontend/*",
     "weights/*.pt",
-    "data/parking_history.db",
 ]
 
 
