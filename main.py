@@ -1001,6 +1001,7 @@ class SystemState:
                 "processed": False,
                 "cam1_boxes": b1_boxes,
                 "cam2_boxes": b2_boxes,
+                "status": self.get_status_payload(),
             }
         try:
             self._process_dual_frames(session_id, frame1, frame2, encode_jpeg=False)
@@ -1018,6 +1019,7 @@ class SystemState:
             "processed": True,
             "cam1_boxes": b1_boxes,
             "cam2_boxes": b2_boxes,
+            "status": self.get_status_payload(),
         }
 
     def _camera_worker_loop(self) -> None:
@@ -1758,72 +1760,78 @@ def _serialize_cam_unit(cam: CameraUnitState) -> dict:
     }
 
 
-@app.get("/api/camera/status")
-def get_camera_status():
+def _build_status_payload(self: SystemState) -> dict:
     now = time.monotonic()
-    pending_count = len(state.pending_records)
-    with state.lock:
-        cam1_status = _serialize_cam_unit(state.cams[1])
-        cam2_status = _serialize_cam_unit(state.cams[2])
+    pending_count = len(self.pending_records)
+    with self.lock:
+        cam1_status = _serialize_cam_unit(self.cams[1])
+        cam2_status = _serialize_cam_unit(self.cams[2])
 
-        # Chọn thông tin vote đang hoạt động mạnh nhất để hiển thị trên pill tổng
         active_vote = cam2_status["vote"] or cam1_status["vote"]
 
         latched_info = None
-        if state.latched is not None:
+        if self.latched is not None:
             remaining = max(
                 0,
-                round(LATCH_TIMEOUT_SECONDS - (now - state.latched["latched_at"])),
+                round(LATCH_TIMEOUT_SECONDS - (now - self.latched["latched_at"])),
             )
             latched_info = {
-                "direction": state.latched["direction"],
+                "direction": self.latched["direction"],
                 "direction_label": (
                     "ĐI VÀO (Check-in)"
-                    if state.latched["direction"] == "IN"
+                    if self.latched["direction"] == "IN"
                     else "ĐI RA (Check-out)"
                 ),
-                "plate_number": state.latched["plate_number"],
-                "plate_cam": state.latched["plate_cam"],
-                "required_face_cam": state.latched["required_face_cam"],
+                "plate_number": self.latched["plate_number"],
+                "plate_cam": self.latched["plate_cam"],
+                "required_face_cam": self.latched["required_face_cam"],
                 "remaining_seconds": remaining,
-                "sampling_face": state.face_window_start is not None,
+                "sampling_face": self.face_window_start is not None,
             }
 
         alert_info = None
-        if state.security_alert is not None:
+        if self.security_alert is not None:
             alert_info = {
-                "plate_number": state.security_alert["plate_number"],
-                "entry_time": state.security_alert["entry_time"],
-                "match_score_pct": state.security_alert["match_score_pct"],
-                "face_confidence_pct": state.security_alert["face_confidence_pct"],
+                "plate_number": self.security_alert["plate_number"],
+                "entry_time": self.security_alert["entry_time"],
+                "match_score_pct": self.security_alert["match_score_pct"],
+                "face_confidence_pct": self.security_alert["face_confidence_pct"],
             }
 
         if (
-            state.gate_feedback is not None
-            and now >= state.gate_feedback.get("expires_at", 0.0)
+            self.gate_feedback is not None
+            and now >= self.gate_feedback.get("expires_at", 0.0)
         ):
-            state.gate_feedback = None
+            self.gate_feedback = None
 
         return {
-            "running": state.running,
-            "mode": "browser" if state.browser_mode else "local",
-            "frame_count": state.frame_count,
+            "running": self.running,
+            "mode": "browser" if self.browser_mode else "local",
+            "frame_count": self.frame_count,
             "cam1": cam1_status,
             "cam2": cam2_status,
             "vote": active_vote,
             "latched": latched_info,
             "security_alert": alert_info,
-            "gate_feedback": state.gate_feedback,
+            "gate_feedback": self.gate_feedback,
             "ambiguous_frame": (
                 cam1_status["ambiguous_frame"] or cam2_status["ambiguous_frame"]
             ),
-            "error": state.camera_error,
-            "last_confirmed": state.last_confirmed,
-            "records_version": state.records_version,
-            "database_ready": state.database_ready,
+            "error": self.camera_error,
+            "last_confirmed": self.last_confirmed,
+            "records_version": self.records_version,
+            "database_ready": self.database_ready,
             "pending_count": pending_count,
-            "face_matching": bool(state.face_service and state.face_service.can_embed),
+            "face_matching": bool(self.face_service and self.face_service.can_embed),
         }
+
+
+SystemState.get_status_payload = _build_status_payload
+
+
+@app.get("/api/camera/status")
+def get_camera_status():
+    return state.get_status_payload()
 
 
 @app.post("/api/camera/cancel-latch")

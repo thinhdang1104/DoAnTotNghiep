@@ -251,6 +251,26 @@
   let browserCanvas = null;
   let browserFrameTimer = null;
   let browserInFlight = false;
+  let statusPollTimer = null;
+
+  function stopStatusPollLoop() {
+    if (statusPollTimer) {
+      clearTimeout(statusPollTimer);
+      statusPollTimer = null;
+    }
+  }
+
+  function scheduleLocalStatusPollIfNeeded(active1, active2) {
+    stopStatusPollLoop();
+    const anyLocalActive =
+      (active1 && !browserVideos[0]) || (active2 && !browserVideos[1]);
+    if (anyLocalActive) {
+      statusPollTimer = setTimeout(async () => {
+        statusPollTimer = null;
+        await pollCameraStatusOnce();
+      }, 320);
+    }
+  }
 
   async function scanBrowserWebcams() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -524,6 +544,9 @@
           if (v2 && out.cam2_boxes) {
             drawOverlayBoxes(cam2LiveVideo || v2, cam2OverlayCanvas, out.cam2_boxes);
           }
+          if (out.status) {
+            await applyCameraStatus(out.status);
+          }
         }
       } catch (_) {
         // Bỏ qua lỗi mạng tạm thời
@@ -631,6 +654,7 @@
     const overlayCanvasEl = camId === 1 ? cam1OverlayCanvas : cam2OverlayCanvas;
     const phEl = camId === 1 ? cam1Placeholder : cam2Placeholder;
     if (imgEl) {
+      imgEl.src = "";
       imgEl.removeAttribute("src");
       imgEl.classList.add("hidden");
     }
@@ -697,14 +721,20 @@
   async function stopSingleCamUI(camId) {
     const stopBtn = camId === 1 ? btnCam1Stop : btnCam2Stop;
     if (stopBtn) stopBtn.disabled = true;
+    isStartingCamera = true;
     stopBrowserWebRTCForCam(camId);
     hideCamStreamUI(camId);
+    if (!camStreaming[1] && !camStreaming[2]) {
+      stopStatusPollLoop();
+    }
     try {
       await fetch(`/api/camera/${camId}/stop`, { method: "POST" });
-      await pollCameraStatusOnce();
     } catch (err) {
       showBanner(cameraAlertBox, "error", err.message);
+    } finally {
+      isStartingCamera = false;
     }
+    await pollCameraStatusOnce();
   }
 
   if (btnCam1Start) {
@@ -790,15 +820,19 @@
 
   btnStopCamera.addEventListener("click", async () => {
     btnStopCamera.disabled = true;
+    isStartingCamera = true;
+    stopStatusPollLoop();
     stopBrowserWebRTC();
     hideCamStreamUI(1);
     hideCamStreamUI(2);
     try {
       await fetch("/api/camera/stop", { method: "POST" });
-      await pollCameraStatusOnce();
     } catch (err) {
       showBanner(cameraAlertBox, "error", err.message);
+    } finally {
+      isStartingCamera = false;
     }
+    await pollCameraStatusOnce();
   });
 
   function updateSingleCamReadout(camData, votePillEl, plateValueEl, faceValueEl, running) {
@@ -885,162 +919,163 @@
     return isActive;
   }
 
+  async function applyCameraStatus(state) {
+    if (!state || isStartingCamera) return;
+
+    updatePendingBadgeUI(state.pending_count);
+
+    if (!didInitialStaleCheck) {
+      didInitialStaleCheck = true;
+      if (state.running && state.mode === "browser" && !browserWebRTCActive) {
+        await fetch("/api/camera/stop", { method: "POST" }).catch(() => {});
+        state.running = false;
+        if (state.cam1) state.cam1.active = false;
+        if (state.cam2) state.cam2.active = false;
+      }
+    }
+
+    const active1 = syncSingleCamUI(
+      1,
+      state.cam1,
+      cam1IndexInput,
+      btnCam1Start,
+      btnCam1Stop,
+      cam1StreamImg,
+      cam1Placeholder
+    );
+    const active2 = syncSingleCamUI(
+      2,
+      state.cam2,
+      cam2IndexInput,
+      btnCam2Start,
+      btnCam2Stop,
+      cam2StreamImg,
+      cam2Placeholder
+    );
+
+    isCameraStreaming = Boolean(active1 || active2);
+    if (streamLiveDot) {
+      streamLiveDot.classList.toggle("online", isCameraStreaming);
+    }
+    btnStartCamera.disabled = Boolean(active1 && active2);
+    btnStopCamera.disabled = !isCameraStreaming;
+
+    if (state.error) {
+      showBanner(cameraAlertBox, "error", state.error);
+    } else if (
+      state.gate_feedback &&
+      state.gate_feedback.message &&
+      state.gate_feedback.seq !== lastFeedbackSeq
+    ) {
+      lastFeedbackSeq = state.gate_feedback.seq;
+      showBanner(
+        cameraAlertBox,
+        state.gate_feedback.type || "success",
+        state.gate_feedback.message,
+        1000
+      );
+    }
+
+    updateSingleCamReadout(
+      state.cam1,
+      cam1VotePill,
+      cam1PlateValue,
+      cam1FaceValue,
+      active1
+    );
+    updateSingleCamReadout(
+      state.cam2,
+      cam2VotePill,
+      cam2PlateValue,
+      cam2FaceValue,
+      active2
+    );
+
+    // Two-Phase Latch UI
+    if (state.latched) {
+      latchStatusBox.classList.remove("hidden");
+      const isIn = state.latched.direction === "IN";
+      latchDirectionBadge.className = isIn ? "pill pos" : "pill warn";
+      latchDirectionBadge.textContent = isIn ? "LƯU HỜ · ĐI VÀO" : "LƯU HỜ · ĐI RA";
+      latchPlateText.textContent = state.latched.plate_number;
+      latchStepText.textContent = state.latched.sampling_face
+        ? `Cam ${state.latched.plate_cam} đã chốt biển — Đang chọn mặt nét nhất ở Cam ${state.latched.required_face_cam}...`
+        : `Cam ${state.latched.plate_cam} đã chốt biển — Chờ khuôn mặt ở Cam ${state.latched.required_face_cam} (${state.latched.remaining_seconds}s)`;
+
+      if (cam1UnitCard) {
+        cam1UnitCard.classList.toggle(
+          "cam-target-highlight",
+          state.latched.required_face_cam === 1
+        );
+      }
+      if (cam2UnitCard) {
+        cam2UnitCard.classList.toggle(
+          "cam-target-highlight",
+          state.latched.required_face_cam === 2
+        );
+      }
+      if (liveFlowPill) {
+        liveFlowPill.className = isIn ? "pill pos" : "pill warn";
+        liveFlowPill.textContent =
+          state.latched.plate_cam === state.latched.required_face_cam
+            ? `Đang đón xe ${isIn ? "VÀO" : "RA"} (1 Cam · Cam ${state.latched.plate_cam})`
+            : `Đang đón xe ${isIn ? "VÀO" : "RA"} (Biển Cam ${state.latched.plate_cam} + Mặt Cam ${state.latched.required_face_cam})`;
+      }
+    } else {
+      latchStatusBox.classList.add("hidden");
+      if (cam1UnitCard) cam1UnitCard.classList.remove("cam-target-highlight");
+      if (cam2UnitCard) cam2UnitCard.classList.remove("cam-target-highlight");
+      if (liveFlowPill) {
+        if (active1 && active2) {
+          liveFlowPill.className = "pill pos";
+          liveFlowPill.textContent = "2 Camera đối xứng (Chéo luồng)";
+        } else if (active1) {
+          liveFlowPill.className = "pill warn";
+          liveFlowPill.textContent = "Chế độ 1 Cam dự phòng (Cam 1)";
+        } else if (active2) {
+          liveFlowPill.className = "pill warn";
+          liveFlowPill.textContent = "Chế độ 1 Cam dự phòng (Cam 2)";
+        } else {
+          liveFlowPill.className = "pill pos";
+          liveFlowPill.textContent = "2 Camera độc lập";
+        }
+      }
+    }
+
+    // Security Alert UI (Face mismatch on exit)
+    if (state.security_alert) {
+      securityAlertBox.classList.remove("hidden");
+      alertScorePill.textContent = `Độ khớp: ${state.security_alert.match_score_pct}`;
+      alertDetailText.textContent =
+        `Xe ${state.security_alert.plate_number} (gửi lúc ${state.security_alert.entry_time}) ` +
+        `có khuôn mặt người lấy xe LỆCH so với lúc gửi xe vào bãi (Cosine ${state.security_alert.match_score_pct} < 65%).`;
+    } else {
+      securityAlertBox.classList.add("hidden");
+    }
+
+    voteAmbiguousWarning.classList.toggle("hidden", !state.ambiguous_frame);
+
+    if (
+      typeof state.records_version === "number" &&
+      state.records_version !== lastRecordsVersion
+    ) {
+      lastRecordsVersion = state.records_version;
+      fetchManagementOverview();
+    }
+
+    scheduleLocalStatusPollIfNeeded(active1, active2);
+  }
+
   async function pollCameraStatusOnce() {
     if (isStartingCamera) return;
     try {
       const res = await fetch("/api/camera/status");
       if (!res.ok) throw new Error("HTTP " + res.status);
       const state = await res.json();
-      if (isStartingCamera) return;
-
-      updatePendingBadgeUI(state.pending_count);
-
-      if (!didInitialStaleCheck) {
-        didInitialStaleCheck = true;
-        if (state.running && state.mode === "browser" && !browserWebRTCActive) {
-          await fetch("/api/camera/stop", { method: "POST" }).catch(() => {});
-          state.running = false;
-          if (state.cam1) state.cam1.active = false;
-          if (state.cam2) state.cam2.active = false;
-        }
-      }
-
-      const active1 = syncSingleCamUI(
-        1,
-        state.cam1,
-        cam1IndexInput,
-        btnCam1Start,
-        btnCam1Stop,
-        cam1StreamImg,
-        cam1Placeholder
-      );
-      const active2 = syncSingleCamUI(
-        2,
-        state.cam2,
-        cam2IndexInput,
-        btnCam2Start,
-        btnCam2Stop,
-        cam2StreamImg,
-        cam2Placeholder
-      );
-
-      isCameraStreaming = Boolean(active1 || active2);
-      if (streamLiveDot) {
-        streamLiveDot.classList.toggle("online", isCameraStreaming);
-      }
-      btnStartCamera.disabled = Boolean(active1 && active2);
-      btnStopCamera.disabled = !isCameraStreaming;
-
-      if (state.error) {
-        showBanner(cameraAlertBox, "error", state.error);
-      } else if (
-        state.gate_feedback &&
-        state.gate_feedback.message &&
-        state.gate_feedback.seq !== lastFeedbackSeq
-      ) {
-        lastFeedbackSeq = state.gate_feedback.seq;
-        showBanner(
-          cameraAlertBox,
-          state.gate_feedback.type || "success",
-          state.gate_feedback.message,
-          1000
-        );
-      }
-
-      updateSingleCamReadout(
-        state.cam1,
-        cam1VotePill,
-        cam1PlateValue,
-        cam1FaceValue,
-        active1
-      );
-      updateSingleCamReadout(
-        state.cam2,
-        cam2VotePill,
-        cam2PlateValue,
-        cam2FaceValue,
-        active2
-      );
-
-      // Two-Phase Latch UI
-      if (state.latched) {
-        latchStatusBox.classList.remove("hidden");
-        const isIn = state.latched.direction === "IN";
-        latchDirectionBadge.className = isIn ? "pill pos" : "pill warn";
-        latchDirectionBadge.textContent = isIn ? "LƯU HỜ · ĐI VÀO" : "LƯU HỜ · ĐI RA";
-        latchPlateText.textContent = state.latched.plate_number;
-        latchStepText.textContent = state.latched.sampling_face
-          ? `Cam ${state.latched.plate_cam} đã chốt biển — Đang chọn mặt nét nhất ở Cam ${state.latched.required_face_cam}...`
-          : `Cam ${state.latched.plate_cam} đã chốt biển — Chờ khuôn mặt ở Cam ${state.latched.required_face_cam} (${state.latched.remaining_seconds}s)`;
-
-        if (cam1UnitCard) {
-          cam1UnitCard.classList.toggle(
-            "cam-target-highlight",
-            state.latched.required_face_cam === 1
-          );
-        }
-        if (cam2UnitCard) {
-          cam2UnitCard.classList.toggle(
-            "cam-target-highlight",
-            state.latched.required_face_cam === 2
-          );
-        }
-        if (liveFlowPill) {
-          liveFlowPill.className = isIn ? "pill pos" : "pill warn";
-          liveFlowPill.textContent =
-            state.latched.plate_cam === state.latched.required_face_cam
-              ? `Đang đón xe ${isIn ? "VÀO" : "RA"} (1 Cam · Cam ${state.latched.plate_cam})`
-              : `Đang đón xe ${isIn ? "VÀO" : "RA"} (Biển Cam ${state.latched.plate_cam} + Mặt Cam ${state.latched.required_face_cam})`;
-        }
-      } else {
-        latchStatusBox.classList.add("hidden");
-        if (cam1UnitCard) cam1UnitCard.classList.remove("cam-target-highlight");
-        if (cam2UnitCard) cam2UnitCard.classList.remove("cam-target-highlight");
-        if (liveFlowPill) {
-          if (active1 && active2) {
-            liveFlowPill.className = "pill pos";
-            liveFlowPill.textContent = "2 Camera đối xứng (Chéo luồng)";
-          } else if (active1) {
-            liveFlowPill.className = "pill warn";
-            liveFlowPill.textContent = "Chế độ 1 Cam dự phòng (Cam 1)";
-          } else if (active2) {
-            liveFlowPill.className = "pill warn";
-            liveFlowPill.textContent = "Chế độ 1 Cam dự phòng (Cam 2)";
-          } else {
-            liveFlowPill.className = "pill pos";
-            liveFlowPill.textContent = "2 Camera độc lập";
-          }
-        }
-      }
-
-      // Security Alert UI (Face mismatch on exit)
-      if (state.security_alert) {
-        securityAlertBox.classList.remove("hidden");
-        alertScorePill.textContent = `Độ khớp: ${state.security_alert.match_score_pct}`;
-        alertDetailText.textContent =
-          `Xe ${state.security_alert.plate_number} (gửi lúc ${state.security_alert.entry_time}) ` +
-          `có khuôn mặt người lấy xe LỆCH so với lúc gửi xe vào bãi (Cosine ${state.security_alert.match_score_pct} < 65%).`;
-      } else {
-        securityAlertBox.classList.add("hidden");
-      }
-
-      voteAmbiguousWarning.classList.toggle("hidden", !state.ambiguous_frame);
-
-      if (
-        typeof state.records_version === "number" &&
-        state.records_version !== lastRecordsVersion
-      ) {
-        lastRecordsVersion = state.records_version;
-        fetchManagementOverview();
-      }
+      await applyCameraStatus(state);
     } catch {
       updatePendingBadgeUI(0);
     }
-  }
-
-  async function pollLoop() {
-    await pollCameraStatusOnce();
-    setTimeout(pollLoop, 260);
   }
 
   // ==================== REVENUE REPORT (NGÀY / THÁNG / NĂM) ====================
@@ -1489,5 +1524,5 @@
   });
 
   fetchManagementOverview();
-  pollLoop();
+  pollCameraStatusOnce();
 })();
