@@ -259,7 +259,9 @@ def _crop_to_data_url(
 
 
 def _save_snapshot_to_disk(kind: str, plate_number: str, data_url: str | None) -> None:
-    """Lưu thêm bản sao file ảnh (.jpg) vào data/snapshots/ để phục vụ kiểm tra trực tiếp."""
+    """Lưu thêm bản sao file ảnh (.jpg) vào data/snapshots/ khi bật cờ SAVE_DISK_SNAPSHOTS=1."""
+    if os.getenv("SAVE_DISK_SNAPSHOTS", "0").strip().lower() not in ("1", "true", "yes"):
+        return
     if not data_url or "," not in data_url:
         return
     try:
@@ -666,14 +668,10 @@ class SystemState:
             self.database_ready = ready
             self.database_error = error
 
-    def _bump_version(self, prewarmed_overview: dict | None = None) -> None:
+    def _bump_version(self) -> None:
         with self.lock:
             self.records_version += 1
             self.overview_cache.clear()
-            if prewarmed_overview is not None:
-                self.overview_cache[
-                    (self.records_version, "", "all", HISTORY_LIMIT)
-                ] = prewarmed_overview
 
     def get_cached_overview(self, q: str, status: str, limit: int) -> dict | None:
         with self.lock:
@@ -753,12 +751,7 @@ class SystemState:
                 self._bump_version()
 
         if inserted_to_db:
-            fresh_overview = None
-            try:
-                fresh_overview = fetch_overview("", "all", HISTORY_LIMIT)
-            except Exception:
-                fresh_overview = None
-            self._bump_version(prewarmed_overview=fresh_overview)
+            self._bump_version()
 
     def _db_writer_loop(self) -> None:
         last_retry = time.monotonic()
@@ -1700,7 +1693,6 @@ class SystemState:
             flushed = self.connect_database()
             if flushed:
                 print(f"[DB] Đã đồng bộ {flushed} bản ghi chờ từ lần chạy trước.")
-            self.get_cached_overview("", "all", HISTORY_LIMIT)
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
             print(f"[WARN] Chưa kết nối được MySQL, bản ghi sẽ được lưu tạm: {error}")
         self.start_db_writer()
@@ -1880,23 +1872,22 @@ def api_resolve_alert(req: ResolveAlertRequest):
 def scan_cameras():
     if os.getenv("SPACE_ID") is not None:
         return {"cameras": []}
-    with state.control_lock:
-        with state.lock:
-            busy_local = {
-                c.device_index: c.backend_name
-                for c in state.cams.values()
-                if c.active and c.mode == "local"
-            }
-        found = []
-        for index in range(6):
-            if index in busy_local:
-                found.append({"index": index, "backend": busy_local[index] or "Đang kết nối"})
-                continue
-            test_cap, _, backend_name, _ = open_camera(index)
-            if test_cap is not None:
-                found.append({"index": index, "backend": backend_name})
-                test_cap.release()
-        return {"cameras": found}
+    with state.lock:
+        busy_local = {
+            c.device_index: c.backend_name
+            for c in state.cams.values()
+            if c.active and c.mode == "local"
+        }
+    found = []
+    for index in range(6):
+        if index in busy_local:
+            found.append({"index": index, "backend": busy_local[index] or "Đang kết nối"})
+            continue
+        test_cap, _, backend_name, _ = open_camera(index)
+        if test_cap is not None:
+            found.append({"index": index, "backend": backend_name})
+            test_cap.release()
+    return {"cameras": found}
 
 
 @app.post("/api/camera/{cam_id}/start")

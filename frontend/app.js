@@ -98,6 +98,7 @@
   const modalFaceImg = document.getElementById("modal-face-img");
   const btnCloseSnapshotModal = document.getElementById("btn-close-snapshot-modal");
 
+  let activeViewId = "view-recognition";
   let activeStatusFilter = "all";
   let activeRevenuePeriod = "daily";
   let cachedRevenueData = null;
@@ -145,6 +146,7 @@
   }
 
   function activateView(targetId) {
+    activeViewId = targetId;
     navItems.forEach((btn) => {
       if (!btn) return;
       const isMatch = btn.getAttribute("data-target") === targetId;
@@ -1060,7 +1062,9 @@
       state.records_version !== lastRecordsVersion
     ) {
       lastRecordsVersion = state.records_version;
-      fetchManagementOverview();
+      if (activeViewId === "view-management" || activeViewId === "view-revenue") {
+        fetchManagementOverview();
+      }
     }
 
     scheduleLocalStatusPollIfNeeded(active1, active2);
@@ -1199,21 +1203,15 @@
 
   function renderSnapshotCell(row) {
     const { plateImg, faceImg } = getRowSnapshots(row);
-    const payload = encodeURIComponent(
-      JSON.stringify({
-        plate: row["Biển số"],
-        direction: row["Luồng"],
-        time: row["Thời gian nhận diện"],
-        match: row["Đối chiếu"] || "-",
-        plateImg,
-        faceImg,
-      })
-    );
+    const plate = escapeHtml(row["Biển số"]);
+    const direction = escapeHtml(row["Luồng"]);
+    const time = escapeHtml(row["Thời gian nhận diện"]);
+    const match = escapeHtml(row["Đối chiếu"] || "-");
     return `
       <div class="snapshot-cell">
-        <button type="button" class="snap-thumb-btn" data-snapshot="${payload}" title="Bấm để phóng to ảnh cắt Biển số & Khuôn mặt">
-          <img class="snap-plate-img" src="${plateImg}" alt="Biển số ${escapeHtml(row["Biển số"])}" loading="lazy" />
-          <img class="snap-face-img" src="${faceImg}" alt="Khuôn mặt ${escapeHtml(row["Biển số"])}" loading="lazy" />
+        <button type="button" class="snap-thumb-btn" data-plate="${plate}" data-dir="${direction}" data-time="${time}" data-match="${match}" title="Bấm để phóng to ảnh cắt Biển số & Khuôn mặt">
+          <img class="snap-plate-img" src="${plateImg}" alt="Biển số ${plate}" loading="lazy" />
+          <img class="snap-face-img" src="${faceImg}" alt="Khuôn mặt ${plate}" loading="lazy" />
         </button>
       </div>
     `;
@@ -1246,12 +1244,18 @@
     });
   }
   document.addEventListener("click", (e) => {
-    const btn = e.target.closest("button[data-snapshot]");
+    const btn = e.target.closest("button.snap-thumb-btn");
     if (!btn) return;
-    try {
-      const info = JSON.parse(decodeURIComponent(btn.getAttribute("data-snapshot") || ""));
-      openSnapshotModal(info);
-    } catch (_) {}
+    const pImg = btn.querySelector(".snap-plate-img");
+    const fImg = btn.querySelector(".snap-face-img");
+    openSnapshotModal({
+      plate: btn.getAttribute("data-plate") || "-",
+      direction: btn.getAttribute("data-dir") || "-",
+      time: btn.getAttribute("data-time") || "-",
+      match: btn.getAttribute("data-match") || "-",
+      plateImg: pImg ? pImg.src : "",
+      faceImg: fImg ? fImg.src : "",
+    });
   });
 
   function buildPageNumbers(totalPages, current) {
@@ -1523,6 +1527,5 @@
     }
   });
 
-  fetchManagementOverview();
   pollCameraStatusOnce();
 })();

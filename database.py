@@ -25,6 +25,7 @@ PARKING_FEE_VND = 2000  # 2.000 VNĐ / lượt giữ xe
 VN_TZ = timezone(timedelta(hours=7))
 SQLITE_DB_PATH = BASE_DIR / "data" / "parking_history.db"
 _SQLITE_LOCK = threading.RLock()
+_SQLITE_INITIALIZED = False
 _ACTIVE_BACKEND = "mysql"  # "mysql" hoặc "sqlite"
 
 
@@ -92,8 +93,13 @@ def _connect_sqlite():
     return conn
 
 
-def _ensure_sqlite_table(conn: sqlite3.Connection) -> None:
+def _ensure_sqlite_table(conn: sqlite3.Connection, force: bool = False) -> None:
+    global _SQLITE_INITIALIZED
+    if _SQLITE_INITIALIZED and not force:
+        return
     with _SQLITE_LOCK:
+        if _SQLITE_INITIALIZED and not force:
+            return
         cur = conn.cursor()
         cur.execute(
             f"""
@@ -141,6 +147,7 @@ def _ensure_sqlite_table(conn: sqlite3.Connection) -> None:
             "UPDATE plate_recognition_history SET fee_amount = 0 WHERE direction = 'OUT' AND fee_amount <> 0"
         )
         conn.commit()
+        _SQLITE_INITIALIZED = True
 
 
 def _ensure_mysql_table(cursor):
@@ -449,7 +456,7 @@ def initialize_database() -> None:
         print(f"[WARN] Không kết nối được MySQL ({error}), chuyển sang SQLite dự phòng.")
         conn = _connect_sqlite()
         try:
-            _ensure_sqlite_table(conn)
+            _ensure_sqlite_table(conn, force=True)
             _ACTIVE_BACKEND = "sqlite"
         finally:
             conn.close()
@@ -1143,30 +1150,21 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                             match_score = max(
                                 -1.0, min(1.0, cosine_similarity(embedding, previous_emb))
                             )
-                    cur.execute(
-                        """
-                        UPDATE plate_recognition_history
-                        SET parking_status = 'COMPLETED'
-                        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
-                          AND direction = 'IN'
-                          AND parking_status = 'IN_PARKING'
-                        """,
-                        (_normalize_search(record["plate_number"]),),
-                    )
                 else:
                     direction = "IN"
                     parking_status = "IN_PARKING"
                     fee_amount = int(record.get("fee_amount", PARKING_FEE_VND))
-                    cur.execute(
-                        """
-                        UPDATE plate_recognition_history
-                        SET parking_status = 'COMPLETED'
-                        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
-                          AND direction = 'IN'
-                          AND parking_status = 'IN_PARKING'
-                        """,
-                        (_normalize_search(record["plate_number"]),),
-                    )
+
+                cur.execute(
+                    """
+                    UPDATE plate_recognition_history
+                    SET parking_status = 'COMPLETED'
+                    WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
+                      AND direction = 'IN'
+                      AND parking_status = 'IN_PARKING'
+                    """,
+                    (_normalize_search(record["plate_number"]),),
+                )
 
                 cur.execute(
                     """
@@ -1225,30 +1223,21 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
                     match_score = max(
                         -1.0, min(1.0, cosine_similarity(embedding, previous_emb))
                     )
-            cursor.execute(
-                """
-                UPDATE plate_recognition_history
-                SET parking_status = 'COMPLETED'
-                WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
-                  AND direction = 'IN'
-                  AND parking_status = 'IN_PARKING'
-                """,
-                (_normalize_search(record["plate_number"]),),
-            )
         else:
             direction = "IN"
             parking_status = "IN_PARKING"
             fee_amount = int(record.get("fee_amount", PARKING_FEE_VND))
-            cursor.execute(
-                """
-                UPDATE plate_recognition_history
-                SET parking_status = 'COMPLETED'
-                WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
-                  AND direction = 'IN'
-                  AND parking_status = 'IN_PARKING'
-                """,
-                (_normalize_search(record["plate_number"]),),
-            )
+
+        cursor.execute(
+            """
+            UPDATE plate_recognition_history
+            SET parking_status = 'COMPLETED'
+            WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+              AND direction = 'IN'
+              AND parking_status = 'IN_PARKING'
+            """,
+            (_normalize_search(record["plate_number"]),),
+        )
 
         cursor.execute(
             """
@@ -1301,11 +1290,8 @@ def flush_pending_plate_records(pending_records: list[dict]) -> int:
         return flushed
 
     connection = _connect_mysql()
-    cursor = connection.cursor(dictionary=True)
     flushed = 0
     try:
-        _ensure_mysql_table(cursor)
-        connection.commit()
         while pending_records:
             insert_plate_record(pending_records[0], connection=connection)
             pending_records.pop(0)
@@ -1314,5 +1300,4 @@ def flush_pending_plate_records(pending_records: list[dict]) -> int:
     except MySQLError as error:
         raise DatabaseOperationError(str(error)) from error
     finally:
-        cursor.close()
         connection.close()

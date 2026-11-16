@@ -8,3 +8,5 @@ fastapi>=0.110.0
 uvicorn>=0.30.0
 mysql-connector-python>=8.0.0
 python-dotenv>=1.0.0
+# Lưu ý: facenet-pytorch==2.6.0 được tự động cài kèm cờ --no-deps trong app.py / face_service.py
+# để không bị ép hạ cấp torch<2.3.0 gây xung đột với ultralytics và gradio.
