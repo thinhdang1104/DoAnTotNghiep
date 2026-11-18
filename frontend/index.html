@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=20261116e" />
+  <link rel="stylesheet" href="styles.css?v=20261118a" />
 </head>
 <body>
   <div class="app-shell">
@@ -115,7 +115,7 @@
                   <circle cx="11" cy="11" r="8" />
                   <path d="m21 21-4.3-4.3" />
                 </svg>
-                <span>Dò cổng</span>
+                <span>Tìm camera</span>
               </button>
               <button id="btn-start-camera" class="btn primary" type="button">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -149,23 +149,25 @@
                 <div class="cam-unit-meta">
                   <span class="cam-index-chip mono-num">CAM 01</span>
                   <div class="cam-unit-title">
-                    <strong>Cam 1 · Luồng cổng 01</strong>
+                    <strong>Cam 1 · Luồng 01</strong>
                     <span class="stamp">Biển số ↔ Đối ứng Mặt Cam 2</span>
                   </div>
                 </div>
                 <div class="cam-unit-controls">
-                  <label class="port-field" for="cam1-index-input">
-                    <span>Cổng</span>
-                    <input id="cam1-index-input" class="input port-input mono-num num" type="number" min="0" max="10" value="0" />
+                  <label class="device-field" for="cam1-device-select">
+                    <span>Thiết bị camera</span>
+                    <select id="cam1-device-select" class="input device-select" disabled>
+                      <option value="">-- Bấm "Tìm camera" --</option>
+                    </select>
                   </label>
-                  <button id="btn-cam1-start" class="btn btn-sm primary" type="button">Kết nối</button>
+                  <button id="btn-cam1-start" class="btn btn-sm primary" type="button" disabled>Kết nối</button>
                   <button id="btn-cam1-stop" class="btn btn-sm" type="button" disabled>Tắt</button>
                 </div>
               </div>
               <div class="cam-unit-badges">
                 <span id="cam1-plate-value" class="pill warn mono-num num hidden">Biển: -</span>
                 <span id="cam1-face-value" class="pill pos mono-num num hidden">Mặt: -</span>
-                <span id="cam1-vote-pill" class="pill mono-num num">Cổng 0 · Ngắt</span>
+                <span id="cam1-vote-pill" class="pill mono-num num">Chưa chọn thiết bị · Ngắt</span>
               </div>
 
               <div class="camera-stage">
@@ -193,23 +195,25 @@
                 <div class="cam-unit-meta">
                   <span class="cam-index-chip cam-chip-2 mono-num">CAM 02</span>
                   <div class="cam-unit-title">
-                    <strong>Cam 2 · Luồng cổng 02</strong>
+                    <strong>Cam 2 · Luồng 02</strong>
                     <span class="stamp">Biển số ↔ Đối ứng Mặt Cam 1</span>
                   </div>
                 </div>
                 <div class="cam-unit-controls">
-                  <label class="port-field" for="cam2-index-input">
-                    <span>Cổng</span>
-                    <input id="cam2-index-input" class="input port-input mono-num num" type="number" min="0" max="10" value="1" />
+                  <label class="device-field" for="cam2-device-select">
+                    <span>Thiết bị camera</span>
+                    <select id="cam2-device-select" class="input device-select" disabled>
+                      <option value="">-- Bấm "Tìm camera" --</option>
+                    </select>
                   </label>
-                  <button id="btn-cam2-start" class="btn btn-sm primary" type="button">Kết nối</button>
+                  <button id="btn-cam2-start" class="btn btn-sm primary" type="button" disabled>Kết nối</button>
                   <button id="btn-cam2-stop" class="btn btn-sm" type="button" disabled>Tắt</button>
                 </div>
               </div>
               <div class="cam-unit-badges">
                 <span id="cam2-plate-value" class="pill warn mono-num num hidden">Biển: -</span>
                 <span id="cam2-face-value" class="pill pos mono-num num hidden">Mặt: -</span>
-                <span id="cam2-vote-pill" class="pill mono-num num">Cổng 1 · Ngắt</span>
+                <span id="cam2-vote-pill" class="pill mono-num num">Chưa chọn thiết bị · Ngắt</span>
               </div>
 
               <div class="camera-stage">
@@ -513,6 +517,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261116e"></script>
+  <script src="app.js?v=20261118a"></script>
 </body>
 </html>

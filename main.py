@@ -896,13 +896,20 @@ class SystemState:
         if cam_id not in self.cams:
             raise ValueError("Camera ID phải là 1 hoặc 2.")
 
+        use_browser = prefer_browser or os.getenv("SPACE_ID") is not None
+
         with self.control_lock:
             with self.lock:
                 cam = self.cams[cam_id]
                 other = self.cams[3 - cam_id]
-                if cam.active:
+                if cam.active and not use_browser:
                     return cam.mode or "local"
-                if other.active and other.device_index == device_index:
+                if (
+                    not use_browser
+                    and other.active
+                    and other.mode == "local"
+                    and other.device_index == device_index
+                ):
                     msg = (
                         f"Cổng {device_index} đang được dùng bởi Cam {other.cam_id}. "
                         "Khi bật 2 Camera, mỗi Camera phải dùng 1 cổng thiết bị riêng (hoặc chỉ bật 1 Camera)."
@@ -910,7 +917,6 @@ class SystemState:
                     self.camera_error = msg
                     raise ValueError(msg)
 
-            use_browser = prefer_browser or os.getenv("SPACE_ID") is not None
             grabber = None
             backend = "WebRTC (trình duyệt)"
 
@@ -923,7 +929,7 @@ class SystemState:
                     else:
                         msg = (
                             f"Không mở được Cam {cam_id} tại cổng {device_index} "
-                            f"({'; '.join(errors)}). Hãy bấm 'Dò cổng' để xem các cổng đang hoạt động."
+                            f"({'; '.join(errors)}). Hãy bấm 'Tìm camera' để kiểm tra thiết bị."
                         )
                         with self.lock:
                             self.camera_error = msg
@@ -932,6 +938,12 @@ class SystemState:
                     grabber = FrameGrabber(cam_id, device_index, cap, frame, backend)
 
             with self.lock:
+                if cam.grabber is not None and cam.grabber is not grabber:
+                    old_grabber = cam.grabber
+                    cam.grabber = None
+                else:
+                    old_grabber = None
+
                 was_running = self.running
                 if not was_running:
                     self.session_id += 1
@@ -944,7 +956,7 @@ class SystemState:
                     for c in self.cams.values():
                         c.observations.clear()
 
-                cam.device_index = device_index
+                cam.device_index = (cam_id - 1) if use_browser else device_index
                 cam.backend_name = backend
                 cam.mode = "browser" if use_browser else "local"
                 cam.grabber = grabber
@@ -959,6 +971,8 @@ class SystemState:
                         target=self._camera_worker_loop, daemon=True
                     )
                     self.worker_thread.start()
+            if old_grabber is not None:
+                old_grabber.stop()
             return cam.mode
 
     def stop_camera(self, cam_id: int) -> None:

@@ -349,12 +349,34 @@ th.n,
   background: var(--border);
 }
 
-.port-field {
+.port-field,
+.device-field {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font-size: var(--s-small);
   color: var(--muted);
+  min-width: 0;
+}
+
+.device-select {
+  width: 205px;
+  max-width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  font-size: var(--s-small);
+  font-weight: 500;
+  color: var(--text);
+  background: var(--surface);
+  border-color: var(--border);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.device-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .port-input {
@@ -1209,7 +1231,12 @@ td.n {
     padding: 14px 16px;
   }
 
-  .search-input {
+  .search-input,
+  .device-select {
     width: 100%;
+  }
+
+  .device-field {
+    flex: 1 1 100%;
   }
 }

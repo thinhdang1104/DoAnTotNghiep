@@ -10,8 +10,8 @@
 
   // Screen 1: Full-width Dual Camera (Cam 1 + Cam 2) elements
   const cameraAlertBox = document.getElementById("camera-alert-box");
-  const cam1IndexInput = document.getElementById("cam1-index-input");
-  const cam2IndexInput = document.getElementById("cam2-index-input");
+  const cam1DeviceSelect = document.getElementById("cam1-device-select");
+  const cam2DeviceSelect = document.getElementById("cam2-device-select");
   const btnScanCamera = document.getElementById("btn-scan-camera");
   const btnStartCamera = document.getElementById("btn-start-camera");
   const btnStopCamera = document.getElementById("btn-stop-camera");
@@ -109,7 +109,16 @@
   let pageSize = 10;
   let isCameraStreaming = false;
   let camStreaming = { 1: false, 2: false };
-  let browserCamPorts = { 1: null, 2: null };
+  let selectedCamDeviceIds = { 1: "", 2: "" };
+  let activeCamDeviceIds = { 1: null, 2: null };
+  let activeCamDeviceLabels = { 1: null, 2: null };
+  let camBusy = { 1: false, 2: false };
+  let manualStoppingCam = { 1: false, 2: false };
+  let trackEndedHandlers = { 1: null, 2: null };
+  let lastCamError = { 1: "", 2: "" };
+  let hasDiscoveredOnce = false;
+  let cameraPermissionGranted = false;
+  let deviceChangeBound = false;
   let lastRecordsVersion = -1;
   let lastFeedbackSeq = -1;
   let searchDebounceTimer = null;
@@ -273,19 +282,298 @@
     }
   }
 
-  async function scanBrowserWebcams() {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      return [];
+  function normalizeVideoInputDevices(rawDevices) {
+    const videoInputs = (rawDevices || []).filter(
+      (d) => d && d.kind === "videoinput" && String(d.deviceId || "").trim() !== ""
+    );
+    const baseLabels = videoInputs.map((d, idx) => {
+      const cleaned = String(d.label || "").trim();
+      return cleaned || `Camera ${idx + 1}`;
+    });
+    const counts = new Map();
+    baseLabels.forEach((lbl) => {
+      counts.set(lbl, (counts.get(lbl) || 0) + 1);
+    });
+    const seen = new Map();
+    return videoInputs.map((d, idx) => {
+      const base = baseLabels[idx];
+      let finalLabel = base;
+      if ((counts.get(base) || 0) > 1) {
+        const nextIdx = (seen.get(base) || 0) + 1;
+        seen.set(base, nextIdx);
+        finalLabel = `${base} (${nextIdx})`;
+      }
+      return {
+        deviceId: String(d.deviceId),
+        label: finalLabel,
+      };
+    });
+  }
+
+  function formatMediaError(err, deviceLabel = "") {
+    if (
+      !window.isSecureContext ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== "function" ||
+      typeof navigator.mediaDevices.enumerateDevices !== "function"
+    ) {
+      return "Trình duyệt không hỗ trợ WebRTC Camera hoặc trang không ở ngữ cảnh bảo mật (HTTPS / localhost).";
     }
-    try {
-      const tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      tempStream.getTracks().forEach((t) => t.stop());
-      await new Promise((r) => setTimeout(r, 180));
-    } catch (_) {
-      // Nếu cổng mặc định lỗi, vẫn thử liệt kê danh sách thiết bị
+    const name = (err && err.name) || "";
+    if (
+      name === "NotAllowedError" ||
+      name === "PermissionDeniedError" ||
+      name === "SecurityError"
+    ) {
+      const inIframe = window.self !== window.top;
+      return inIframe
+        ? "Trình duyệt chặn quyền Camera trong khung nhúng. Vui lòng cấp quyền Camera trên thanh địa chỉ hoặc mở trực tiếp https://minhthinh-doan.hf.space"
+        : "Bạn đã từ chối cấp quyền truy cập Camera. Vui lòng cho phép quyền Camera trên thanh địa chỉ trình duyệt rồi thử lại.";
     }
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    browserCamDevices = devices.filter((d) => d.kind === "videoinput");
+    if (
+      name === "NotFoundError" ||
+      name === "DevicesNotFoundError" ||
+      name === "OverconstrainedError"
+    ) {
+      return deviceLabel
+        ? `Thiết bị "${deviceLabel}" không còn tồn tại hoặc không đáp ứng kết nối. Vui lòng chọn thiết bị khác.`
+        : "Không tìm thấy thiết bị Camera nào được kết nối với máy của bạn.";
+    }
+    if (name === "NotReadableError" || name === "TrackStartError") {
+      return deviceLabel
+        ? `Thiết bị "${deviceLabel}" đang bận hoặc không mở được (có thể đang được dùng bởi ứng dụng khác).`
+        : "Thiết bị Camera đang bận hoặc không mở được.";
+    }
+    return (err && err.message) || "Không thể truy cập thiết bị Camera.";
+  }
+
+  function getSelectedDeviceLabel(camId) {
+    if (activeCamDeviceLabels[camId]) {
+      return activeCamDeviceLabels[camId];
+    }
+    const devId = selectedCamDeviceIds[camId];
+    if (!devId) return "";
+    const found = browserCamDevices.find((d) => d.deviceId === devId);
+    return found ? found.label : "";
+  }
+
+  function setPlaceholderText(camId, text) {
+    const phEl = camId === 1 ? cam1Placeholder : cam2Placeholder;
+    if (!phEl) return;
+    const span = phEl.querySelector(".standby-text");
+    if (span) {
+      span.textContent = text;
+    }
+  }
+
+  function renderDeviceSelects() {
+    [1, 2].forEach((camId) => {
+      const selectEl = camId === 1 ? cam1DeviceSelect : cam2DeviceSelect;
+      if (!selectEl) return;
+      const otherId = 3 - camId;
+      const otherReservedId = activeCamDeviceIds[otherId];
+      const currentVal = selectedCamDeviceIds[camId] || "";
+
+      const optionsHtml = [];
+      if (browserCamDevices.length === 0) {
+        optionsHtml.push(
+          `<option value="">-- Bấm "Tìm camera" --</option>`
+        );
+      } else {
+        optionsHtml.push(
+          `<option value="">-- Chọn thiết bị camera --</option>`
+        );
+        browserCamDevices.forEach((dev) => {
+          const usedByOther = Boolean(
+            otherReservedId && otherReservedId === dev.deviceId
+          );
+          const suffix = usedByOther ? ` (Đang dùng ở Cam ${otherId})` : "";
+          const selectedAttr = currentVal === dev.deviceId ? " selected" : "";
+          const disabledAttr = usedByOther ? " disabled" : "";
+          optionsHtml.push(
+            `<option value="${escapeHtml(dev.deviceId)}"${selectedAttr}${disabledAttr}>${escapeHtml(dev.label + suffix)}</option>`
+          );
+        });
+      }
+
+      selectEl.innerHTML = optionsHtml.join("");
+      selectEl.value = currentVal;
+      selectEl.disabled = Boolean(
+        camStreaming[camId] || camBusy[camId] || browserCamDevices.length === 0
+      );
+    });
+  }
+
+  function refreshCamControlButtons() {
+    const anyBusy = Boolean(camBusy[1] || camBusy[2] || isStartingCamera);
+    const active1 = Boolean(camStreaming[1]);
+    const active2 = Boolean(camStreaming[2]);
+    isCameraStreaming = Boolean(active1 || active2);
+
+    if (streamLiveDot) {
+      streamLiveDot.classList.toggle("online", isCameraStreaming);
+    }
+
+    [1, 2].forEach((camId) => {
+      const startBtn = camId === 1 ? btnCam1Start : btnCam2Start;
+      const stopBtn = camId === 1 ? btnCam1Stop : btnCam2Stop;
+      const otherId = 3 - camId;
+      const selId = selectedCamDeviceIds[camId] || "";
+      const isUsedByOther = Boolean(
+        selId && activeCamDeviceIds[otherId] && activeCamDeviceIds[otherId] === selId
+      );
+      const canConnect = Boolean(
+        !camStreaming[camId] &&
+          !camBusy[camId] &&
+          browserCamDevices.length > 0 &&
+          selId &&
+          !isUsedByOther
+      );
+      if (startBtn) startBtn.disabled = !canConnect;
+      if (stopBtn) stopBtn.disabled = Boolean(!camStreaming[camId] || camBusy[camId]);
+    });
+
+    if (btnStartCamera) {
+      btnStartCamera.disabled = Boolean(
+        anyBusy || (active1 && active2) || browserCamDevices.length === 0
+      );
+    }
+    if (btnStopCamera) {
+      btnStopCamera.disabled = Boolean(anyBusy || !isCameraStreaming);
+    }
+
+    if (liveFlowPill && (!latchStatusBox || latchStatusBox.classList.contains("hidden"))) {
+      if (active1 && active2) {
+        liveFlowPill.className = "pill pos";
+        liveFlowPill.textContent = "2 Camera đối xứng (Chéo luồng)";
+      } else if (active1) {
+        liveFlowPill.className = "pill warn";
+        liveFlowPill.textContent = `Chế độ 1 Cam dự phòng (Cam 1 · ${activeCamDeviceLabels[1] || "Đang bật"})`;
+      } else if (active2) {
+        liveFlowPill.className = "pill warn";
+        liveFlowPill.textContent = `Chế độ 1 Cam dự phòng (Cam 2 · ${activeCamDeviceLabels[2] || "Đang bật"})`;
+      } else {
+        liveFlowPill.className = "pill pos";
+        liveFlowPill.textContent = "2 Camera độc lập";
+      }
+    }
+  }
+
+  function updateIdleBadgeForCam(camId) {
+    if (camStreaming[camId]) return;
+    const pillEl = camId === 1 ? cam1VotePill : cam2VotePill;
+    if (!pillEl) return;
+    const lbl = getSelectedDeviceLabel(camId);
+    pillEl.className = "pill mono-num num";
+    pillEl.textContent = lbl ? `${lbl} · Ngắt` : "Chưa chọn thiết bị · Ngắt";
+  }
+
+  function attachDeviceChangeListenerOnce() {
+    if (deviceChangeBound) return;
+    if (
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.addEventListener === "function"
+    ) {
+      deviceChangeBound = true;
+      navigator.mediaDevices.addEventListener("devicechange", () => {
+        discoverCameraDevices({
+          requestPermission: false,
+          isInitialAssign: false,
+        }).catch(() => {});
+      });
+    }
+  }
+
+  async function discoverCameraDevices({
+    requestPermission = false,
+    isInitialAssign = false,
+  } = {}) {
+    if (
+      !window.isSecureContext ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== "function" ||
+      typeof navigator.mediaDevices.enumerateDevices !== "function"
+    ) {
+      throw new Error(formatMediaError(null));
+    }
+
+    attachDeviceChangeListenerOnce();
+
+    let rawDevices = await navigator.mediaDevices.enumerateDevices();
+    const hasLabeledVideo = rawDevices.some(
+      (d) =>
+        d &&
+        d.kind === "videoinput" &&
+        String(d.deviceId || "").trim() !== "" &&
+        String(d.label || "").trim() !== ""
+    );
+    const hasActiveStream = Boolean(browserStreams[0] || browserStreams[1]);
+    if (hasLabeledVideo || hasActiveStream) {
+      cameraPermissionGranted = true;
+    }
+
+    if (requestPermission && !cameraPermissionGranted) {
+      let tempStream = null;
+      try {
+        tempStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+        cameraPermissionGranted = true;
+      } catch (err) {
+        if (
+          err &&
+          (err.name === "NotAllowedError" ||
+            err.name === "PermissionDeniedError" ||
+            err.name === "SecurityError")
+        ) {
+          cameraPermissionGranted = false;
+        }
+        throw new Error(formatMediaError(err));
+      } finally {
+        if (tempStream) {
+          tempStream.getTracks().forEach((t) => t.stop());
+        }
+      }
+      rawDevices = await navigator.mediaDevices.enumerateDevices();
+    }
+
+    browserCamDevices = normalizeVideoInputDevices(rawDevices);
+
+    // Giữ nguyên lựa chọn hiện tại nếu deviceId vẫn còn tồn tại; không tự ý đổi sang thiết bị khác nếu bị rút
+    [1, 2].forEach((camId) => {
+      if (camStreaming[camId] || camBusy[camId]) {
+        if (activeCamDeviceIds[camId]) {
+          selectedCamDeviceIds[camId] = activeCamDeviceIds[camId];
+        }
+        return;
+      }
+      const prevId = selectedCamDeviceIds[camId];
+      if (prevId) {
+        const stillExists = browserCamDevices.some((d) => d.deviceId === prevId);
+        if (!stillExists) {
+          selectedCamDeviceIds[camId] = "";
+        }
+      }
+    });
+
+    if (!hasDiscoveredOnce && isInitialAssign && browserCamDevices.length > 0) {
+      hasDiscoveredOnce = true;
+      if (!selectedCamDeviceIds[1] && !activeCamDeviceIds[1]) {
+        selectedCamDeviceIds[1] = browserCamDevices[0].deviceId;
+      }
+      if (!selectedCamDeviceIds[2] && !activeCamDeviceIds[2]) {
+        const secondDev = browserCamDevices.find(
+          (d) => d.deviceId !== selectedCamDeviceIds[1]
+        );
+        selectedCamDeviceIds[2] = secondDev ? secondDev.deviceId : "";
+      }
+    }
+
+    renderDeviceSelects();
+    updateIdleBadgeForCam(1);
+    updateIdleBadgeForCam(2);
+    refreshCamControlButtons();
     return browserCamDevices;
   }
 
@@ -318,98 +606,11 @@
     const ready = await waitVideoReady(video, 1800);
     if (!ready) {
       stream.getTracks().forEach((t) => t.stop());
+      video.srcObject = null;
       video.remove();
       throw new Error("Thiết bị camera không trả về khung hình (videoWidth = 0).");
     }
     return { stream, video };
-  }
-
-  async function openBrowserWebcamAtIndex(camIdx, excludeIndex = null) {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error(
-        "Trình duyệt chặn quyền Camera (cần chạy trên localhost hoặc HTTPS, hoặc mở trực tiếp https://minhthinh-doan.hf.space)."
-      );
-    }
-    if (!browserCamDevices.length) {
-      await scanBrowserWebcams();
-    }
-
-    // Sắp xếp thứ tự ưu tiên thử mở:
-    // 1. Đúng cổng camIdx người dùng chọn
-    // 2. Các cổng có tên "DroidCam" (nếu cổng camIdx bị hỏng/trống)
-    // 3. Các cổng videoinput còn lại (trừ cổng excludeIndex đang được camera kia sử dụng)
-    const candidates = [];
-    const seenIds = new Set();
-    const pushCandidate = (dev, idx) => {
-      if (!dev) return;
-      if (excludeIndex !== null && idx === excludeIndex) return;
-      const key = dev.deviceId || `idx-${idx}`;
-      if (seenIds.has(key)) return;
-      seenIds.add(key);
-      candidates.push({ dev, idx });
-    };
-
-    if (browserCamDevices[camIdx]) {
-      pushCandidate(browserCamDevices[camIdx], camIdx);
-    }
-    browserCamDevices.forEach((d, idx) => {
-      if ((d.label || "").toLowerCase().includes("droidcam")) {
-        pushCandidate(d, idx);
-      }
-    });
-    browserCamDevices.forEach((d, idx) => pushCandidate(d, idx));
-
-    let lastErr = null;
-    for (const item of candidates) {
-      if (item.dev && item.dev.deviceId) {
-        try {
-          // Không ép độ phân giải 960x540 để tương thích 100% với DroidCam DirectShow (640x480)
-          const res = await tryOpenStreamWithVideo({
-            video: { deviceId: { exact: item.dev.deviceId } },
-            audio: false,
-          });
-          return { ...res, openedIndex: item.idx, label: item.dev.label || `Cổng ${item.idx}` };
-        } catch (err) {
-          lastErr = err;
-        }
-      }
-    }
-
-    if (excludeIndex !== null) {
-      throw (
-        lastErr ||
-        new Error(
-          `Không thể mở thiết bị Camera thứ 2 tại cổng ${camIdx}. Hãy kiểm tra kết nối hoặc sử dụng chế độ 1 Camera dự phòng.`
-        )
-      );
-    }
-
-    // Fallback cuối cùng: mở camera mặc định của trình duyệt
-    try {
-      const res = await tryOpenStreamWithVideo({ video: true, audio: false });
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        browserCamDevices = devices.filter((d) => d.kind === "videoinput");
-      } catch (_) {}
-      return { ...res, openedIndex: camIdx, label: "Webcam mặc định" };
-    } catch (err) {
-      const finalErr = lastErr || err;
-      if (finalErr && (finalErr.name === "NotAllowedError" || finalErr.name === "SecurityError")) {
-        const inIframe = window.self !== window.top;
-        throw new Error(
-          inIframe
-            ? "Trình duyệt chặn quyền Camera trong khung nhúng. Vui lòng cho phép quyền Camera trên thanh địa chỉ hoặc mở trực tiếp tại: https://minhthinh-doan.hf.space"
-            : "Bạn chưa cấp quyền sử dụng Camera cho trình duyệt. Hãy bấm biểu tượng ổ khóa trên thanh địa chỉ và chọn 'Cho phép (Allow)' Camera."
-        );
-      }
-      if (finalErr && finalErr.name === "NotFoundError") {
-        throw new Error("Không tìm thấy thiết bị Webcam nào được kết nối với máy tính/điện thoại của bạn.");
-      }
-      if (finalErr && finalErr.name === "NotReadableError") {
-        throw new Error("Camera đang bị khóa bởi ứng dụng khác hoặc cổng được chọn không hoạt động. Hãy bấm 'Dò cổng' và thử lại.");
-      }
-      throw finalErr;
-    }
   }
 
   function captureVideoToJpegDataUrl(video) {
@@ -527,7 +728,7 @@
       if (!v1 && !v2) return;
 
       const img1 = v1 ? captureVideoToJpegDataUrl(v1) : null;
-      const img2 = v2 ? (v2 === v1 ? img1 : captureVideoToJpegDataUrl(v2)) : null;
+      const img2 = v2 ? captureVideoToJpegDataUrl(v2) : null;
       if (!img1 && !img2) return;
 
       browserInFlight = true;
@@ -557,53 +758,64 @@
     }, 140);
   }
 
-  async function startBrowserWebRTCForCam(camId, portIdx) {
+  function detachTrackEndedHandler(camId, stream) {
+    const handler = trackEndedHandlers[camId];
+    if (handler && stream) {
+      stream.getVideoTracks().forEach((t) => {
+        try {
+          t.removeEventListener("ended", handler);
+        } catch (_) {}
+      });
+    }
+    trackEndedHandlers[camId] = null;
+  }
+
+  function attachTrackEndedHandler(camId, stream, deviceLabel) {
     const slot = camId - 1;
-    const otherId = 3 - camId;
-    const otherSlot = otherId - 1;
+    detachTrackEndedHandler(camId, stream);
+    const tracks = stream ? stream.getVideoTracks() : [];
+    if (!tracks.length) return;
 
-    stopBrowserWebRTCForCam(camId);
-
-    if (!browserCamDevices.length) {
-      await scanBrowserWebcams();
-    }
-
-    const otherActive = Boolean(browserVideos[otherSlot] && browserStreams[otherSlot]);
-    if (otherActive) {
-      if (browserCamDevices.length <= 1) {
-        throw new Error(
-          `Máy chỉ có 1 thiết bị Camera nên không thể bật đồng thời 2 luồng Camera độc lập. Vui lòng dùng chế độ 1 Camera dự phòng (chỉ bật Cam ${otherId}) hoặc kết nối thêm Camera thứ 2.`
-        );
-      }
-      if (browserCamPorts[otherId] === portIdx) {
-        throw new Error(
-          `Cổng ${portIdx} đang được sử dụng bởi Cam ${otherId}. Vui lòng chọn cổng khác cho Cam ${camId} để đảm bảo 2 luồng tách biệt.`
-        );
-      }
-    }
-
-    const camObj = await openBrowserWebcamAtIndex(
-      portIdx,
-      otherActive ? browserCamPorts[otherId] : null
-    );
-
-    browserStreams[slot] = camObj.stream;
-    browserVideos[slot] = camObj.video;
-    browserCamPorts[camId] = camObj.openedIndex ?? portIdx;
-    browserWebRTCActive = Boolean(browserVideos[0] || browserVideos[1]);
-    camStreaming[camId] = true;
-    isCameraStreaming = Boolean(camStreaming[1] || camStreaming[2]);
-
-    // Hiển thị trực tiếp thẻ <video> ở tốc độ 60 FPS mượt tuyệt đối (độ trễ 0ms)
-    const liveVideoEl = camId === 1 ? cam1LiveVideo : cam2LiveVideo;
-    if (liveVideoEl) {
-      liveVideoEl.srcObject = camObj.stream;
+    const handler = () => {
+      if (manualStoppingCam[camId]) return;
+      if (browserStreams[slot] !== stream) return;
+      handleUnexpectedTrackEnded(camId, deviceLabel);
+    };
+    trackEndedHandlers[camId] = handler;
+    tracks.forEach((t) => {
       try {
-        await liveVideoEl.play();
-      } catch (_) {}
-    }
-    revealCamImagesIfReady();
-    ensureBrowserFrameLoop();
+        t.addEventListener("ended", handler, { once: true });
+      } catch (_) {
+        t.onended = handler;
+      }
+    });
+  }
+
+  async function handleUnexpectedTrackEnded(camId, lostLabel) {
+    const labelText = lostLabel || activeCamDeviceLabels[camId] || `Cam ${camId}`;
+    stopBrowserWebRTCForCam(camId);
+    hideCamStreamUI(camId);
+    setPlaceholderText(
+      camId,
+      `Thiết bị "${labelText}" đã bị ngắt kết nối. Vui lòng chọn thiết bị và kết nối lại.`
+    );
+    updateIdleBadgeForCam(camId);
+    renderDeviceSelects();
+    refreshCamControlButtons();
+    showBanner(
+      cameraAlertBox,
+      "error",
+      `Cam ${camId} (${labelText}) đã bị ngắt kết nối thiết bị. Vui lòng kiểm tra lại camera và kết nối lại.`
+    );
+    try {
+      await fetch(`/api/camera/${camId}/stop`, { method: "POST" });
+    } catch (_) {}
+    try {
+      await discoverCameraDevices({
+        requestPermission: false,
+        isInitialAssign: false,
+      });
+    } catch (_) {}
   }
 
   function stopBrowserWebRTCForCam(camId) {
@@ -612,33 +824,42 @@
     const s = browserStreams[slot];
     const v = browserVideos[slot];
 
-    browserStreams[slot] = null;
-    browserVideos[slot] = null;
-    browserCamPorts[camId] = null;
+    manualStoppingCam[camId] = true;
+    try {
+      if (s) {
+        detachTrackEndedHandler(camId, s);
+      }
+      browserStreams[slot] = null;
+      browserVideos[slot] = null;
+      activeCamDeviceIds[camId] = null;
+      activeCamDeviceLabels[camId] = null;
 
-    const liveVideoEl = camId === 1 ? cam1LiveVideo : cam2LiveVideo;
-    const overlayCanvasEl = camId === 1 ? cam1OverlayCanvas : cam2OverlayCanvas;
-    if (liveVideoEl) {
-      liveVideoEl.srcObject = null;
-      liveVideoEl.classList.add("hidden");
-    }
-    if (overlayCanvasEl) {
-      clearOverlayCanvas(overlayCanvasEl);
-      overlayCanvasEl.classList.add("hidden");
-    }
+      const liveVideoEl = camId === 1 ? cam1LiveVideo : cam2LiveVideo;
+      const overlayCanvasEl = camId === 1 ? cam1OverlayCanvas : cam2OverlayCanvas;
+      if (liveVideoEl) {
+        liveVideoEl.srcObject = null;
+        liveVideoEl.classList.add("hidden");
+      }
+      if (overlayCanvasEl) {
+        clearOverlayCanvas(overlayCanvasEl);
+        overlayCanvasEl.classList.add("hidden");
+      }
 
-    if (s && browserStreams[otherSlot] !== s) {
-      s.getTracks().forEach((t) => t.stop());
-    }
-    if (v && browserVideos[otherSlot] !== v) {
-      v.srcObject = null;
-      v.remove();
-    }
+      if (s && browserStreams[otherSlot] !== s) {
+        s.getTracks().forEach((t) => t.stop());
+      }
+      if (v && browserVideos[otherSlot] !== v) {
+        v.srcObject = null;
+        v.remove();
+      }
 
-    browserWebRTCActive = Boolean(browserVideos[0] || browserVideos[1]);
-    if (!browserWebRTCActive && browserFrameTimer) {
-      clearInterval(browserFrameTimer);
-      browserFrameTimer = null;
+      browserWebRTCActive = Boolean(browserVideos[0] || browserVideos[1]);
+      if (!browserWebRTCActive && browserFrameTimer) {
+        clearInterval(browserFrameTimer);
+        browserFrameTimer = null;
+      }
+    } finally {
+      manualStoppingCam[camId] = false;
     }
   }
 
@@ -672,59 +893,204 @@
     }
   }
 
-  async function startSingleCamUI(camId) {
-    const inputEl = camId === 1 ? cam1IndexInput : cam2IndexInput;
-    const startBtn = camId === 1 ? btnCam1Start : btnCam2Start;
-    const portIdx = parseInt((inputEl && inputEl.value) || "0", 10);
+  async function startSingleCamUI(camId, { silentSuccessBanner = false } = {}) {
+    if (camBusy[camId] || camStreaming[camId]) {
+      return Boolean(camStreaming[camId]);
+    }
+    const slot = camId - 1;
+    const otherId = 3 - camId;
+    const selectEl = camId === 1 ? cam1DeviceSelect : cam2DeviceSelect;
+    lastCamError[camId] = "";
 
-    isStartingCamera = true;
-    if (startBtn) startBtn.disabled = true;
-    if (inputEl) inputEl.disabled = true;
-    showBanner(cameraAlertBox, "", `Đang kết nối Cam ${camId} tại cổng ${portIdx}...`);
+    let selectedId =
+      (selectEl && selectEl.value) || selectedCamDeviceIds[camId] || "";
+
+    if (browserCamDevices.length === 0) {
+      try {
+        await discoverCameraDevices({
+          requestPermission: true,
+          isInitialAssign: true,
+        });
+        selectedId =
+          (selectEl && selectEl.value) || selectedCamDeviceIds[camId] || "";
+      } catch (err) {
+        lastCamError[camId] = err.message;
+        setPlaceholderText(camId, err.message);
+        showBanner(cameraAlertBox, "error", `Cam ${camId}: ${err.message}`);
+        return false;
+      }
+    }
+
+    if (browserCamDevices.length === 0) {
+      const msg = "Không tìm thấy thiết bị Camera nào để kết nối.";
+      lastCamError[camId] = msg;
+      setPlaceholderText(camId, msg);
+      showBanner(cameraAlertBox, "error", `Cam ${camId}: ${msg}`);
+      return false;
+    }
+
+    if (!selectedId) {
+      let msg = `Vui lòng chọn thiết bị camera cho Cam ${camId} trước khi kết nối.`;
+      if (
+        browserCamDevices.length === 1 &&
+        activeCamDeviceIds[otherId] === browserCamDevices[0].deviceId
+      ) {
+        msg = `Máy chỉ có 1 thiết bị Camera (${browserCamDevices[0].label}) và đang được sử dụng ở Cam ${otherId}. Không thể mở cùng 1 thiết bị cho cả 2 ô.`;
+      }
+      lastCamError[camId] = msg;
+      setPlaceholderText(camId, msg);
+      showBanner(cameraAlertBox, "error", msg);
+      return false;
+    }
+
+    if (
+      activeCamDeviceIds[otherId] &&
+      activeCamDeviceIds[otherId] === selectedId
+    ) {
+      const dupDev = browserCamDevices.find((d) => d.deviceId === selectedId);
+      const dupName = (dupDev && dupDev.label) || "đã chọn";
+      const msg = `Thiết bị "${dupName}" đang được sử dụng ở Cam ${otherId}. Vui lòng chọn thiết bị khác cho Cam ${camId}.`;
+      lastCamError[camId] = msg;
+      setPlaceholderText(camId, msg);
+      showBanner(cameraAlertBox, "error", msg);
+      return false;
+    }
+
+    // Đặt khóa & giữ chỗ thiết bị ĐỒNG BỘ trước lệnh await đầu tiên để chống race condition khi bấm 2 ô liên tiếp
+    camBusy[camId] = true;
+    selectedCamDeviceIds[camId] = selectedId;
+    activeCamDeviceIds[camId] = selectedId;
+    renderDeviceSelects();
+    refreshCamControlButtons();
+
+    let openedCamObj = null;
     try {
+      // Kiểm tra lại danh sách thiết bị hiện có để chắc chắn deviceId vẫn còn tồn tại
+      const latestRaw = await navigator.mediaDevices.enumerateDevices();
+      browserCamDevices = normalizeVideoInputDevices(latestRaw);
+      const targetDev = browserCamDevices.find((d) => d.deviceId === selectedId);
+      if (!targetDev) {
+        selectedCamDeviceIds[camId] = "";
+        throw new Error(
+          `Thiết bị đã chọn cho Cam ${camId} không còn tồn tại. Vui lòng chọn thiết bị khác.`
+        );
+      }
+
+      activeCamDeviceLabels[camId] = targetDev.label;
+      showBanner(
+        cameraAlertBox,
+        "",
+        `Đang kết nối Cam ${camId} (${targetDev.label})...`
+      );
+
+      // Mở ĐÚNG thiết bị bằng exact deviceId — tuyệt đối không fallback sang thiết bị khác hay video: true
+      try {
+        openedCamObj = await tryOpenStreamWithVideo({
+          video: { deviceId: { exact: selectedId } },
+          audio: false,
+        });
+      } catch (openErr) {
+        throw new Error(formatMediaError(openErr, targetDev.label));
+      }
+
+      // Đăng ký phiên browser rõ ràng với backend (prefer_browser: true)
       const res = await fetch(`/api/camera/${camId}/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_index: portIdx }),
+        body: JSON.stringify({
+          device_index: camId - 1,
+          prefer_browser: true,
+        }),
       });
-      const data = await res.json();
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (_) {}
       if (!res.ok) {
-        throw new Error(data.detail || `Không thể mở Cam ${camId}.`);
+        throw new Error(
+          data.detail || `Không thể đăng ký phiên Cam ${camId} trên máy chủ.`
+        );
       }
-      if (data.mode === "browser") {
-        await startBrowserWebRTCForCam(camId, portIdx);
-      } else {
-        const ts = Date.now();
-        const imgEl = camId === 1 ? cam1StreamImg : cam2StreamImg;
-        const phEl = camId === 1 ? cam1Placeholder : cam2Placeholder;
-        camStreaming[camId] = true;
-        isCameraStreaming = true;
-        if (imgEl) {
-          imgEl.src = `/api/camera/stream/${camId}?t=${ts}`;
-          imgEl.classList.remove("hidden");
-        }
-        if (phEl) phEl.classList.add("hidden");
+
+      browserStreams[slot] = openedCamObj.stream;
+      browserVideos[slot] = openedCamObj.video;
+      openedCamObj = null; // đã bàn giao cho browserStreams[slot]
+      browserWebRTCActive = Boolean(browserVideos[0] || browserVideos[1]);
+      camStreaming[camId] = true;
+      isCameraStreaming = Boolean(camStreaming[1] || camStreaming[2]);
+
+      attachTrackEndedHandler(camId, browserStreams[slot], targetDev.label);
+
+      const liveVideoEl = camId === 1 ? cam1LiveVideo : cam2LiveVideo;
+      if (liveVideoEl) {
+        liveVideoEl.srcObject = browserStreams[slot];
+        try {
+          await liveVideoEl.play();
+        } catch (_) {}
       }
-      showBanner(cameraAlertBox, "", "");
-      await pollCameraStatusOnce();
+
+      revealCamImagesIfReady();
+      ensureBrowserFrameLoop();
+
+      const votePillEl = camId === 1 ? cam1VotePill : cam2VotePill;
+      if (votePillEl) {
+        votePillEl.className = "pill mono-num num";
+        votePillEl.textContent = `${targetDev.label} · Đang quét`;
+      }
+
+      if (!silentSuccessBanner) {
+        showBanner(
+          cameraAlertBox,
+          "success",
+          `Đã kết nối Cam ${camId}: ${targetDev.label}`,
+          1000
+        );
+      }
+      return true;
     } catch (err) {
+      if (openedCamObj) {
+        try {
+          openedCamObj.stream.getTracks().forEach((t) => t.stop());
+        } catch (_) {}
+        try {
+          openedCamObj.video.srcObject = null;
+          openedCamObj.video.remove();
+        } catch (_) {}
+        openedCamObj = null;
+      }
       stopBrowserWebRTCForCam(camId);
       hideCamStreamUI(camId);
-      await fetch(`/api/camera/${camId}/stop`, { method: "POST" }).catch(() => {});
-      showBanner(cameraAlertBox, "error", err.message);
-      if (startBtn) startBtn.disabled = false;
-      if (inputEl) inputEl.disabled = false;
+      // Giữ lại lựa chọn trong dropdown (nếu thiết bị vẫn còn trong danh sách) để người dùng sửa hoặc thử lại
+      if (
+        selectedId &&
+        browserCamDevices.some((d) => d.deviceId === selectedId)
+      ) {
+        selectedCamDeviceIds[camId] = selectedId;
+      }
+      lastCamError[camId] = err.message;
+      setPlaceholderText(camId, `Lỗi kết nối Cam ${camId}: ${err.message}`);
+      updateIdleBadgeForCam(camId);
+      if (!silentSuccessBanner) {
+        showBanner(cameraAlertBox, "error", `Cam ${camId}: ${err.message}`);
+      }
+      return false;
     } finally {
-      isStartingCamera = false;
+      camBusy[camId] = false;
+      renderDeviceSelects();
+      refreshCamControlButtons();
     }
   }
 
   async function stopSingleCamUI(camId) {
-    const stopBtn = camId === 1 ? btnCam1Stop : btnCam2Stop;
-    if (stopBtn) stopBtn.disabled = true;
-    isStartingCamera = true;
+    if (camBusy[camId]) return;
+    camBusy[camId] = true;
+    renderDeviceSelects();
+    refreshCamControlButtons();
+
     stopBrowserWebRTCForCam(camId);
     hideCamStreamUI(camId);
+    setPlaceholderText(camId, `Chưa kết nối Cam ${camId}`);
+    updateIdleBadgeForCam(camId);
     if (!camStreaming[1] && !camStreaming[2]) {
       stopStatusPollLoop();
     }
@@ -733,10 +1099,26 @@
     } catch (err) {
       showBanner(cameraAlertBox, "error", err.message);
     } finally {
-      isStartingCamera = false;
+      camBusy[camId] = false;
+      renderDeviceSelects();
+      refreshCamControlButtons();
     }
     await pollCameraStatusOnce();
   }
+
+  [1, 2].forEach((camId) => {
+    const selectEl = camId === 1 ? cam1DeviceSelect : cam2DeviceSelect;
+    if (!selectEl) return;
+    selectEl.addEventListener("change", () => {
+      if (camStreaming[camId] || camBusy[camId]) {
+        selectEl.value = activeCamDeviceIds[camId] || selectedCamDeviceIds[camId] || "";
+        return;
+      }
+      selectedCamDeviceIds[camId] = selectEl.value || "";
+      updateIdleBadgeForCam(camId);
+      refreshCamControlButtons();
+    });
+  });
 
   if (btnCam1Start) {
     btnCam1Start.addEventListener("click", () => startSingleCamUI(1));
@@ -753,97 +1135,161 @@
 
   btnScanCamera.addEventListener("click", async () => {
     btnScanCamera.disabled = true;
-    showBanner(cameraAlertBox, "", "Đang dò các cổng camera...");
+    showBanner(cameraAlertBox, "", "Đang xin quyền và tìm thiết bị camera...");
     try {
-      const res = await fetch("/api/camera/scan", { method: "POST" });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.detail || "Không thể dò cổng camera.");
-      }
-      if (data.cameras && data.cameras.length > 0) {
-        const listText = data.cameras.map((c) => `cổng ${c.index}`).join(", ");
-        if (!camStreaming[1]) cam1IndexInput.value = data.cameras[0].index;
-        if (!camStreaming[2]) {
-          cam2IndexInput.value =
-            data.cameras.length >= 2 ? data.cameras[1].index : data.cameras[0].index;
-        }
+      const devices = await discoverCameraDevices({
+        requestPermission: true,
+        isInitialAssign: true,
+      });
+      if (devices.length === 0) {
+        setPlaceholderText(1, "Không tìm thấy thiết bị Camera nào.");
+        setPlaceholderText(2, "Không tìm thấy thiết bị Camera nào.");
+        showBanner(
+          cameraAlertBox,
+          "error",
+          "Không tìm thấy thiết bị Camera nào được kết nối với máy của bạn."
+        );
+      } else if (devices.length === 1) {
+        showBanner(
+          cameraAlertBox,
+          "warn",
+          `Tìm thấy 1 thiết bị: ${devices[0].label}. Vì chỉ có 1 thiết bị nên chỉ có thể bật 1 ô (Chế độ 1 Camera dự phòng), không thể bật đồng thời cả 2 ô.`
+        );
+      } else {
+        const names = devices.map((d) => d.label).join(", ");
         showBanner(
           cameraAlertBox,
           "success",
-          `Tìm thấy ${data.cameras.length} camera (${listText}). Bạn có thể bấm "Kết nối" ở từng Cam hoặc "Bật cả 2".`
+          `Tìm thấy ${devices.length} thiết bị: ${names}. Hãy chọn thiết bị cho Cam 1 / Cam 2 và bấm "Kết nối" hoặc "Bật cả 2".`
         );
-      } else {
-        const webcams = await scanBrowserWebcams();
-        if (webcams.length > 0) {
-          const droidIdx = webcams.findIndex((w) =>
-            (w.label || "").toLowerCase().includes("droidcam")
-          );
-          if (droidIdx >= 0) {
-            const otherIdx = webcams.findIndex((_, i) => i !== droidIdx);
-            if (!camStreaming[1]) cam1IndexInput.value = droidIdx;
-            if (!camStreaming[2]) {
-              cam2IndexInput.value = otherIdx >= 0 ? otherIdx : droidIdx;
-            }
-          } else {
-            if (!camStreaming[1]) cam1IndexInput.value = 0;
-            if (!camStreaming[2]) cam2IndexInput.value = webcams.length >= 2 ? 1 : 0;
-          }
-          const names = webcams.map((w, i) => `cổng ${i} (${w.label || "Webcam"})`).join(", ");
-          showBanner(
-            cameraAlertBox,
-            "success",
-            `[WebRTC] Tìm thấy ${webcams.length} camera: ${names}. Bấm "Kết nối" ở Cam 1 hoặc Cam 2 để bắt đầu!`
-          );
-        } else {
-          showBanner(cameraAlertBox, "error", "Không tìm thấy camera nào từ cổng 0 đến 5.");
-        }
       }
     } catch (err) {
       showBanner(cameraAlertBox, "error", err.message);
     } finally {
       btnScanCamera.disabled = false;
+      renderDeviceSelects();
+      refreshCamControlButtons();
     }
   });
 
   btnStartCamera.addEventListener("click", async () => {
+    if (camBusy[1] || camBusy[2] || isStartingCamera) return;
     btnStartCamera.disabled = true;
     try {
-      if (!camStreaming[1]) {
-        await startSingleCamUI(1);
+      if (browserCamDevices.length === 0) {
+        await discoverCameraDevices({
+          requestPermission: true,
+          isInitialAssign: true,
+        });
       }
-      if (!camStreaming[2]) {
-        await startSingleCamUI(2);
+      if (browserCamDevices.length < 2) {
+        const msg =
+          browserCamDevices.length === 1
+            ? `Chỉ tìm thấy 1 thiết bị (${browserCamDevices[0].label}). Để dùng "Bật cả 2", máy cần kết nối ít nhất 2 thiết bị camera khác nhau (hoặc bấm "Kết nối" ở 1 ô để dùng chế độ 1 Camera dự phòng).`
+            : "Không tìm thấy đủ 2 thiết bị camera để bật đồng thời cả 2 ô.";
+        showBanner(cameraAlertBox, "error", msg);
+        return;
       }
+
+      const dev1 = camStreaming[1]
+        ? activeCamDeviceIds[1]
+        : (cam1DeviceSelect && cam1DeviceSelect.value) || selectedCamDeviceIds[1] || "";
+      const dev2 = camStreaming[2]
+        ? activeCamDeviceIds[2]
+        : (cam2DeviceSelect && cam2DeviceSelect.value) || selectedCamDeviceIds[2] || "";
+
+      if (!dev1 || !dev2) {
+        showBanner(
+          cameraAlertBox,
+          "error",
+          'Vui lòng chọn đủ 2 thiết bị camera cho Cam 1 và Cam 2 trước khi bấm "Bật cả 2".'
+        );
+        return;
+      }
+      if (dev1 === dev2) {
+        showBanner(
+          cameraAlertBox,
+          "error",
+          "Cam 1 và Cam 2 không được chọn cùng một thiết bị camera. Vui lòng chọn 2 thiết bị khác nhau."
+        );
+        return;
+      }
+
+      const wasStreaming1 = Boolean(camStreaming[1]);
+      const wasStreaming2 = Boolean(camStreaming[2]);
+      const ok1 = wasStreaming1
+        ? true
+        : await startSingleCamUI(1, { silentSuccessBanner: true });
+      const ok2 = wasStreaming2
+        ? true
+        : await startSingleCamUI(2, { silentSuccessBanner: true });
+
+      if (ok1 && ok2) {
+        showBanner(
+          cameraAlertBox,
+          "success",
+          `Đã kết nối cả 2 Camera: Cam 1 (${activeCamDeviceLabels[1]}) & Cam 2 (${activeCamDeviceLabels[2]}).`,
+          1200
+        );
+      } else if (ok1 && !ok2) {
+        showBanner(
+          cameraAlertBox,
+          "error",
+          `Cam 1 (${activeCamDeviceLabels[1]}) đang hoạt động, nhưng Cam 2 kết nối thất bại: ${lastCamError[2] || "Không mở được thiết bị."}`
+        );
+      } else if (!ok1 && ok2) {
+        showBanner(
+          cameraAlertBox,
+          "error",
+          `Cam 2 (${activeCamDeviceLabels[2]}) đang hoạt động, nhưng Cam 1 kết nối thất bại: ${lastCamError[1] || "Không mở được thiết bị."}`
+        );
+      } else {
+        showBanner(
+          cameraAlertBox,
+          "error",
+          `Không thể kết nối cả 2 Camera. Cam 1: ${lastCamError[1] || "Lỗi"} | Cam 2: ${lastCamError[2] || "Lỗi"}`
+        );
+      }
+    } catch (err) {
+      showBanner(cameraAlertBox, "error", err.message);
     } finally {
-      await pollCameraStatusOnce();
+      renderDeviceSelects();
+      refreshCamControlButtons();
     }
   });
 
   btnStopCamera.addEventListener("click", async () => {
+    if (camBusy[1] || camBusy[2]) return;
     btnStopCamera.disabled = true;
     isStartingCamera = true;
     stopStatusPollLoop();
     stopBrowserWebRTC();
     hideCamStreamUI(1);
     hideCamStreamUI(2);
+    setPlaceholderText(1, "Chưa kết nối Cam 1");
+    setPlaceholderText(2, "Chưa kết nối Cam 2");
+    updateIdleBadgeForCam(1);
+    updateIdleBadgeForCam(2);
+    renderDeviceSelects();
+    refreshCamControlButtons();
     try {
       await fetch("/api/camera/stop", { method: "POST" });
     } catch (err) {
       showBanner(cameraAlertBox, "error", err.message);
     } finally {
       isStartingCamera = false;
+      renderDeviceSelects();
+      refreshCamControlButtons();
     }
     await pollCameraStatusOnce();
   });
 
-  function updateSingleCamReadout(camData, votePillEl, plateValueEl, faceValueEl, running) {
-    if (!camData) return;
-
-    const plates = camData.current_plates || [];
-    const faces = camData.current_faces || [];
+  function updateSingleCamReadout(camId, camData, votePillEl, plateValueEl, faceValueEl, running) {
+    const plates = (camData && camData.current_plates) || [];
+    const faces = (camData && camData.current_faces) || [];
 
     if (plateValueEl) {
-      if (plates.length > 0) {
+      if (running && plates.length > 0) {
         plateValueEl.textContent = `Biển: ${plates.join(", ")}`;
         plateValueEl.classList.remove("hidden");
       } else {
@@ -852,7 +1298,7 @@
     }
 
     if (faceValueEl) {
-      if (faces.length > 0) {
+      if (running && faces.length > 0) {
         const bestConf = Math.round(Math.max(...faces) * 100);
         faceValueEl.textContent = `Mặt: ${bestConf}%`;
         faceValueEl.classList.remove("hidden");
@@ -862,16 +1308,22 @@
     }
 
     if (votePillEl) {
+      const devLabel =
+        activeCamDeviceLabels[camId] ||
+        getSelectedDeviceLabel(camId) ||
+        (camData && camData.mode === "local"
+          ? `Camera nội bộ #${camData.device_index}`
+          : "Chưa chọn thiết bị");
       if (!running) {
         votePillEl.className = "pill mono-num num";
-        votePillEl.textContent = `Cổng ${camData.device_index} · Ngắt`;
-      } else if (camData.vote) {
+        votePillEl.textContent = `${devLabel} · Ngắt`;
+      } else if (camData && camData.vote) {
         const pct = Math.round(camData.vote.vote_share * 100);
         votePillEl.className = "pill warn mono-num num";
         votePillEl.textContent = `${camData.vote.candidate} (${camData.vote.vote_count}/${camData.vote.sample_count} · ${pct}%)`;
       } else {
         votePillEl.className = "pill mono-num num";
-        votePillEl.textContent = `Cổng ${camData.device_index} · Đang quét`;
+        votePillEl.textContent = `${devLabel} · Đang quét`;
       }
     }
   }
@@ -879,25 +1331,20 @@
   function syncSingleCamUI(
     camId,
     camState,
-    inputEl,
-    startBtn,
-    stopBtn,
     imgEl,
     phEl
   ) {
     const slot = camId - 1;
-    const isActive = Boolean(
-      (camState && camState.active) || browserVideos[slot]
+    const ownsBrowserStream = Boolean(browserVideos[slot] && browserStreams[slot]);
+    const isLocalActive = Boolean(
+      camState && camState.active && camState.mode === "local"
     );
-    const mode = (camState && camState.mode) || (browserVideos[slot] ? "browser" : "local");
+    const isActiveHere = Boolean(ownsBrowserStream || isLocalActive);
 
-    if (isActive) {
-      if (camState && typeof camState.device_index === "number" && inputEl) {
-        inputEl.value = camState.device_index;
-      }
+    if (isActiveHere) {
       if (!camStreaming[camId]) {
         camStreaming[camId] = true;
-        if (mode !== "browser" && imgEl && phEl) {
+        if (isLocalActive && !ownsBrowserStream && imgEl && phEl) {
           imgEl.src = `/api/camera/stream/${camId}?t=${Date.now()}`;
           imgEl.classList.remove("hidden");
           phEl.classList.add("hidden");
@@ -905,19 +1352,25 @@
           revealCamImagesIfReady();
         }
       }
-      if (inputEl) inputEl.disabled = true;
-      if (startBtn) startBtn.disabled = true;
-      if (stopBtn) stopBtn.disabled = false;
     } else {
-      if (camStreaming[camId]) {
+      if (camStreaming[camId] && !camBusy[camId]) {
         stopBrowserWebRTCForCam(camId);
         hideCamStreamUI(camId);
       }
-      if (inputEl) inputEl.disabled = false;
-      if (startBtn) startBtn.disabled = false;
-      if (stopBtn) stopBtn.disabled = true;
+      if (
+        camState &&
+        camState.active &&
+        camState.mode === "browser" &&
+        !ownsBrowserStream &&
+        !camBusy[camId]
+      ) {
+        setPlaceholderText(
+          camId,
+          `Cam ${camId} đang mở ở phiên/tab khác — Chọn thiết bị và bấm "Kết nối" để phát từ tab này`
+        );
+      }
     }
-    return isActive;
+    return isActiveHere;
   }
 
   async function applyCameraStatus(state) {
@@ -928,28 +1381,18 @@
     const active1 = syncSingleCamUI(
       1,
       state.cam1,
-      cam1IndexInput,
-      btnCam1Start,
-      btnCam1Stop,
       cam1StreamImg,
       cam1Placeholder
     );
     const active2 = syncSingleCamUI(
       2,
       state.cam2,
-      cam2IndexInput,
-      btnCam2Start,
-      btnCam2Stop,
       cam2StreamImg,
       cam2Placeholder
     );
 
-    isCameraStreaming = Boolean(active1 || active2);
-    if (streamLiveDot) {
-      streamLiveDot.classList.toggle("online", isCameraStreaming);
-    }
-    btnStartCamera.disabled = Boolean(active1 && active2);
-    btnStopCamera.disabled = !isCameraStreaming;
+    renderDeviceSelects();
+    refreshCamControlButtons();
 
     if (state.error) {
       showBanner(cameraAlertBox, "error", state.error);
@@ -968,6 +1411,7 @@
     }
 
     updateSingleCamReadout(
+      1,
       state.cam1,
       cam1VotePill,
       cam1PlateValue,
@@ -975,6 +1419,7 @@
       active1
     );
     updateSingleCamReadout(
+      2,
       state.cam2,
       cam2VotePill,
       cam2PlateValue,
@@ -1016,21 +1461,7 @@
       latchStatusBox.classList.add("hidden");
       if (cam1UnitCard) cam1UnitCard.classList.remove("cam-target-highlight");
       if (cam2UnitCard) cam2UnitCard.classList.remove("cam-target-highlight");
-      if (liveFlowPill) {
-        if (active1 && active2) {
-          liveFlowPill.className = "pill pos";
-          liveFlowPill.textContent = "2 Camera đối xứng (Chéo luồng)";
-        } else if (active1) {
-          liveFlowPill.className = "pill warn";
-          liveFlowPill.textContent = "Chế độ 1 Cam dự phòng (Cam 1)";
-        } else if (active2) {
-          liveFlowPill.className = "pill warn";
-          liveFlowPill.textContent = "Chế độ 1 Cam dự phòng (Cam 2)";
-        } else {
-          liveFlowPill.className = "pill pos";
-          liveFlowPill.textContent = "2 Camera độc lập";
-        }
-      }
+      refreshCamControlButtons();
     }
 
     // Security Alert UI (Face mismatch on exit)
@@ -1517,5 +1948,16 @@
     }
   });
 
+  attachDeviceChangeListenerOnce();
+  setPlaceholderText(
+    1,
+    'Bấm "Tìm camera" để cấp quyền và chọn thiết bị cho Cam 1'
+  );
+  setPlaceholderText(
+    2,
+    'Bấm "Tìm camera" để cấp quyền và chọn thiết bị cho Cam 2'
+  );
+  renderDeviceSelects();
+  refreshCamControlButtons();
   pollCameraStatusOnce();
 })();
