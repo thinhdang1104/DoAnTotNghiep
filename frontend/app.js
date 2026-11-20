@@ -36,7 +36,7 @@
   const cam1Placeholder = document.getElementById("cam1-placeholder");
   const cam2Placeholder = document.getElementById("cam2-placeholder");
   const voteAmbiguousWarning = document.getElementById("vote-ambiguous-warning");
-  const liveFlowPill = document.getElementById("live-flow-pill");
+  const gateTopupBox = document.getElementById("gate-topup-box");
 
   // Two-Phase Latch elements
   const latchStatusBox = document.getElementById("latch-status-box");
@@ -128,20 +128,21 @@
 
   function showBanner(box, type, message, durationMs = 0) {
     if (!box) return;
+    const baseClass = box === gateTopupBox ? "topup-toast" : "notice-banner";
     if (box._hideTimer) {
       clearTimeout(box._hideTimer);
       box._hideTimer = null;
     }
     if (!message) {
-      box.className = "notice-banner hidden";
+      box.className = `${baseClass} hidden`;
       box.textContent = "";
       return;
     }
-    box.className = type ? `notice-banner notice-${type}` : "notice-banner";
+    box.className = type ? `${baseClass} notice-${type}` : baseClass;
     box.textContent = message;
     if (durationMs > 0) {
       box._hideTimer = setTimeout(() => {
-        box.className = "notice-banner hidden";
+        box.className = `${baseClass} hidden`;
         box.textContent = "";
         box._hideTimer = null;
       }, durationMs);
@@ -218,7 +219,7 @@
       if (res.ok) {
         const data = await res.json();
         if (data && data.message) {
-          showBanner(cameraAlertBox, data.type || "warn", data.message, 1000);
+          showBanner(gateTopupBox || cameraAlertBox, data.type || "warn", data.message, 2500);
         }
       }
       pollCameraStatusOnce();
@@ -423,22 +424,6 @@
     }
     if (btnStopCamera) {
       btnStopCamera.disabled = Boolean(anyBusy || !isCameraStreaming);
-    }
-
-    if (liveFlowPill && (!latchStatusBox || latchStatusBox.classList.contains("hidden"))) {
-      if (active1 && active2) {
-        liveFlowPill.className = "pill pos";
-        liveFlowPill.textContent = "2 Camera đối xứng (Chéo luồng)";
-      } else if (active1) {
-        liveFlowPill.className = "pill warn";
-        liveFlowPill.textContent = `Chế độ 1 Cam dự phòng (Cam 1 · ${activeCamDeviceLabels[1] || "Đang bật"})`;
-      } else if (active2) {
-        liveFlowPill.className = "pill warn";
-        liveFlowPill.textContent = `Chế độ 1 Cam dự phòng (Cam 2 · ${activeCamDeviceLabels[2] || "Đang bật"})`;
-      } else {
-        liveFlowPill.className = "pill pos";
-        liveFlowPill.textContent = "2 Camera độc lập";
-      }
     }
   }
 
@@ -1377,17 +1362,19 @@
 
     if (state.error) {
       showBanner(cameraAlertBox, "error", state.error);
-    } else if (
+    }
+
+    if (
       state.gate_feedback &&
       state.gate_feedback.message &&
       state.gate_feedback.seq !== lastFeedbackSeq
     ) {
       lastFeedbackSeq = state.gate_feedback.seq;
       showBanner(
-        cameraAlertBox,
+        gateTopupBox || cameraAlertBox,
         state.gate_feedback.type || "success",
         state.gate_feedback.message,
-        1000
+        2500
       );
     }
 
@@ -1431,13 +1418,6 @@
           state.latched.required_face_cam === 2
         );
       }
-      if (liveFlowPill) {
-        liveFlowPill.className = isIn ? "pill pos" : "pill warn";
-        liveFlowPill.textContent =
-          state.latched.plate_cam === state.latched.required_face_cam
-            ? `Đang đón xe ${isIn ? "VÀO" : "RA"} (1 Cam · Cam ${state.latched.plate_cam})`
-            : `Đang đón xe ${isIn ? "VÀO" : "RA"} (Biển Cam ${state.latched.plate_cam} + Mặt Cam ${state.latched.required_face_cam})`;
-      }
     } else {
       latchStatusBox.classList.add("hidden");
       if (cam1UnitCard) cam1UnitCard.classList.remove("cam-target-highlight");
@@ -1445,8 +1425,11 @@
       refreshCamControlButtons();
     }
 
-    // Security Alert UI (Face mismatch on exit)
+    // Security Alert UI (Face mismatch on exit — Top-up in blue box area)
     if (state.security_alert) {
+      if (gateTopupBox) {
+        showBanner(gateTopupBox, "", "");
+      }
       securityAlertBox.classList.remove("hidden");
       alertScorePill.textContent = `Độ khớp: ${state.security_alert.match_score_pct}`;
       alertDetailText.textContent =
@@ -1680,7 +1663,7 @@
 
     if (totalItems === 0) {
       if (paginationRangeText) {
-        paginationRangeText.textContent = "Hiển thị 0–0 / 0 bản ghi (tối đa 200 bản ghi mới nhất)";
+        paginationRangeText.textContent = "Hiển thị 0–0";
       }
       paginationControls.innerHTML = "";
       return;
@@ -1689,7 +1672,7 @@
     const startIdx = (currentPage - 1) * pageSize + 1;
     const endIdx = Math.min(totalItems, currentPage * pageSize);
     if (paginationRangeText) {
-      paginationRangeText.textContent = `Hiển thị ${startIdx}–${endIdx} / ${totalItems} bản ghi (tối đa 200 bản ghi mới nhất)`;
+      paginationRangeText.textContent = `Hiển thị ${startIdx}–${endIdx}`;
     }
 
     const pageItems = buildPageNumbers(totalPages, currentPage);
@@ -1727,7 +1710,7 @@
     cachedTotalRecords = typeof totalRecords === "number" ? totalRecords : cachedHistoryRecords.length;
 
     if (ledgerCountText) {
-      ledgerCountText.textContent = `${cachedMatchedCount} / ${cachedTotalRecords} bản ghi (tối đa 200 bản ghi mới nhất)`;
+      ledgerCountText.textContent = `${cachedMatchedCount} / ${cachedTotalRecords}`;
     }
 
     const totalItems = cachedHistoryRecords.length;

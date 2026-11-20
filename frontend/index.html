@@ -7,26 +7,13 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=20261120a" />
+  <link rel="stylesheet" href="styles.css?v=20261120b" />
 </head>
 <body>
   <div class="app-shell">
     <!-- TOP BAR -->
     <header class="topbar">
       <div class="topbar-left">
-        <div class="brand-group">
-          <span class="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-              <path d="m9 12 2 2 4-4" />
-            </svg>
-          </span>
-          <div class="brand-text">
-            <h1 id="page-title" class="brand-title">Bãi Giữ Xe Trường Học</h1>
-            <span class="brand-subtitle">AI Dual-Camera &amp; FaceNet Security</span>
-          </div>
-        </div>
-
         <nav class="top-nav" aria-label="Chuyển màn hình">
           <button
             id="nav-recognition"
@@ -77,35 +64,40 @@
       <section id="view-recognition" class="screen-view active" aria-label="Camera nhận diện">
         <div id="camera-alert-box" class="notice-banner hidden" role="status"></div>
 
-        <!-- SECURITY ALERT BOX (ONLY SHOWN WHEN FACE MISMATCH ON EXIT) -->
-        <section id="security-alert-box" class="panel alert-panel hidden" role="alert">
-          <header class="panel-header">
-            <div class="live-title-group">
-              <span class="alert-icon-wrap" aria-hidden="true">
-                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
-                  <path d="M12 9v4" />
-                  <path d="M12 17h.01" />
-                </svg>
-              </span>
-              <h2 class="alert-title">Cảnh báo lệch khuôn mặt khi lấy xe</h2>
-            </div>
-            <span id="alert-score-pill" class="pill neg mono-num num">Lệch 0%</span>
-          </header>
-          <p id="alert-detail-text" class="alert-desc"></p>
-          <div class="alert-actions">
-            <button id="btn-approve-exit" class="btn" type="button">Cho phép ra (Ngoại lệ)</button>
-            <button id="btn-reject-exit" class="btn danger" type="button">Từ chối (Giữ xe)</button>
-          </div>
-        </section>
-
         <!-- FULL-WIDTH DUAL CAMERA PANEL (CAM 1 + CAM 2) -->
         <article class="panel camera-panel">
           <header class="panel-header">
             <div class="live-title-group">
               <span id="stream-live-dot" class="status-dot" aria-hidden="true"></span>
               <h2>Hệ thống 2 Camera Kiểm soát Cổng</h2>
-              <span id="live-flow-pill" class="pill pos">2 Camera độc lập</span>
+            </div>
+
+            <!-- TOP-UP POPUP AREA FOR ENTRY/EXIT FEEDBACK & FACE MISMATCH ALERT -->
+            <div class="header-topup-slot">
+              <div id="gate-topup-box" class="topup-toast hidden" role="status" aria-live="polite"></div>
+
+              <section id="security-alert-box" class="topup-security-alert hidden" role="alert">
+                <div class="topup-alert-main">
+                  <span class="alert-icon-wrap" aria-hidden="true">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
+                      <path d="M12 9v4" />
+                      <path d="M12 17h.01" />
+                    </svg>
+                  </span>
+                  <div class="topup-alert-copy">
+                    <div class="topup-alert-headline">
+                      <strong class="alert-title">Cảnh báo lệch khuôn mặt khi lấy xe</strong>
+                      <span id="alert-score-pill" class="pill neg mono-num num">Lệch 0%</span>
+                    </div>
+                    <p id="alert-detail-text" class="alert-desc"></p>
+                  </div>
+                </div>
+                <div class="alert-actions">
+                  <button id="btn-approve-exit" class="btn btn-sm" type="button">Cho phép ra</button>
+                  <button id="btn-reject-exit" class="btn btn-sm danger" type="button">Từ chối</button>
+                </div>
+              </section>
             </div>
 
             <div class="camera-controls">
@@ -149,7 +141,6 @@
                   <span class="cam-index-chip mono-num">CAM 01</span>
                   <div class="cam-unit-title">
                     <strong>Cam 1 · Luồng 01</strong>
-                    <span class="stamp">Biển số ↔ Đối ứng Mặt Cam 2</span>
                   </div>
                 </div>
                 <div class="cam-unit-controls">
@@ -195,7 +186,6 @@
                   <span class="cam-index-chip cam-chip-2 mono-num">CAM 02</span>
                   <div class="cam-unit-title">
                     <strong>Cam 2 · Luồng 02</strong>
-                    <span class="stamp">Biển số ↔ Đối ứng Mặt Cam 1</span>
                   </div>
                 </div>
                 <div class="cam-unit-controls">
@@ -316,7 +306,7 @@
                 class="input search-input"
                 placeholder="Tìm biển số xe..."
               />
-              <span id="ledger-count-text" class="stamp mono-num num">0 bản ghi (tối đa 200 bản ghi mới nhất)</span>
+              <span id="ledger-count-text" class="stamp mono-num num">0 / 0</span>
               <button id="btn-refresh-management" class="btn" type="button">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
@@ -346,7 +336,7 @@
 
           <div id="ledger-pagination" class="pagination-bar" aria-label="Phân trang danh sách bản ghi">
             <div class="pagination-meta">
-              <span id="pagination-range-text" class="stamp mono-num num">Hiển thị 0–0 / 0 bản ghi (tối đa 200 bản ghi mới nhất)</span>
+              <span id="pagination-range-text" class="stamp mono-num num">Hiển thị 0–0</span>
               <label for="page-size-select" class="pagination-size-label">
                 <span>Số dòng:</span>
                 <select id="page-size-select" class="input page-size-select mono-num num">
@@ -480,6 +470,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261120a"></script>
+  <script src="app.js?v=20261120b"></script>
 </body>
 </html>

@@ -646,7 +646,101 @@ th.n,
   color: var(--text);
 }
 
-/* Security Alert Box */
+/* Security Alert Box & Top-up Slot in Panel Header (Blue Box Area) */
+.header-topup-slot {
+  flex: 1 1 320px;
+  min-width: 240px;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.topup-toast {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  max-width: 100%;
+  min-height: 34px;
+  padding: 5px 14px;
+  border-radius: var(--r-ctl);
+  border: 1px solid #4d3b19;
+  background: var(--pill-warn-bg);
+  color: var(--pill-warn-fg);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  animation: topupPopIn 0.16s ease-out;
+}
+
+.topup-toast.notice-success {
+  background: var(--pill-pos-bg);
+  border-color: #1f4d35;
+  color: var(--pill-pos-fg);
+}
+
+.topup-toast.notice-error {
+  background: var(--pill-neg-bg);
+  border-color: #522328;
+  color: var(--pill-neg-fg);
+}
+
+.topup-toast.notice-warn {
+  background: var(--pill-warn-bg);
+  border-color: #4d3b19;
+  color: var(--pill-warn-fg);
+}
+
+.topup-security-alert {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
+  border-radius: var(--r-ctl);
+  background: #231215;
+  border: 1px solid #6b2930;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  animation: topupPopIn 0.16s ease-out;
+}
+
+.topup-alert-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.topup-alert-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.topup-alert-headline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+@keyframes topupPopIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 .alert-panel {
   background: #231215;
   border-color: #6b2930;
@@ -656,23 +750,28 @@ th.n,
 .alert-icon-wrap {
   display: inline-flex;
   color: #f27474;
+  flex-shrink: 0;
 }
 
 .alert-title {
   color: #f27474 !important;
+  font-size: 13px;
+  line-height: 18px;
 }
 
 .alert-desc {
-  margin: 0 0 14px 0;
+  margin: 0;
   color: var(--text);
-  font-size: var(--s-body);
+  font-size: 12px;
+  line-height: 16px;
 }
 
 .alert-actions {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 /* ==================== SCREEN 2: MANAGEMENT KPIs ==================== */
