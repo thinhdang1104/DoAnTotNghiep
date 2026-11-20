@@ -5,7 +5,6 @@
   const navRevenue = document.getElementById("nav-revenue");
   const navItems = [navRecognition, navManagement, navRevenue];
   const views = document.querySelectorAll(".screen-view");
-  const navPendingBadge = document.getElementById("nav-pending-badge");
   const streamLiveDot = document.getElementById("stream-live-dot");
 
   // Screen 1: Full-width Dual Camera (Cam 1 + Cam 2) elements
@@ -58,7 +57,6 @@
   const statInParking = document.getElementById("stat-in-parking");
   const statTodayRecords = document.getElementById("stat-today-records");
   const statTotalRecords = document.getElementById("stat-total-records");
-  const statPendingRecords = document.getElementById("stat-pending-records");
 
   // Revenue Report elements (2.000 đ / lượt)
   const revTodayAmount = document.getElementById("rev-today-amount");
@@ -72,10 +70,6 @@
   const revPeriodBtns = document.querySelectorAll(".rev-period-btn[data-rev-period]");
   const revenuePeriodColTitle = document.getElementById("revenue-period-col-title");
   const revenueTableBody = document.getElementById("revenue-table-body");
-
-  const pendingSection = document.getElementById("pending-section");
-  const pendingTableBody = document.getElementById("pending-table-body");
-  const btnFlushPending = document.getElementById("btn-flush-pending");
 
   const tabLinks = document.querySelectorAll(".tab-link[data-status-filter]");
   const tabCountAll = document.getElementById("tab-count-all");
@@ -190,17 +184,6 @@
     new URLSearchParams(window.location.search).get("view") === "management"
   ) {
     activateView("view-management");
-  }
-
-  function updatePendingBadgeUI(pendingCount) {
-    if (navPendingBadge) {
-      if (pendingCount > 0) {
-        navPendingBadge.textContent = String(pendingCount);
-        navPendingBadge.classList.remove("hidden");
-      } else {
-        navPendingBadge.classList.add("hidden");
-      }
-    }
   }
 
   function renderDirectionPill(dirText) {
@@ -1376,8 +1359,6 @@
   async function applyCameraStatus(state) {
     if (!state || isStartingCamera) return;
 
-    updatePendingBadgeUI(state.pending_count);
-
     const active1 = syncSingleCamUI(
       1,
       state.cam1,
@@ -1811,7 +1792,6 @@
 
   function applyManagementData(data) {
     const records = data.records || [];
-    const pending = data.pending_records || [];
     const stats = data.stats || {
       total_records: records.length,
       today_records: 0,
@@ -1820,12 +1800,9 @@
       total_out: 0,
     };
 
-    updatePendingBadgeUI(pending.length);
-
     if (statInParking) statInParking.textContent = String(stats.in_parking ?? 0);
     statTodayRecords.textContent = String(stats.today_records ?? 0);
     statTotalRecords.textContent = String(stats.total_records ?? 0);
-    statPendingRecords.textContent = String(pending.length);
 
     if (tabCountAll) tabCountAll.textContent = String(stats.total_records ?? 0);
     if (tabCountParking) tabCountParking.textContent = String(stats.in_parking ?? 0);
@@ -1838,25 +1815,6 @@
       showBanner(managementAlertBox, "error", `Chưa kết nối được MySQL: ${data.database_error}`);
     } else {
       showBanner(managementAlertBox, "", "");
-    }
-
-    if (pending.length > 0) {
-      pendingSection.classList.remove("hidden");
-      pendingTableBody.innerHTML = pending
-        .map(
-          (row) => `
-          <tr>
-            <td><span class="plate-cell-main mono-num num">${escapeHtml(row["Biển số"])}</span></td>
-            <td>${renderSnapshotCell(row)}</td>
-            <td>${renderDirectionPill(row["Luồng"])}</td>
-            <td class="n mono-num num">${escapeHtml(row["Thời gian nhận diện"])}</td>
-          </tr>
-        `
-        )
-        .join("");
-    } else {
-      pendingSection.classList.add("hidden");
-      pendingTableBody.innerHTML = "";
     }
 
     const matched = typeof data.matched === "number" ? data.matched : records.length;
@@ -1883,7 +1841,6 @@
       }
       applyManagementData(data);
     } catch {
-      updatePendingBadgeUI(0);
       showBanner(managementAlertBox, "error", "Không kết nối được tới máy chủ FastAPI.");
     }
   }
@@ -1915,36 +1872,12 @@
         throw new Error(data.detail || "Chưa kết nối được MySQL.");
       }
       await fetchManagementOverview();
-      const flushedMsg =
-        data.flushed > 0 ? ` và đồng bộ ${data.flushed} bản ghi chờ` : "";
-      showBanner(managementAlertBox, "success", `Đã làm mới dữ liệu từ MySQL${flushedMsg}.`);
+      showBanner(managementAlertBox, "success", "Đã làm mới dữ liệu từ MySQL.");
     } catch (err) {
       await fetchManagementOverview();
       showBanner(managementAlertBox, "error", err.message);
     } finally {
       btnRefreshManagement.disabled = false;
-    }
-  });
-
-  btnFlushPending.addEventListener("click", async () => {
-    btnFlushPending.disabled = true;
-    try {
-      const res = await fetch("/api/management/flush-pending", { method: "POST" });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.detail || "Không thể đồng bộ bản ghi chờ.");
-      }
-      await fetchManagementOverview();
-      showBanner(
-        managementAlertBox,
-        "success",
-        `Đã đồng bộ ${data.flushed || 0} bản ghi chờ vào MySQL.`
-      );
-    } catch (err) {
-      await fetchManagementOverview();
-      showBanner(managementAlertBox, "error", err.message);
-    } finally {
-      btnFlushPending.disabled = false;
     }
   });
 

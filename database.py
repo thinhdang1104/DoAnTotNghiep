@@ -1,7 +1,5 @@
 import math
 import os
-import sqlite3
-import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,10 +21,6 @@ load_dotenv(BASE_DIR / ".env")
 HISTORY_LIMIT = 200
 PARKING_FEE_VND = 2000  # 2.000 VNĐ / lượt giữ xe
 VN_TZ = timezone(timedelta(hours=7))
-SQLITE_DB_PATH = BASE_DIR / "data" / "parking_history.db"
-_SQLITE_LOCK = threading.RLock()
-_SQLITE_INITIALIZED = False
-_ACTIVE_BACKEND = "mysql"  # "mysql" hoặc "sqlite"
 
 
 def now_vn() -> datetime:
@@ -40,16 +34,6 @@ class DatabaseConfigurationError(RuntimeError):
 
 class DatabaseOperationError(RuntimeError):
     pass
-
-
-def _should_allow_sqlite_fallback() -> bool:
-    """Chỉ tự động chuyển sang SQLite khi chưa cấu hình MYSQL_HOST hoặc khi bật rõ cờ DB_FALLBACK_SQLITE=1."""
-    flag = os.getenv("DB_FALLBACK_SQLITE", "").strip().lower()
-    if flag in ("1", "true", "yes"):
-        return True
-    if flag in ("0", "false", "no"):
-        return False
-    return not bool(os.getenv("MYSQL_HOST", "").strip())
 
 
 def _connection_config():
@@ -84,70 +68,6 @@ def _connect_mysql():
         return mysql.connector.connect(**config)
     except MySQLError as error:
         raise DatabaseOperationError(str(error)) from error
-
-
-def _connect_sqlite():
-    SQLITE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(SQLITE_DB_PATH), timeout=15.0, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _ensure_sqlite_table(conn: sqlite3.Connection, force: bool = False) -> None:
-    global _SQLITE_INITIALIZED
-    if _SQLITE_INITIALIZED and not force:
-        return
-    with _SQLITE_LOCK:
-        if _SQLITE_INITIALIZED and not force:
-            return
-        cur = conn.cursor()
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS plate_recognition_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                plate_number TEXT NOT NULL,
-                direction TEXT NOT NULL DEFAULT 'IN',
-                parking_status TEXT NOT NULL DEFAULT 'IN_PARKING',
-                entry_record_id INTEGER NULL,
-                fee_amount INTEGER NOT NULL DEFAULT {PARKING_FEE_VND},
-                recognized_at TEXT NOT NULL,
-                vote_count INTEGER NOT NULL,
-                sample_count INTEGER NOT NULL,
-                consensus_rate REAL NOT NULL,
-                face_detected INTEGER NOT NULL DEFAULT 0,
-                face_confidence REAL NULL,
-                face_embedding BLOB NULL,
-                face_match_score REAL NULL,
-                plate_image TEXT NULL,
-                face_image TEXT NULL,
-                camera_index INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-            )
-            """
-        )
-        cur.execute("PRAGMA table_info(plate_recognition_history)")
-        sqlite_cols = {row[1] for row in cur.fetchall()}
-        if "plate_image" not in sqlite_cols:
-            cur.execute("ALTER TABLE plate_recognition_history ADD COLUMN plate_image TEXT NULL")
-        if "face_image" not in sqlite_cols:
-            cur.execute("ALTER TABLE plate_recognition_history ADD COLUMN face_image TEXT NULL")
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sqlite_plate_rec ON plate_recognition_history (plate_number, recognized_at)"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sqlite_rec_at ON plate_recognition_history (recognized_at)"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sqlite_plate_status ON plate_recognition_history (plate_number, parking_status)"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sqlite_status_dir ON plate_recognition_history (parking_status, direction)"
-        )
-        cur.execute(
-            "UPDATE plate_recognition_history SET fee_amount = 0 WHERE direction = 'OUT' AND fee_amount <> 0"
-        )
-        conn.commit()
-        _SQLITE_INITIALIZED = True
 
 
 def _ensure_mysql_table(cursor):
@@ -371,11 +291,11 @@ def _build_demo_records_list() -> list[dict]:
 
 
 def _demo_seeding_enabled() -> bool:
-    """Mặc định chỉ tự nạp dữ liệu demo khi dùng SQLite dự phòng trên Cloud; có thể ép bằng SEED_DEMO_DATA."""
+    """Chỉ tự nạp dữ liệu demo khi bật cờ SEED_DEMO_DATA=1."""
     flag = os.getenv("SEED_DEMO_DATA")
     if flag is not None:
         return flag.strip().lower() in ("1", "true", "yes")
-    return bool(os.getenv("SPACE_ID")) and _ACTIVE_BACKEND == "sqlite"
+    return False
 
 
 def seed_demo_records_if_empty() -> int:
@@ -385,27 +305,6 @@ def seed_demo_records_if_empty() -> int:
 
     marker_plate = "59S2-482.19"
     try:
-        if _ACTIVE_BACKEND == "sqlite":
-            with _SQLITE_LOCK:
-                conn = _connect_sqlite()
-                try:
-                    _ensure_sqlite_table(conn)
-                    cur = conn.cursor()
-                    cur.execute(
-                        "SELECT COUNT(*) FROM plate_recognition_history WHERE plate_number = ?",
-                        (marker_plate,),
-                    )
-                    count = int(cur.fetchone()[0])
-                finally:
-                    conn.close()
-            if count > 0:
-                return 0
-            demo_list = _build_demo_records_list()
-            for rec in demo_list:
-                insert_plate_record(rec)
-            print(f"[DB] Đã tự động nạp {len(demo_list)} bản ghi mẫu (SQLite) phục vụ Demo!")
-            return len(demo_list)
-
         connection = _connect_mysql()
         cursor = connection.cursor()
         try:
@@ -430,41 +329,22 @@ def seed_demo_records_if_empty() -> int:
 
 
 def initialize_database() -> None:
-    """Kết nối thử MySQL; nếu chạy trên Cloud chưa có MySQL thì tự động khởi tạo SQLite."""
-    global _ACTIVE_BACKEND
+    """Kết nối và khởi tạo bảng trên MySQL."""
+    connection = _connect_mysql()
+    cursor = connection.cursor(dictionary=True)
     try:
-        connection = _connect_mysql()
-        cursor = connection.cursor(dictionary=True)
-        try:
-            _ensure_mysql_table(cursor)
-            connection.commit()
-            _ACTIVE_BACKEND = "mysql"
-            print(
-                f"[DB] Đã kết nối MySQL thành công: "
-                f"{os.getenv('MYSQL_HOST')}:{os.getenv('MYSQL_PORT', '3306')}/{os.getenv('MYSQL_DATABASE')}"
-            )
-        except MySQLError as error:
-            raise DatabaseOperationError(str(error)) from error
-        finally:
-            cursor.close()
-            connection.close()
-        seed_demo_records_if_empty()
-        return
-    except (DatabaseConfigurationError, DatabaseOperationError) as error:
-        if not _should_allow_sqlite_fallback():
-            raise
-        print(f"[WARN] Không kết nối được MySQL ({error}), chuyển sang SQLite dự phòng.")
-        conn = None
-        try:
-            conn = _connect_sqlite()
-            _ensure_sqlite_table(conn, force=True)
-            _ACTIVE_BACKEND = "sqlite"
-        except sqlite3.Error as sq_err:
-            raise DatabaseOperationError(str(sq_err)) from sq_err
-        finally:
-            if conn is not None:
-                conn.close()
-        seed_demo_records_if_empty()
+        _ensure_mysql_table(cursor)
+        connection.commit()
+        print(
+            f"[DB] Đã kết nối MySQL thành công: "
+            f"{os.getenv('MYSQL_HOST')}:{os.getenv('MYSQL_PORT', '3306')}/{os.getenv('MYSQL_DATABASE')}"
+        )
+    except MySQLError as error:
+        raise DatabaseOperationError(str(error)) from error
+    finally:
+        cursor.close()
+        connection.close()
+    seed_demo_records_if_empty()
 
 
 # ----------------------------------------------------------------------------
@@ -555,48 +435,11 @@ def _normalize_search(text: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Truy vấn & Đối chiếu phiên gửi xe (Hỗ trợ cả MySQL & SQLite)
+# Truy vấn & Đối chiếu phiên gửi xe (MySQL)
 # ----------------------------------------------------------------------------
 def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
     """Tìm phiên gửi xe đang ở trong bãi (IN_PARKING) gần nhất của biển số này."""
     norm_plate = _normalize_search(plate_number)
-    if _ACTIVE_BACKEND == "sqlite" and cursor is None:
-        with _SQLITE_LOCK:
-            conn = None
-            try:
-                conn = _connect_sqlite()
-                _ensure_sqlite_table(conn)
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT id, plate_number, recognized_at, face_embedding
-                    FROM plate_recognition_history
-                    WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
-                      AND direction = 'IN'
-                      AND parking_status = 'IN_PARKING'
-                    ORDER BY recognized_at DESC, id DESC
-                    LIMIT 1
-                    """,
-                    (norm_plate,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return None
-                raw_emb = row["face_embedding"]
-                return {
-                    "id": int(row["id"]),
-                    "plate_number": row["plate_number"],
-                    "recognized_at": format_recognition_time(row["recognized_at"]),
-                    "embedding": embedding_from_bytes(
-                        bytes(raw_emb) if raw_emb is not None else None
-                    ),
-                }
-            except sqlite3.Error as error:
-                raise DatabaseOperationError(str(error)) from error
-            finally:
-                if conn is not None:
-                    conn.close()
-
     own_conn = cursor is None
     connection = None
     if own_conn:
@@ -647,27 +490,6 @@ def _find_last_embedding_mysql(cursor, plate_number: str) -> tuple[int | None, l
     if active:
         return active["id"], active.get("embedding")
     return None, None
-
-
-def _find_last_embedding_sqlite(cur: sqlite3.Cursor, plate_number: str) -> tuple[int | None, list[float] | None]:
-    norm_plate = _normalize_search(plate_number)
-    cur.execute(
-        """
-        SELECT id, face_embedding
-        FROM plate_recognition_history
-        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
-          AND direction = 'IN'
-          AND parking_status = 'IN_PARKING'
-        ORDER BY recognized_at DESC, id DESC
-        LIMIT 1
-        """,
-        (norm_plate,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return None, None
-    raw_emb = row["face_embedding"]
-    return int(row["id"]), embedding_from_bytes(bytes(raw_emb) if raw_emb is not None else None)
 
 
 def verify_checkout_face(
@@ -823,227 +645,10 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
     }
 
 
-def _fetch_revenue_report_sqlite(cur: sqlite3.Cursor) -> dict:
-    """Tính doanh thu giữ xe (2.000 đ / lượt gửi vào) theo Ngày, Tháng, Năm trên SQLite."""
-    now = now_vn()
-    today_prefix = now.strftime("%Y-%m-%d")
-    month_prefix = now.strftime("%Y-%m")
-    year_prefix = now.strftime("%Y")
-
-    cur.execute(
-        """
-        SELECT
-            COALESCE(SUM(CASE WHEN substr(recognized_at, 1, 10) = ? AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_today,
-            COALESCE(SUM(CASE WHEN substr(recognized_at, 1, 10) = ? THEN fee_amount ELSE 0 END), 0) AS revenue_today,
-            COALESCE(SUM(CASE WHEN substr(recognized_at, 1, 7) = ? AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_month,
-            COALESCE(SUM(CASE WHEN substr(recognized_at, 1, 7) = ? THEN fee_amount ELSE 0 END), 0) AS revenue_month,
-            COALESCE(SUM(CASE WHEN substr(recognized_at, 1, 4) = ? AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_year,
-            COALESCE(SUM(CASE WHEN substr(recognized_at, 1, 4) = ? THEN fee_amount ELSE 0 END), 0) AS revenue_year,
-            COALESCE(SUM(CASE WHEN direction = 'IN' THEN 1 ELSE 0 END), 0) AS tickets_total,
-            COALESCE(SUM(fee_amount), 0) AS revenue_total
-        FROM plate_recognition_history
-        """,
-        (today_prefix, today_prefix, month_prefix, month_prefix, year_prefix, year_prefix),
-    )
-    summary = cur.fetchone()
-
-    cur.execute(
-        """
-        SELECT
-            strftime('%d/%m/%Y', recognized_at) AS period_label,
-            substr(recognized_at, 1, 10) AS sort_date,
-            COUNT(*) AS ticket_count,
-            COALESCE(SUM(fee_amount), 0) AS total_vnd
-        FROM plate_recognition_history
-        WHERE direction = 'IN'
-        GROUP BY sort_date
-        ORDER BY sort_date DESC
-        LIMIT 14
-        """
-    )
-    daily_rows = [
-        {
-            "period": row["period_label"] or row["sort_date"],
-            "tickets": int(row["ticket_count"] or 0),
-            "unit_price": PARKING_FEE_VND,
-            "revenue": int(row["total_vnd"] or 0),
-        }
-        for row in cur.fetchall()
-    ]
-
-    cur.execute(
-        """
-        SELECT
-            strftime('%m/%Y', recognized_at) AS period_label,
-            substr(recognized_at, 1, 7) AS sort_month,
-            COUNT(*) AS ticket_count,
-            COALESCE(SUM(fee_amount), 0) AS total_vnd
-        FROM plate_recognition_history
-        WHERE direction = 'IN'
-        GROUP BY sort_month
-        ORDER BY sort_month DESC
-        LIMIT 12
-        """
-    )
-    monthly_rows = [
-        {
-            "period": f"Tháng {row['period_label'] or row['sort_month']}",
-            "tickets": int(row["ticket_count"] or 0),
-            "unit_price": PARKING_FEE_VND,
-            "revenue": int(row["total_vnd"] or 0),
-        }
-        for row in cur.fetchall()
-    ]
-
-    cur.execute(
-        """
-        SELECT
-            substr(recognized_at, 1, 4) AS period_label,
-            COUNT(*) AS ticket_count,
-            COALESCE(SUM(fee_amount), 0) AS total_vnd
-        FROM plate_recognition_history
-        WHERE direction = 'IN'
-        GROUP BY period_label
-        ORDER BY period_label DESC
-        LIMIT 10
-        """
-    )
-    yearly_rows = [
-        {
-            "period": f"Năm {row['period_label']}",
-            "tickets": int(row["ticket_count"] or 0),
-            "unit_price": PARKING_FEE_VND,
-            "revenue": int(row["total_vnd"] or 0),
-        }
-        for row in cur.fetchall()
-    ]
-
-    return {
-        "unit_price": PARKING_FEE_VND,
-        "today": {
-            "tickets": int(summary["tickets_today"] or 0) if summary else 0,
-            "revenue": int(summary["revenue_today"] or 0) if summary else 0,
-        },
-        "month": {
-            "tickets": int(summary["tickets_month"] or 0) if summary else 0,
-            "revenue": int(summary["revenue_month"] or 0) if summary else 0,
-        },
-        "year": {
-            "tickets": int(summary["tickets_year"] or 0) if summary else 0,
-            "revenue": int(summary["revenue_year"] or 0) if summary else 0,
-        },
-        "total": {
-            "tickets": int(summary["tickets_total"] or 0) if summary else 0,
-            "revenue": int(summary["revenue_total"] or 0) if summary else 0,
-        },
-        "daily": daily_rows,
-        "monthly": monthly_rows,
-        "yearly": yearly_rows,
-    }
-
-
 def fetch_overview(
     query: str = "", status_filter: str = "all", limit: int = HISTORY_LIMIT
 ):
     """Thống kê toàn bộ bảng + báo cáo doanh thu Ngày/Tháng/Năm + danh sách bản ghi."""
-    if _ACTIVE_BACKEND == "sqlite":
-        with _SQLITE_LOCK:
-            conn = None
-            try:
-                conn = _connect_sqlite()
-                _ensure_sqlite_table(conn)
-                cur = conn.cursor()
-                today_prefix = now_vn().strftime("%Y-%m-%d")
-                cur.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS total,
-                        COALESCE(SUM(CASE WHEN substr(recognized_at, 1, 10) = ? THEN 1 ELSE 0 END), 0) AS today,
-                        COALESCE(SUM(CASE WHEN direction = 'IN' AND parking_status = 'IN_PARKING' THEN 1 ELSE 0 END), 0) AS in_parking,
-                        COALESCE(SUM(CASE WHEN direction = 'IN' THEN 1 ELSE 0 END), 0) AS total_in,
-                        COALESCE(SUM(CASE WHEN direction = 'OUT' THEN 1 ELSE 0 END), 0) AS total_out,
-                        COALESCE(SUM(CASE WHEN face_detected = 1 THEN 1 ELSE 0 END), 0) AS with_face
-                    FROM plate_recognition_history
-                    """,
-                    (today_prefix,),
-                )
-                stats_row = cur.fetchone()
-                total = int(stats_row["total"] or 0) if stats_row else 0
-                with_face = int(stats_row["with_face"] or 0) if stats_row else 0
-                in_parking = int(stats_row["in_parking"] or 0) if stats_row else 0
-                total_in = int(stats_row["total_in"] or 0) if stats_row else 0
-                total_out = int(stats_row["total_out"] or 0) if stats_row else 0
-                today_cnt = int(stats_row["today"] or 0) if stats_row else 0
-
-                revenue_report = _fetch_revenue_report_sqlite(cur)
-
-                conditions = []
-                params: list = []
-                normalized_query = _normalize_search(query)
-                if normalized_query:
-                    conditions.append(
-                        "REPLACE(REPLACE(plate_number, '-', ''), '.', '') LIKE ?"
-                    )
-                    params.append(f"%{normalized_query}%")
-
-                if status_filter == "in_parking":
-                    conditions.append("direction = 'IN' AND parking_status = 'IN_PARKING'")
-                elif status_filter == "direction_in":
-                    conditions.append("direction = 'IN'")
-                elif status_filter == "direction_out":
-                    conditions.append("direction = 'OUT'")
-                elif status_filter == "with_face":
-                    conditions.append("face_detected = 1")
-                elif status_filter == "no_face":
-                    conditions.append("face_detected = 0")
-
-                where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-                cur.execute(
-                    f"SELECT COUNT(*) AS matched FROM plate_recognition_history {where_sql}",
-                    params,
-                )
-                matched_row = cur.fetchone()
-                matched = int(matched_row["matched"] or 0) if matched_row else 0
-
-                cur.execute(
-                    f"""
-                    SELECT id, plate_number, direction, parking_status, entry_record_id,
-                           fee_amount, recognized_at, vote_count, sample_count,
-                           consensus_rate, face_detected, face_confidence,
-                           (face_embedding IS NOT NULL) AS face_embedding, face_match_score,
-                           plate_image, face_image, camera_index
-                    FROM plate_recognition_history
-                    {where_sql}
-                    ORDER BY recognized_at DESC, id DESC
-                    LIMIT ?
-                    """,
-                    [*params, int(limit)],
-                )
-                records = [
-                    format_record_row(dict(row)["id"], dict(row))
-                    for row in cur.fetchall()
-                ]
-                return {
-                    "stats": {
-                        "total_records": total,
-                        "today_records": today_cnt,
-                        "in_parking": in_parking,
-                        "total_in": total_in,
-                        "total_out": total_out,
-                        "with_face": with_face,
-                        "no_face": total - with_face,
-                        "face_rate": round(with_face / total * 100) if total else 0,
-                    },
-                    "revenue": revenue_report,
-                    "matched": matched,
-                    "records": records,
-                }
-            except sqlite3.Error as error:
-                raise DatabaseOperationError(str(error)) from error
-            finally:
-                if conn is not None:
-                    conn.close()
-
     connection = _connect_mysql()
     cursor = connection.cursor(dictionary=True)
     try:
@@ -1137,90 +742,7 @@ def fetch_overview(
 
 
 def insert_plate_record(record: dict, connection=None) -> tuple[int, float | None]:
-    """Lưu một lượt nhận diện (VÀO hoặc RA)."""
-    if _ACTIVE_BACKEND == "sqlite" and connection is None:
-        with _SQLITE_LOCK:
-            conn = None
-            try:
-                conn = _connect_sqlite()
-                _ensure_sqlite_table(conn)
-                cur = conn.cursor()
-                direction = str(record.get("direction") or "IN").upper()
-                embedding = record.get("face_embedding")
-                match_score = record.get("face_match_score")
-                entry_id = record.get("entry_record_id")
-
-                if direction == "OUT":
-                    parking_status = "EXITED"
-                    fee_amount = 0
-                    if embedding and match_score is None:
-                        found_id, previous_emb = _find_last_embedding_sqlite(
-                            cur, record["plate_number"]
-                        )
-                        if entry_id is None:
-                            entry_id = found_id
-                        if previous_emb is not None:
-                            match_score = max(
-                                -1.0, min(1.0, cosine_similarity(embedding, previous_emb))
-                            )
-                else:
-                    direction = "IN"
-                    parking_status = "IN_PARKING"
-                    fee_amount = int(record.get("fee_amount", PARKING_FEE_VND))
-
-                cur.execute(
-                    """
-                    UPDATE plate_recognition_history
-                    SET parking_status = 'COMPLETED'
-                    WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = ?
-                      AND direction = 'IN'
-                      AND parking_status = 'IN_PARKING'
-                    """,
-                    (_normalize_search(record["plate_number"]),),
-                )
-
-                cur.execute(
-                    """
-                    INSERT INTO plate_recognition_history (
-                        plate_number, direction, parking_status, entry_record_id,
-                        fee_amount, recognized_at, vote_count, sample_count,
-                        consensus_rate, face_detected, face_confidence,
-                        face_embedding, face_match_score, plate_image, face_image, camera_index
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        record["plate_number"],
-                        direction,
-                        parking_status,
-                        entry_id,
-                        fee_amount,
-                        format_recognition_time(record["recognized_at"]),
-                        record["vote_count"],
-                        record["sample_count"],
-                        record["consensus_rate"],
-                        1 if record.get("face_detected") else 0,
-                        record.get("face_confidence"),
-                        embedding_to_bytes(embedding) if embedding else None,
-                        match_score,
-                        record.get("plate_image"),
-                        record.get("face_image"),
-                        record["camera_index"],
-                    ),
-                )
-                conn.commit()
-                return int(cur.lastrowid), match_score
-            except sqlite3.Error as error:
-                if conn is not None:
-                    try:
-                        conn.rollback()
-                    except sqlite3.Error:
-                        pass
-                raise DatabaseOperationError(str(error)) from error
-            finally:
-                if conn is not None:
-                    conn.close()
-
+    """Lưu một lượt nhận diện (VÀO hoặc RA) trực tiếp vào MySQL."""
     own_connection = connection is None
     if own_connection:
         connection = _connect_mysql()
@@ -1298,27 +820,3 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
         cursor.close()
         if own_connection:
             connection.close()
-
-
-def flush_pending_plate_records(pending_records: list[dict]) -> int:
-    """Ghi lần lượt các bản ghi chờ qua một kết nối."""
-    if _ACTIVE_BACKEND == "sqlite":
-        flushed = 0
-        while pending_records:
-            insert_plate_record(pending_records[0])
-            pending_records.pop(0)
-            flushed += 1
-        return flushed
-
-    connection = _connect_mysql()
-    flushed = 0
-    try:
-        while pending_records:
-            insert_plate_record(pending_records[0], connection=connection)
-            pending_records.pop(0)
-            flushed += 1
-        return flushed
-    except MySQLError as error:
-        raise DatabaseOperationError(str(error)) from error
-    finally:
-        connection.close()

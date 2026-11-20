@@ -678,7 +678,7 @@ th.n,
 /* ==================== SCREEN 2: MANAGEMENT KPIs ==================== */
 .kpis {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--gap);
   margin-bottom: var(--gap);
 }
@@ -700,10 +700,6 @@ th.n,
 
 .kpi.accent-blue {
   border-top: 2px solid var(--info);
-}
-
-.kpi.accent-neutral {
-  border-top: 2px solid #596375;
 }
 
 .kpi-top {
@@ -1069,10 +1065,6 @@ td.n {
 .camera-panel .notice-banner {
   margin-top: 12px;
   margin-bottom: 0;
-}
-
-.pending-card {
-  margin-bottom: var(--gap);
 }
 
 /* ==================== SNAPSHOT THUMBNAILS & MODAL ==================== */

@@ -1,5 +1,4 @@
 import base64
-import json
 import math
 import os
 import queue
@@ -9,7 +8,6 @@ import threading
 import time
 from collections import Counter, deque
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -28,7 +26,6 @@ from database import (
     DatabaseOperationError,
     fetch_overview,
     find_active_parking_session,
-    flush_pending_plate_records,
     format_record_row,
     initialize_database,
     insert_plate_record,
@@ -47,7 +44,6 @@ BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 PLATE_MODEL_PATH = BASE_DIR / "weights" / "plate_best.pt"
 CHAR_MODEL_PATH = BASE_DIR / "weights" / "chars_best.pt"
-PENDING_FILE = BASE_DIR / "data" / "pending_records.json"
 
 CONF_PLATE = 0.40
 CONF_CHAR = 0.35
@@ -562,7 +558,6 @@ class SystemState:
 
         self.database_ready = False
         self.database_error: str | None = None
-        self.pending_records: list[dict] = []
         self.records_version = 0
         self.overview_cache: dict[tuple, dict] = {}
         self.overview_cache_date: str = ""
@@ -640,44 +635,6 @@ class SystemState:
         self.plates_must_leave.add(plate_key)
         self.plate_last_seen_global[plate_key] = now
 
-    # ---------------------------------------------------------- hàng chờ (file)
-    def load_pending_from_disk(self) -> None:
-        if not PENDING_FILE.is_file():
-            return
-        try:
-            items = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
-            for item in items:
-                item["recognized_at"] = datetime.fromisoformat(item["recognized_at"])
-            with self.db_write_lock:
-                self.pending_records = items
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            print(f"[WARN] Không đọc được {PENDING_FILE}: {error}")
-
-    def _persist_pending(self) -> None:
-        try:
-            if not self.pending_records:
-                PENDING_FILE.unlink(missing_ok=True)
-                return
-            PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
-            payload = [
-                {
-                    **{k: v for k, v in rec.items() if k != "_seq"},
-                    "recognized_at": rec["recognized_at"].isoformat(),
-                }
-                for rec in self.pending_records
-            ]
-            tmp = PENDING_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(PENDING_FILE)
-        except OSError as error:
-            print(f"[WARN] Không ghi được {PENDING_FILE}: {error}")
-
-    def get_pending_snapshot(self) -> list[dict]:
-        return list(self.pending_records)
-
-    def get_pending_count(self) -> int:
-        return len(self.pending_records)
-
     # -------------------------------------------------------------- database
     def _set_db_status(self, ready: bool, error: str | None) -> None:
         with self.lock:
@@ -706,7 +663,7 @@ class SystemState:
                 self.overview_cache[key] = overview
         return overview
 
-    def connect_database(self) -> int:
+    def connect_database(self) -> None:
         try:
             initialize_database()
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
@@ -714,62 +671,27 @@ class SystemState:
             raise
         self._set_db_status(True, None)
         self._bump_version()
-        return self.flush_pending()
-
-    def flush_pending(self) -> int:
-        with self.db_write_lock:
-            if not self.pending_records:
-                return 0
-            before = len(self.pending_records)
-            try:
-                flush_pending_plate_records(self.pending_records)
-                self._set_db_status(True, None)
-            except (DatabaseConfigurationError, DatabaseOperationError) as error:
-                self._set_db_status(False, str(error))
-                raise
-            finally:
-                flushed = before - len(self.pending_records)
-                self._persist_pending()
-                if flushed:
-                    self._bump_version()
-            return flushed
 
     def _store_record(self, record: dict) -> None:
         inserted_to_db = False
         with self.db_write_lock:
-            with self.lock:
-                ready = self.database_ready
-            if ready:
-                try:
-                    _, match_score = insert_plate_record(record)
-                    with self.lock:
-                        if (
-                            self.last_confirmed
-                            and self.last_confirmed.get("seq") == record.get("_seq")
-                        ):
-                            preview = format_record_row(
-                                "Mới",
-                                {**record, "face_match_score": match_score},
-                            )
-                            self.last_confirmed["match_status"] = preview["Đối chiếu"]
-                    inserted_to_db = True
-                except (DatabaseConfigurationError, DatabaseOperationError) as error:
-                    self._set_db_status(False, str(error))
-
-            if not inserted_to_db:
-                if str(record.get("direction", "IN")).upper() == "OUT":
-                    rec_key = _clean_plate_key(record.get("plate_number"))
-                    for pending_rec in self.pending_records:
-                        if (
-                            _clean_plate_key(pending_rec.get("plate_number")) == rec_key
-                            and pending_rec.get("direction") == "IN"
-                            and pending_rec.get("parking_status") == "IN_PARKING"
-                        ):
-                            pending_rec["parking_status"] = "COMPLETED"
-
-                self.pending_records.append(record)
-                self._persist_pending()
-                self._bump_version()
+            try:
+                _, match_score = insert_plate_record(record)
+                self._set_db_status(True, None)
+                with self.lock:
+                    if (
+                        self.last_confirmed
+                        and self.last_confirmed.get("seq") == record.get("_seq")
+                    ):
+                        preview = format_record_row(
+                            "Mới",
+                            {**record, "face_match_score": match_score},
+                        )
+                        self.last_confirmed["match_status"] = preview["Đối chiếu"]
+                inserted_to_db = True
+            except (DatabaseConfigurationError, DatabaseOperationError) as error:
+                self._set_db_status(False, str(error))
+                print(f"[WARN] Không thể ghi bản ghi vào MySQL: {error}")
 
         if inserted_to_db:
             self._bump_version()
@@ -800,8 +722,8 @@ class SystemState:
             if not ready and now - last_retry >= DB_RETRY_SECONDS:
                 last_retry = now
                 try:
-                    flushed = self.connect_database()
-                    print(f"[DB] Đã kết nối lại MySQL, đồng bộ {flushed} bản ghi chờ.")
+                    self.connect_database()
+                    print("[DB] Đã kết nối lại MySQL thành công.")
                 except (DatabaseConfigurationError, DatabaseOperationError):
                     pass
 
@@ -1583,10 +1505,7 @@ class SystemState:
     def _get_active_parking_session(
         self, plate_number: str
     ) -> tuple[dict | None, bool]:
-        """Trả về (active_session, db_ok). Nếu lỗi kết nối DB mà không có bản ghi pending thì db_ok = False."""
-        pending_sess = self._find_pending_active_session(plate_number)
-        if pending_sess is not None:
-            return pending_sess, True
+        """Trả về (active_session, db_ok). Nếu lỗi kết nối MySQL thì db_ok = False."""
         with self.lock:
             db_ready = self.database_ready
         if not db_ready:
@@ -1596,21 +1515,6 @@ class SystemState:
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
             self._set_db_status(False, str(error))
             return None, False
-
-    def _find_pending_active_session(self, plate_number: str) -> dict | None:
-        target_key = _clean_plate_key(plate_number)
-        for rec in reversed(list(self.pending_records)):
-            if (
-                _clean_plate_key(rec.get("plate_number")) == target_key
-                and rec.get("direction") == "IN"
-                and rec.get("parking_status") == "IN_PARKING"
-            ):
-                return {
-                    "id": None,
-                    "recognized_at": str(rec.get("recognized_at")),
-                    "embedding": rec.get("face_embedding"),
-                }
-        return None
 
     def _commit_latched_pair(self, record: dict, best_face) -> None:
         """Trích xuất vector 512 chiều của Khuôn mặt chuẩn nhất từ Camera đối diện và:
@@ -1696,22 +1600,6 @@ class SystemState:
                     except (DatabaseConfigurationError, DatabaseOperationError) as error:
                         self._set_db_status(False, str(error))
 
-            if check is None or not check.get("has_active_session"):
-                pending_sess = self._find_pending_active_session(plate)
-                if pending_sess is not None:
-                    prev_emb = pending_sess.get("embedding")
-                    if embedding and prev_emb:
-                        score = max(
-                            -1.0, min(1.0, cosine_similarity(embedding, prev_emb))
-                        )
-                        check = {
-                            "has_active_session": True,
-                            "entry_id": None,
-                            "entry_time": pending_sess["recognized_at"],
-                            "match_score": score,
-                            "matched": score >= FACE_MATCH_THRESHOLD,
-                        }
-
             if check and check.get("has_active_session"):
                 record["entry_record_id"] = check.get("entry_id")
                 record["face_match_score"] = check.get("match_score")
@@ -1785,22 +1673,18 @@ class SystemState:
 
     def _background_startup(self) -> None:
         try:
-            flushed = self.connect_database()
-            if flushed:
-                print(f"[DB] Đã đồng bộ {flushed} bản ghi chờ từ lần chạy trước.")
+            self.connect_database()
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
-            print(f"[WARN] Chưa kết nối được MySQL, bản ghi sẽ được lưu tạm: {error}")
+            print(f"[WARN] Chưa kết nối được MySQL: {error}")
         self.start_db_writer()
         self.load_ai_models()
 
     def startup(self) -> None:
-        self.load_pending_from_disk()
         # Khởi tạo kết nối MySQL Aiven + tải mô hình AI trong luồng nền để cổng HTTP mở tức thì
         threading.Thread(target=self._background_startup, daemon=True).start()
 
     def get_status_payload(self) -> dict:
         now = time.monotonic()
-        pending_count = len(self.pending_records)
         with self.lock:
             cam1_status = _serialize_cam_unit(self.cams[1])
             cam2_status = _serialize_cam_unit(self.cams[2])
@@ -1859,7 +1743,6 @@ class SystemState:
                 "last_confirmed": self.last_confirmed,
                 "records_version": self.records_version,
                 "database_ready": self.database_ready,
-                "pending_count": pending_count,
                 "face_matching": bool(self.face_service and self.face_service.can_embed),
             }
 
@@ -2075,10 +1958,6 @@ def get_management_overview(
     q: str = "", status: str = "all", limit: int = HISTORY_LIMIT
 ):
     limit = max(1, min(limit, 1000))
-    pending_snapshot = state.get_pending_snapshot()
-    pending_rows = [
-        format_record_row("Chờ lưu", rec) for rec in reversed(pending_snapshot)
-    ]
 
     with state.lock:
         ready = state.database_ready
@@ -2098,7 +1977,6 @@ def get_management_overview(
             "revenue": overview["revenue"] if overview else None,
             "matched": overview["matched"] if overview else 0,
             "records": overview["records"] if overview else [],
-            "pending_records": pending_rows,
             "records_version": state.records_version,
         }
 
@@ -2106,17 +1984,8 @@ def get_management_overview(
 @app.post("/api/management/reconnect")
 def api_reconnect_database():
     try:
-        flushed = state.connect_database()
-        return {"status": "ok", "flushed": flushed}
-    except (DatabaseConfigurationError, DatabaseOperationError) as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-
-
-@app.post("/api/management/flush-pending")
-def api_flush_pending():
-    try:
-        flushed = state.flush_pending()
-        return {"status": "flushed" if flushed else "empty", "flushed": flushed}
+        state.connect_database()
+        return {"status": "ok"}
     except (DatabaseConfigurationError, DatabaseOperationError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 

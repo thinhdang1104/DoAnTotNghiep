@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=20261118a" />
+  <link rel="stylesheet" href="styles.css?v=20261120a" />
 </head>
 <body>
   <div class="app-shell">
@@ -54,7 +54,6 @@
               <rect x="3" y="14" width="7" height="7" rx="1" />
             </svg>
             <span>Lịch sử &amp; quản lý</span>
-            <span id="nav-pending-badge" class="nav-count hidden">0</span>
           </button>
           <button
             id="nav-revenue"
@@ -289,42 +288,6 @@
             </div>
             <div class="kpi-value mono-num num" id="stat-total-records">0</div>
           </div>
-
-          <div class="kpi accent-neutral">
-            <div class="kpi-top">
-              <div class="kpi-label">Chờ đồng bộ</div>
-              <span class="kpi-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                  <path d="M3 3v5h5" />
-                  <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-                  <path d="M16 16h5v5" />
-                </svg>
-              </span>
-            </div>
-            <div class="kpi-value mono-num num" id="stat-pending-records">0</div>
-          </div>
-        </div>
-
-        <!-- PENDING RECORDS QUEUE (SHOWN WHEN > 0) -->
-        <div id="pending-section" class="panel pending-card hidden">
-          <header class="panel-header">
-            <h2>Bản ghi chờ lưu MySQL</h2>
-            <button id="btn-flush-pending" class="btn primary" type="button">Đồng bộ ngay</button>
-          </header>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Biển số xe</th>
-                  <th>Ảnh cắt (Biển &amp; Mặt)</th>
-                  <th>Luồng</th>
-                  <th class="n">Thời gian</th>
-                </tr>
-              </thead>
-              <tbody id="pending-table-body"></tbody>
-            </table>
-          </div>
         </div>
 
         <!-- RECOGNITION LEDGER -->
@@ -517,6 +480,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261118a"></script>
+  <script src="app.js?v=20261120a"></script>
 </body>
 </html>
