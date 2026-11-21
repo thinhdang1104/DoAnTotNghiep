@@ -8,6 +8,7 @@
   --raised: #161a22;
   --elevated: #22262e;
   --border: #242a36;
+  --border-strong: #384152;
   --rule: #1a1f28;
   --control: #313949;
 
@@ -332,24 +333,6 @@ th.n,
   font-weight: 600;
 }
 
-.port-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: var(--ground);
-  border: 1px solid var(--border);
-  border-radius: var(--r-ctl);
-  padding: 2px 8px;
-}
-
-.port-divider {
-  display: inline-flex;
-  width: 1px;
-  height: 20px;
-  background: var(--border);
-}
-
-.port-field,
 .device-field {
   display: inline-flex;
   align-items: center;
@@ -377,24 +360,6 @@ th.n,
 .device-select:disabled {
   opacity: 0.6;
   cursor: not-allowed;
-}
-
-.port-input {
-  width: 46px;
-  height: 28px;
-  padding: 0 4px;
-  text-align: center;
-  font-weight: 600;
-  background: var(--surface);
-  border-color: var(--border);
-  -moz-appearance: textfield;
-  appearance: textfield;
-}
-
-.port-input::-webkit-outer-spin-button,
-.port-input::-webkit-inner-spin-button {
-  -webkit-appearance: none;
-  margin: 0;
 }
 
 .camera-controls {

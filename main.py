@@ -25,6 +25,7 @@ from database import (
     DatabaseConfigurationError,
     DatabaseOperationError,
     fetch_overview,
+    fetch_parking_session_case,
     find_active_parking_session,
     format_record_row,
     initialize_database,
@@ -560,6 +561,7 @@ class SystemState:
         self.database_error: str | None = None
         self.records_version = 0
         self.overview_cache: dict[tuple, dict] = {}
+        self.overview_summary_cache: dict[tuple, dict] = {}
         self.overview_cache_date: str = ""
         self.write_queue: queue.Queue = queue.Queue()
         self.writer_stop = threading.Event()
@@ -645,21 +647,42 @@ class SystemState:
         with self.lock:
             self.records_version += 1
             self.overview_cache.clear()
+            self.overview_summary_cache.clear()
 
     def get_cached_overview(self, q: str, status: str, limit: int) -> dict | None:
         today_str = now_vn().strftime("%Y-%m-%d")
         with self.lock:
             if self.overview_cache_date != today_str:
                 self.overview_cache.clear()
+                self.overview_summary_cache.clear()
                 self.overview_cache_date = today_str
             ver = self.records_version
             key = (today_str, ver, q.strip(), status.strip(), limit)
             cached = self.overview_cache.get(key)
+            summary_key = (today_str, ver)
+            cached_summary = self.overview_summary_cache.get(summary_key)
         if cached is not None:
             return cached
-        overview = fetch_overview(q, status, limit)
+
+        need_summary = cached_summary is None
+        overview = fetch_overview(
+            q, status, limit, include_stats_and_revenue=need_summary
+        )
         with self.lock:
             if self.records_version == ver and self.overview_cache_date == today_str:
+                if need_summary and overview.get("stats") is not None:
+                    cached_summary = {
+                        "stats": overview["stats"],
+                        "revenue": overview["revenue"],
+                    }
+                    self.overview_summary_cache[summary_key] = cached_summary
+                elif cached_summary is not None:
+                    overview["stats"] = cached_summary["stats"]
+                    overview["revenue"] = cached_summary["revenue"]
+
+                if len(self.overview_cache) >= 16:
+                    oldest_key = next(iter(self.overview_cache))
+                    self.overview_cache.pop(oldest_key, None)
                 self.overview_cache[key] = overview
         return overview
 
@@ -672,11 +695,13 @@ class SystemState:
         self._set_db_status(True, None)
         self._bump_version()
 
-    def _store_record(self, record: dict) -> None:
+    def _store_record(self, record: dict) -> bool:
         inserted_to_db = False
         with self.db_write_lock:
             try:
                 _, match_score = insert_plate_record(record)
+                if match_score is not None:
+                    record["face_match_score"] = match_score
                 self._set_db_status(True, None)
                 with self.lock:
                     if (
@@ -695,6 +720,7 @@ class SystemState:
 
         if inserted_to_db:
             self._bump_version()
+        return inserted_to_db
 
     def _db_writer_loop(self) -> None:
         last_retry = time.monotonic()
@@ -748,23 +774,22 @@ class SystemState:
         if self.writer_stop.is_set():
             return {"status": "none", "message": ""}
         record_to_save = None
-        now = time.monotonic()
+        plate_key = ""
+        plate_number = ""
+        direction = "OUT"
         with self.lock:
             alert = self.security_alert
             if alert is None:
                 return {"status": "none", "message": ""}
-            self.security_alert = None
             plate_key = alert.get("plate_key", "")
             plate_number = alert["record"].get("plate_number", "")
             direction = alert["record"].get("direction", "OUT")
 
             if approve:
-                record_to_save = alert["record"]
-                msg = f"XE {plate_number} RA BÃI ĐƯỢC DUYỆT"
-                if plate_key:
-                    self._lock_plate_cooldown_locked(plate_key, direction, now)
-                self._set_feedback_locked("warn", msg)
+                record_to_save = dict(alert["record"])
+                self.security_alert = None
             else:
+                self.security_alert = None
                 # Khi TỪ CHỐI: xóa cooldown của biển số này để chủ xe thật có thể quét lại ngay
                 msg = f"XE {plate_number} RA BÃI BỊ TỪ CHỐI"
                 if plate_key:
@@ -772,8 +797,22 @@ class SystemState:
                 for cam in self.cams.values():
                     cam.observations.clear()
                 self._set_feedback_locked("error", msg)
+                return {"status": "rejected", "message": msg, "type": "error"}
 
         if record_to_save is not None:
+            saved = self._store_record(record_to_save)
+            now = time.monotonic()
+            if not saved:
+                err_msg = f"Chưa lưu được lượt xe {plate_number} vào CSDL, vui lòng quét lại"
+                with self.lock:
+                    if plate_key:
+                        self.recent_confirms.pop(f"{plate_key}:{direction}", None)
+                    for cam in self.cams.values():
+                        cam.observations.clear()
+                    self._set_feedback_locked("error", err_msg)
+                return {"status": "db_error", "message": err_msg, "type": "error"}
+
+            msg = f"XE {plate_number} RA BÃI ĐƯỢC DUYỆT"
             _save_snapshot_to_disk(
                 "plate",
                 record_to_save["plate_number"],
@@ -786,6 +825,9 @@ class SystemState:
             )
             preview = format_record_row("Mới", record_to_save)
             with self.lock:
+                if plate_key:
+                    self._lock_plate_cooldown_locked(plate_key, direction, now)
+                self._set_feedback_locked("warn", msg)
                 self.last_confirmed = {
                     "seq": record_to_save["_seq"],
                     "plate_number": record_to_save["plate_number"],
@@ -795,9 +837,8 @@ class SystemState:
                     "face_status": preview["Khuôn mặt"],
                     "match_status": preview["Đối chiếu"],
                 }
-            self.write_queue.put(record_to_save)
             return {"status": "approved", "message": msg, "type": "warn"}
-        return {"status": "rejected", "message": msg, "type": "error"}
+        return {"status": "none", "message": ""}
 
     # ------------------------------------------------- Camera độc lập (bật/tắt riêng)
     def _refresh_running_locked(self) -> None:
@@ -1625,41 +1666,46 @@ class SystemState:
                         }
                     return
 
-                with self.lock:
-                    if self.session_id != commit_session_id:
-                        return
-                    if plate_key:
-                        self._lock_plate_cooldown_locked(plate_key, "OUT", now)
-                    self._set_feedback_locked(
-                        "success",
-                        f"XE {plate} RA BÃI THÀNH CÔNG",
-                    )
+                feedback_type = "success"
+                feedback_msg = f"XE {plate} RA BÃI THÀNH CÔNG"
             else:
-                with self.lock:
-                    if self.session_id != commit_session_id:
-                        return
-                    if plate_key:
-                        self._lock_plate_cooldown_locked(plate_key, "OUT", now)
-                    self._set_feedback_locked(
-                        "warn",
-                        f"XE {plate} RA BÃI (CHƯA CÓ LƯỢT VÀO)",
-                    )
+                feedback_type = "warn"
+                feedback_msg = f"XE {plate} RA BÃI (CHƯA CÓ LƯỢT VÀO)"
         else:
+            feedback_type = "success"
+            feedback_msg = f"XE {plate} VÀO BÃI THÀNH CÔNG"
+
+        with self.lock:
+            if self.session_id != commit_session_id:
+                return
+
+        saved = self._store_record(record)
+        now = time.monotonic()
+        if not saved:
             with self.lock:
                 if self.session_id != commit_session_id:
                     return
                 if plate_key:
-                    self._lock_plate_cooldown_locked(plate_key, "IN", now)
+                    self.recent_confirms.pop(f"{plate_key}:{direction}", None)
+                    self.plates_must_leave.discard(plate_key)
+                for cam in self.cams.values():
+                    cam.observations.clear()
                 self._set_feedback_locked(
-                    "success",
-                    f"XE {plate} VÀO BÃI THÀNH CÔNG",
+                    "error",
+                    f"Chưa lưu được lượt xe {plate} vào CSDL, vui lòng quét lại",
                 )
+            return
 
         _save_snapshot_to_disk("plate", record["plate_number"], record.get("plate_image"))
         _save_snapshot_to_disk("face", record["plate_number"], face_image)
 
         preview = format_record_row("Mới", record)
         with self.lock:
+            if self.session_id != commit_session_id:
+                return
+            if plate_key:
+                self._lock_plate_cooldown_locked(plate_key, direction, now)
+            self._set_feedback_locked(feedback_type, feedback_msg)
             self.last_confirmed = {
                 "seq": record["_seq"],
                 "plate_number": record["plate_number"],
@@ -1669,7 +1715,6 @@ class SystemState:
                 "face_status": preview["Khuôn mặt"],
                 "match_status": preview["Đối chiếu"],
             }
-        self.write_queue.put(record)
 
     def _background_startup(self) -> None:
         try:
@@ -1979,6 +2024,19 @@ def get_management_overview(
             "records": overview["records"] if overview else [],
             "records_version": state.records_version,
         }
+
+
+@app.get("/api/management/session-case/{record_id}")
+def get_parking_session_case(record_id: int):
+    try:
+        case_data = fetch_parking_session_case(record_id)
+        if case_data is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy bản ghi.")
+        state._set_db_status(True, None)
+        return case_data
+    except (DatabaseConfigurationError, DatabaseOperationError) as error:
+        state._set_db_status(False, str(error))
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @app.post("/api/management/reconnect")

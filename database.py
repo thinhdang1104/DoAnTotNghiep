@@ -654,34 +654,49 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
 
 
 def fetch_overview(
-    query: str = "", status_filter: str = "all", limit: int = HISTORY_LIMIT
+    query: str = "",
+    status_filter: str = "all",
+    limit: int = HISTORY_LIMIT,
+    include_stats_and_revenue: bool = True,
 ):
     """Thống kê toàn bộ bảng + báo cáo doanh thu Ngày/Tháng/Năm + danh sách bản ghi."""
     connection = _connect_mysql()
     cursor = connection.cursor(dictionary=True)
     try:
-        today_start = now_vn().replace(hour=0, minute=0, second=0)
-        cursor.execute(
-            """
-            SELECT
-                COUNT(*) AS total,
-                COALESCE(SUM(recognized_at >= %s), 0) AS today,
-                COALESCE(SUM(direction = 'IN' AND parking_status = 'IN_PARKING'), 0) AS in_parking,
-                COALESCE(SUM(direction = 'IN'), 0) AS total_in,
-                COALESCE(SUM(direction = 'OUT'), 0) AS total_out,
-                COALESCE(SUM(face_detected = 1), 0) AS with_face
-            FROM plate_recognition_history
-            """,
-            (today_start,),
-        )
-        stats_row = cursor.fetchone() or {}
-        total = int(stats_row.get("total") or 0)
-        with_face = int(stats_row.get("with_face") or 0)
-        in_parking = int(stats_row.get("in_parking") or 0)
-        total_in = int(stats_row.get("total_in") or 0)
-        total_out = int(stats_row.get("total_out") or 0)
-
-        revenue_report = _fetch_revenue_report_mysql(cursor)
+        stats_payload = None
+        revenue_report = None
+        if include_stats_and_revenue:
+            today_start = now_vn().replace(hour=0, minute=0, second=0)
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(recognized_at >= %s), 0) AS today,
+                    COALESCE(SUM(direction = 'IN' AND parking_status = 'IN_PARKING'), 0) AS in_parking,
+                    COALESCE(SUM(direction = 'IN'), 0) AS total_in,
+                    COALESCE(SUM(direction = 'OUT'), 0) AS total_out,
+                    COALESCE(SUM(face_detected = 1), 0) AS with_face
+                FROM plate_recognition_history
+                """,
+                (today_start,),
+            )
+            stats_row = cursor.fetchone() or {}
+            total = int(stats_row.get("total") or 0)
+            with_face = int(stats_row.get("with_face") or 0)
+            in_parking = int(stats_row.get("in_parking") or 0)
+            total_in = int(stats_row.get("total_in") or 0)
+            total_out = int(stats_row.get("total_out") or 0)
+            stats_payload = {
+                "total_records": total,
+                "today_records": int(stats_row.get("today") or 0),
+                "in_parking": in_parking,
+                "total_in": total_in,
+                "total_out": total_out,
+                "with_face": with_face,
+                "no_face": total - with_face,
+                "face_rate": round(with_face / total * 100) if total else 0,
+            }
+            revenue_report = _fetch_revenue_report_mysql(cursor)
 
         conditions = []
         params = []
@@ -728,19 +743,168 @@ def fetch_overview(
         records = [format_record_row(row["id"], row) for row in cursor.fetchall()]
 
         return {
-            "stats": {
-                "total_records": total,
-                "today_records": int(stats_row.get("today") or 0),
-                "in_parking": in_parking,
-                "total_in": total_in,
-                "total_out": total_out,
-                "with_face": with_face,
-                "no_face": total - with_face,
-                "face_rate": round(with_face / total * 100) if total else 0,
-            },
+            "stats": stats_payload,
             "revenue": revenue_report,
             "matched": matched,
             "records": records,
+        }
+    except MySQLError as error:
+        raise DatabaseOperationError(str(error)) from error
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def fetch_parking_session_case(record_id: int) -> dict | None:
+    """Truy vấn cặp bản ghi (Check-in & Check-out) trực tiếp từ MySQL theo ID được chọn và entry_record_id."""
+    connection = _connect_mysql()
+    cursor = connection.cursor(dictionary=True)
+    select_cols = """
+        SELECT id, plate_number, direction, parking_status, entry_record_id,
+               fee_amount, recognized_at, vote_count, sample_count,
+               consensus_rate, face_detected, face_confidence,
+               face_embedding IS NOT NULL AS face_embedding, face_match_score,
+               plate_image, face_image, camera_index
+        FROM plate_recognition_history
+    """
+    try:
+        cursor.execute(f"{select_cols} WHERE id = %s LIMIT 1", (int(record_id),))
+        target = cursor.fetchone()
+        if not target:
+            return None
+
+        target_dir = str(target.get("direction") or "IN").upper()
+        checkin_raw = None
+        checkout_raw = None
+
+        if target_dir == "OUT":
+            checkout_raw = target
+            entry_id = target.get("entry_record_id")
+            if entry_id is not None:
+                cursor.execute(f"{select_cols} WHERE id = %s LIMIT 1", (int(entry_id),))
+                checkin_raw = cursor.fetchone()
+            if checkin_raw is None:
+                norm_plate = _normalize_search(target.get("plate_number") or "")
+                cursor.execute(
+                    f"""
+                    {select_cols}
+                    WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+                      AND direction = 'IN'
+                      AND (recognized_at < %s OR (recognized_at = %s AND id < %s))
+                    ORDER BY recognized_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        norm_plate,
+                        target["recognized_at"],
+                        target["recognized_at"],
+                        int(target["id"]),
+                    ),
+                )
+                checkin_raw = cursor.fetchone()
+        else:
+            checkin_raw = target
+            cursor.execute(
+                f"""
+                {select_cols}
+                WHERE direction = 'OUT' AND entry_record_id = %s
+                ORDER BY recognized_at ASC, id ASC
+                LIMIT 1
+                """,
+                (int(target["id"]),),
+            )
+            checkout_raw = cursor.fetchone()
+
+            if checkout_raw is None:
+                norm_plate = _normalize_search(target.get("plate_number") or "")
+                cursor.execute(
+                    """
+                    SELECT id, recognized_at
+                    FROM plate_recognition_history
+                    WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+                      AND direction = 'IN'
+                      AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
+                    ORDER BY recognized_at ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (
+                        norm_plate,
+                        target["recognized_at"],
+                        target["recognized_at"],
+                        int(target["id"]),
+                    ),
+                )
+                next_in = cursor.fetchone()
+                if next_in:
+                    cursor.execute(
+                        f"""
+                        {select_cols}
+                        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+                          AND direction = 'OUT'
+                          AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
+                          AND (recognized_at < %s OR (recognized_at = %s AND id < %s))
+                        ORDER BY recognized_at ASC, id ASC
+                        LIMIT 1
+                        """,
+                        (
+                            norm_plate,
+                            target["recognized_at"],
+                            target["recognized_at"],
+                            int(target["id"]),
+                            next_in["recognized_at"],
+                            next_in["recognized_at"],
+                            int(next_in["id"]),
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        {select_cols}
+                        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+                          AND direction = 'OUT'
+                          AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
+                        ORDER BY recognized_at ASC, id ASC
+                        LIMIT 1
+                        """,
+                        (
+                            norm_plate,
+                            target["recognized_at"],
+                            target["recognized_at"],
+                            int(target["id"]),
+                        ),
+                    )
+                checkout_raw = cursor.fetchone()
+
+        checkin_row = (
+            format_record_row(checkin_raw["id"], checkin_raw) if checkin_raw else None
+        )
+        checkout_row = (
+            format_record_row(checkout_raw["id"], checkout_raw)
+            if checkout_raw
+            else None
+        )
+        in_status = (
+            str(checkin_raw.get("parking_status") or "").upper()
+            if checkin_raw
+            else ""
+        )
+        session_closed_missing_exit = bool(
+            checkin_raw is not None
+            and checkout_raw is None
+            and in_status != "IN_PARKING"
+        )
+        return {
+            "target_id": int(target["id"]),
+            "plate_number": (
+                (checkin_row and checkin_row["Biển số"])
+                or (checkout_row and checkout_row["Biển số"])
+                or target.get("plate_number")
+                or "-"
+            ),
+            "checkin_row": checkin_row,
+            "checkout_row": checkout_row,
+            "in_parking_status": in_status,
+            "session_closed_missing_exit": session_closed_missing_exit,
         }
     except MySQLError as error:
         raise DatabaseOperationError(str(error)) from error

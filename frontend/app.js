@@ -1617,6 +1617,96 @@
     return String(row["Luồng"] || "").includes("Ra");
   }
 
+  function computeLostCaseDetails(checkinRow, checkoutRow, fallbackPlate = "-") {
+    const plateNumber =
+      (checkinRow && checkinRow["Biển số"]) ||
+      (checkoutRow && checkoutRow["Biển số"]) ||
+      fallbackPlate ||
+      "-";
+
+    const checkinSnap = checkinRow
+      ? getRowSnapshots(checkinRow)
+      : {
+          plateImg: makeFallbackPlateSvg(plateNumber),
+          faceImg: makeFallbackFaceSvg(plateNumber, "-"),
+        };
+    const checkoutSnap = checkoutRow ? getRowSnapshots(checkoutRow) : null;
+
+    const inStatusCode = checkinRow
+      ? String(checkinRow.parking_status_code || "").toUpperCase()
+      : "";
+    const inStatusText = checkinRow
+      ? String(checkinRow["Trạng thái bãi"] || "")
+      : "";
+    const sessionClosedMissingExit = Boolean(
+      checkinRow &&
+        !checkoutRow &&
+        ((inStatusCode && inStatusCode !== "IN_PARKING") ||
+          (inStatusText && !inStatusText.includes("Đang gửi")))
+    );
+
+    const matchLabel = checkoutRow
+      ? String(checkoutRow["Đối chiếu"] || "-")
+      : sessionClosedMissingExit
+      ? "Phiên đã đóng, thiếu thông tin lượt ra"
+      : "Chưa có lượt ra";
+
+    const isMismatch =
+      Boolean(checkoutRow) &&
+      (matchLabel.includes("Lệch") ||
+        (typeof checkoutRow.face_match_score === "number" &&
+          checkoutRow.face_match_score < 0.65));
+
+    let verdictType = "warn";
+    let verdictText = "";
+    let takerNote = "";
+
+    if (checkoutRow) {
+      if (isMismatch) {
+        verdictType = "alert";
+        verdictText =
+          `CẢNH BÁO NGHI VẤN MẤT XE: Xe ${plateNumber} đã Check-out lúc ${checkoutRow["Thời gian nhận diện"]} ` +
+          `với khuôn mặt Người lấy xe LỆCH so với người gửi lúc Check-in (${matchLabel} — Duyệt ngoại lệ).`;
+        takerNote =
+          "Khuôn mặt Người lấy xe KHÔNG KHỚP với người gửi xe lúc Check-in. Đề nghị trích xuất ảnh này làm bằng chứng xác minh.";
+      } else {
+        verdictType = "ok";
+        verdictText =
+          `ĐÃ LẤY XE RA BÃI: Xe ${plateNumber} Check-in lúc ${checkinRow ? checkinRow["Thời gian nhận diện"] : "-"} ` +
+          `và đã Check-out lúc ${checkoutRow["Thời gian nhận diện"]} (${matchLabel}).`;
+        takerNote =
+          "Ảnh khuôn mặt Người lấy xe được camera cổng ra ghi nhận tại thời điểm Check-out.";
+      }
+    } else if (sessionClosedMissingExit) {
+      verdictType = "warn";
+      verdictText =
+        `Phiên đã đóng, thiếu thông tin lượt ra: Xe ${plateNumber} (Check-in lúc ${checkinRow ? checkinRow["Thời gian nhận diện"] : "-"}) ` +
+        `đã được đánh dấu đóng phiên (${checkinRow["Trạng thái bãi"] || inStatusCode}), nhưng không tìm thấy bản ghi lượt ra liên kết.`;
+      takerNote = "Phiên đã đóng, thiếu thông tin lượt ra.";
+    } else {
+      verdictType = "warn";
+      verdictText =
+        `CHƯA CÓ LƯỢT CHECK-OUT: Xe ${plateNumber} đã Check-in lúc ${checkinRow ? checkinRow["Thời gian nhận diện"] : "-"} ` +
+        `và hiện vẫn đang ở trạng thái Đang gửi trong bãi (chưa ghi nhận lượt lấy xe qua cổng).`;
+      takerNote =
+        "Chưa có ảnh Người lấy xe vì biển số này chưa thực hiện Check-out qua cổng camera.";
+    }
+
+    return {
+      plateNumber,
+      checkinRow,
+      checkoutRow,
+      checkinSnap,
+      checkoutSnap,
+      sessionClosedMissingExit,
+      matchLabel,
+      isMismatch,
+      verdictType,
+      verdictText,
+      takerNote,
+    };
+  }
+
   function buildLostVehicleCase(targetRow) {
     if (!targetRow) return null;
     const plateKey = normalizePlateKey(targetRow["Biển số"]);
@@ -1678,65 +1768,7 @@
       }
     }
 
-    const plateNumber =
-      (checkinRow && checkinRow["Biển số"]) ||
-      (checkoutRow && checkoutRow["Biển số"]) ||
-      targetRow["Biển số"] ||
-      "-";
-
-    const checkinSnap = checkinRow
-      ? getRowSnapshots(checkinRow)
-      : { plateImg: makeFallbackPlateSvg(plateNumber), faceImg: makeFallbackFaceSvg(plateNumber, "-") };
-    const checkoutSnap = checkoutRow ? getRowSnapshots(checkoutRow) : null;
-
-    const matchLabel = checkoutRow ? String(checkoutRow["Đối chiếu"] || "-") : "Chưa có lượt ra";
-    const isMismatch =
-      Boolean(checkoutRow) &&
-      (matchLabel.includes("Lệch") ||
-        (typeof checkoutRow.face_match_score === "number" &&
-          checkoutRow.face_match_score < 0.65));
-
-    let verdictType = "warn";
-    let verdictText = "";
-    let takerNote = "";
-
-    if (checkoutRow) {
-      if (isMismatch) {
-        verdictType = "alert";
-        verdictText =
-          `CẢNH BÁO NGHI VẤN MẤT XE: Xe ${plateNumber} đã Check-out lúc ${checkoutRow["Thời gian nhận diện"]} ` +
-          `với khuôn mặt Người lấy xe LỆCH so với người gửi lúc Check-in (${matchLabel} — Duyệt ngoại lệ).`;
-        takerNote =
-          "Khuôn mặt Người lấy xe KHÔNG KHỚP với người gửi xe lúc Check-in. Đề nghị trích xuất ảnh này làm bằng chứng xác minh.";
-      } else {
-        verdictType = "ok";
-        verdictText =
-          `ĐÃ LẤY XE RA BÃI: Xe ${plateNumber} Check-in lúc ${checkinRow ? checkinRow["Thời gian nhận diện"] : "-"} ` +
-          `và đã Check-out lúc ${checkoutRow["Thời gian nhận diện"]} (${matchLabel}).`;
-        takerNote =
-          "Ảnh khuôn mặt Người lấy xe được camera cổng ra ghi nhận tại thời điểm Check-out.";
-      }
-    } else {
-      verdictType = "warn";
-      verdictText =
-        `CHƯA CÓ LƯỢT CHECK-OUT: Xe ${plateNumber} đã Check-in lúc ${checkinRow ? checkinRow["Thời gian nhận diện"] : "-"} ` +
-        `và hiện vẫn đang ở trạng thái Đang gửi trong bãi (chưa ghi nhận lượt lấy xe qua cổng).`;
-      takerNote =
-        "Chưa có ảnh Người lấy xe vì biển số này chưa thực hiện Check-out qua cổng camera.";
-    }
-
-    return {
-      plateNumber,
-      checkinRow,
-      checkoutRow,
-      checkinSnap,
-      checkoutSnap,
-      matchLabel,
-      isMismatch,
-      verdictType,
-      verdictText,
-      takerNote,
-    };
+    return computeLostCaseDetails(checkinRow, checkoutRow, targetRow["Biển số"]);
   }
 
   function renderSnapshotCell(row) {
@@ -1753,10 +1785,8 @@
     `;
   }
 
-  function openLostVehicleModalByRow(row) {
-    if (!snapshotModal || !row) return;
-    const caseData = buildLostVehicleCase(row);
-    if (!caseData) return;
+  function renderLostVehicleModalCase(caseData) {
+    if (!snapshotModal || !caseData) return;
     activeLostCase = caseData;
 
     if (snapshotModalTitle) {
@@ -1830,6 +1860,43 @@
       if (takerFaceEmpty) {
         takerFaceEmpty.classList.add("hidden");
       }
+    } else if (caseData.sessionClosedMissingExit) {
+      if (checkoutBadgePill) {
+        checkoutBadgePill.className = "pill warn";
+        checkoutBadgePill.textContent = "2. CHECK OUT (THIẾU BẢN GHI RA)";
+      }
+      if (checkoutRecordId) checkoutRecordId.textContent = "#-";
+      if (checkoutTime) {
+        checkoutTime.textContent = "Phiên đã đóng, thiếu thông tin lượt ra";
+      }
+      if (checkoutParkingStatus) {
+        checkoutParkingStatus.textContent = "Phiên đã đóng, thiếu thông tin lượt ra";
+      }
+      if (checkoutMatchStatus) {
+        checkoutMatchStatus.textContent = "Không có dữ liệu lượt ra";
+      }
+
+      if (modalCheckoutPlateImg) {
+        modalCheckoutPlateImg.src = "";
+        modalCheckoutPlateImg.classList.add("hidden");
+      }
+      if (checkoutPlateEmpty) {
+        checkoutPlateEmpty.textContent = "Phiên đã đóng, thiếu thông tin lượt ra";
+        checkoutPlateEmpty.classList.remove("hidden");
+      }
+
+      if (takerMatchPill) {
+        takerMatchPill.className = "pill warn mono-num num";
+        takerMatchPill.textContent = "Thiếu lượt ra";
+      }
+      if (modalTakerFaceImg) {
+        modalTakerFaceImg.src = "";
+        modalTakerFaceImg.classList.add("hidden");
+      }
+      if (takerFaceEmpty) {
+        takerFaceEmpty.textContent = "Phiên đã đóng, thiếu thông tin lượt ra";
+        takerFaceEmpty.classList.remove("hidden");
+      }
     } else {
       if (checkoutBadgePill) {
         checkoutBadgePill.className = "pill warn";
@@ -1845,6 +1912,7 @@
         modalCheckoutPlateImg.classList.add("hidden");
       }
       if (checkoutPlateEmpty) {
+        checkoutPlateEmpty.textContent = "Chưa có lượt Check-out qua cổng";
         checkoutPlateEmpty.classList.remove("hidden");
       }
 
@@ -1857,6 +1925,7 @@
         modalTakerFaceImg.classList.add("hidden");
       }
       if (takerFaceEmpty) {
+        takerFaceEmpty.textContent = "Xe chưa ghi nhận lượt lấy ra qua cổng";
         takerFaceEmpty.classList.remove("hidden");
       }
     }
@@ -1866,6 +1935,36 @@
     }
 
     snapshotModal.classList.remove("hidden");
+  }
+
+  async function openLostVehicleModalByRow(row) {
+    if (!snapshotModal || !row) return;
+    const recId = Number(row["ID"]);
+
+    // Hiển thị tức thì từ dữ liệu sẵn có, sau đó đồng bộ cặp bản ghi chuẩn từ Backend theo ID & entry_record_id
+    const localCase = buildLostVehicleCase(row);
+    if (localCase) {
+      renderLostVehicleModalCase(localCase);
+    }
+
+    if (!Number.isNaN(recId) && recId > 0) {
+      try {
+        const res = await fetch(`/api/management/session-case/${recId}`);
+        if (res.ok) {
+          const payload = await res.json();
+          if (payload && ("checkin_row" in payload || "checkout_row" in payload)) {
+            const authoritativeCase = computeLostCaseDetails(
+              payload.checkin_row || null,
+              payload.checkout_row || null,
+              payload.plate_number || row["Biển số"]
+            );
+            renderLostVehicleModalCase(authoritativeCase);
+          }
+        }
+      } catch (_) {
+        // Giữ nguyên dữ liệu localCase nếu lỗi mạng tạm thời
+      }
+    }
   }
 
   function closeSnapshotModal() {
@@ -2481,8 +2580,8 @@
 
         <div class="case-col">
           <h4>2. CHECK OUT (LÚC LẤY XE)</h4>
-          <div>Mã bản ghi: <strong>${c.checkoutRow ? `#${escapeHtml(c.checkoutRow["ID"])}` : "Chưa có lượt ra"}</strong></div>
-          <div>Thời gian ra: <strong>${escapeHtml(c.checkoutRow ? c.checkoutRow["Thời gian nhận diện"] : "Chưa có lượt ra")}</strong></div>
+          <div>Mã bản ghi: <strong>${c.checkoutRow ? `#${escapeHtml(c.checkoutRow["ID"])}` : c.sessionClosedMissingExit ? "Phiên đã đóng, thiếu thông tin lượt ra" : "Chưa có lượt ra"}</strong></div>
+          <div>Thời gian ra: <strong>${escapeHtml(c.checkoutRow ? c.checkoutRow["Thời gian nhận diện"] : c.sessionClosedMissingExit ? "Phiên đã đóng, thiếu thông tin lượt ra" : "Chưa có lượt ra")}</strong></div>
           <div>Đối chiếu FaceNet: <strong>${escapeHtml(c.matchLabel)}</strong></div>
           ${
             c.checkoutSnap
@@ -2490,7 +2589,7 @@
                   <div>Ảnh biển số Check-out</div>
                   <img src="${c.checkoutSnap.plateImg}" alt="Biển số lúc ra" />
                 </div>`
-              : `<p>Chưa ghi nhận lượt Check-out qua cổng.</p>`
+              : `<p>${c.sessionClosedMissingExit ? "Phiên đã đóng, thiếu thông tin lượt ra." : "Chưa ghi nhận lượt Check-out qua cổng."}</p>`
           }
         </div>
 
