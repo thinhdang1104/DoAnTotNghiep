@@ -406,9 +406,17 @@ def format_record_row(record_id, record: dict) -> dict:
     default_fee = 0 if direction == "OUT" else PARKING_FEE_VND
     fee_amount = int(record.get("fee_amount", default_fee))
     fee_label = "Đã thu lúc vào" if direction == "OUT" else format_vnd(fee_amount)
+    raw_entry_id = record.get("entry_record_id")
+    entry_record_id = int(raw_entry_id) if raw_entry_id is not None else None
+    raw_match = record.get("face_match_score")
+    face_match_score = float(raw_match) if raw_match is not None else None
     return {
         "ID": record_id,
         "Biển số": record["plate_number"],
+        "direction_code": direction,
+        "parking_status_code": str(parking_status or "").upper(),
+        "entry_record_id": entry_record_id,
+        "face_match_score": face_match_score,
         "Luồng": format_direction_label(direction),
         "Trạng thái bãi": format_parking_status_label(direction, parking_status),
         "Phí giữ xe": fee_label,

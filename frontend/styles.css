@@ -1298,9 +1298,143 @@ td.n {
   object-fit: contain;
 }
 
+.revenue-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.lost-case-modal-card {
+  max-width: 1020px;
+}
+
+.snapshot-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.lost-case-verdict {
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--raised);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 19px;
+  margin-bottom: 14px;
+}
+
+.lost-case-verdict.verdict-alert {
+  background: #231215;
+  border-color: #6b2930;
+  color: #f9b4b4;
+}
+
+.lost-case-verdict.verdict-warn {
+  background: #241d11;
+  border-color: #5c471e;
+  color: #f5d07e;
+}
+
+.lost-case-verdict.verdict-ok {
+  background: #112319;
+  border-color: #214e36;
+  color: #96efc0;
+}
+
+.lost-case-grid {
+  display: grid;
+  grid-template-columns: 1.25fr 1fr 1fr;
+  gap: 14px;
+}
+
+.lost-case-col {
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.lost-case-col.highlight-taker-col {
+  border-color: #593342;
+  background: #171218;
+}
+
+.lost-case-col-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.lost-case-meta-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lost-case-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.lost-case-meta-row strong {
+  color: var(--text);
+  text-align: right;
+}
+
+.lost-case-photos-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.snapshot-img-frame.small-frame {
+  height: 132px;
+}
+
+.snapshot-img-frame.taker-frame {
+  height: 170px;
+  border-color: rgba(229, 83, 83, 0.35);
+}
+
+.snapshot-empty-hint {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+  padding: 0 12px;
+}
+
+.lost-case-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--muted);
+}
+
+.btn-lost-case {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
 /* ==================== RESPONSIVE ==================== */
 @media (max-width: 960px) {
-  .dual-camera-grid {
+  .dual-camera-grid,
+  .lost-case-grid {
     grid-template-columns: 1fr;
   }
 

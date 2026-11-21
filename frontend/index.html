@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=20261120b" />
+  <link rel="stylesheet" href="styles.css?v=20261121a" />
 </head>
 <body>
   <div class="app-shell">
@@ -307,6 +307,15 @@
                 placeholder="Tìm biển số xe..."
               />
               <span id="ledger-count-text" class="stamp mono-num num">0 / 0</span>
+              <button id="btn-export-history-pdf" class="btn" type="button" title="Xuất báo cáo Lịch sử & Quản lý ra file PDF">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                  <line x1="12" y1="18" x2="12" y2="12" />
+                  <polyline points="9 15 12 18 15 15" />
+                </svg>
+                <span>Xuất PDF</span>
+              </button>
               <button id="btn-refresh-management" class="btn" type="button">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
@@ -328,6 +337,7 @@
                   <th>Luồng</th>
                   <th class="n">Thời gian</th>
                   <th class="n">Mã ghi</th>
+                  <th class="n">Xử lý mất xe</th>
                 </tr>
               </thead>
               <tbody id="history-table-body"></tbody>
@@ -367,30 +377,41 @@
               <span id="revenue-unit-pill" class="pill warn mono-num num">Đơn giá: 2.000 đ / lượt gửi</span>
             </div>
 
-            <div class="cam-switcher" role="tablist" aria-label="Chu kỳ thống kê doanh thu">
-              <button
-                type="button"
-                class="cam-switch-btn rev-period-btn"
-                data-rev-period="daily"
-                aria-pressed="true"
-              >
-                Theo ngày
-              </button>
-              <button
-                type="button"
-                class="cam-switch-btn rev-period-btn"
-                data-rev-period="monthly"
-                aria-pressed="false"
-              >
-                Theo tháng
-              </button>
-              <button
-                type="button"
-                class="cam-switch-btn rev-period-btn"
-                data-rev-period="yearly"
-                aria-pressed="false"
-              >
-                Theo năm
+            <div class="revenue-header-actions">
+              <div class="cam-switcher" role="tablist" aria-label="Chu kỳ thống kê doanh thu">
+                <button
+                  type="button"
+                  class="cam-switch-btn rev-period-btn"
+                  data-rev-period="daily"
+                  aria-pressed="true"
+                >
+                  Theo ngày
+                </button>
+                <button
+                  type="button"
+                  class="cam-switch-btn rev-period-btn"
+                  data-rev-period="monthly"
+                  aria-pressed="false"
+                >
+                  Theo tháng
+                </button>
+                <button
+                  type="button"
+                  class="cam-switch-btn rev-period-btn"
+                  data-rev-period="yearly"
+                  aria-pressed="false"
+                >
+                  Theo năm
+                </button>
+              </div>
+              <button id="btn-export-revenue-pdf" class="btn" type="button" title="Xuất báo cáo Doanh thu ra file PDF">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                  <line x1="12" y1="18" x2="12" y2="12" />
+                  <polyline points="9 15 12 18 15 15" />
+                </svg>
+                <span>Xuất PDF</span>
               </button>
             </div>
           </header>
@@ -442,34 +463,118 @@
       </section>
     </main>
 
-    <!-- MODAL XEM ẢNH CẮT BIỂN SỐ & KHUÔN MẶT -->
+    <!-- MODAL XỬ LÝ TÌNH HUỐNG MẤT XE (CHECK IN, CHECK OUT, NGƯỜI LẤY XE) -->
     <div id="snapshot-modal" class="snapshot-modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="snapshot-modal-title">
-      <div class="snapshot-modal-card">
+      <div class="snapshot-modal-card lost-case-modal-card">
         <header class="snapshot-modal-header">
           <div>
-            <h3 id="snapshot-modal-title" class="snapshot-modal-title mono-num">Chi tiết Ảnh cắt Nhận diện</h3>
-            <p id="snapshot-modal-meta" class="snapshot-modal-meta">Biển số &amp; Khuôn mặt đã lưu</p>
+            <h3 id="snapshot-modal-title" class="snapshot-modal-title mono-num">Hồ sơ Tra cứu &amp; Xử lý Mất xe</h3>
+            <p id="snapshot-modal-meta" class="snapshot-modal-meta">Đối chiếu thông tin Check-in · Check-out · Người lấy xe</p>
           </div>
-          <button id="btn-close-snapshot-modal" type="button" class="btn snapshot-close-btn" aria-label="Đóng">✕ Đóng</button>
+          <div class="snapshot-modal-actions">
+            <button id="btn-export-lost-case-pdf" type="button" class="btn primary">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+                <line x1="12" y1="18" x2="12" y2="12" />
+                <polyline points="9 15 12 18 15 15" />
+              </svg>
+              <span>Xuất PDF biên bản</span>
+            </button>
+            <button id="btn-close-snapshot-modal" type="button" class="btn snapshot-close-btn" aria-label="Đóng">✕ Đóng</button>
+          </div>
         </header>
-        <div class="snapshot-modal-grid">
-          <div class="snapshot-box">
-            <span class="snapshot-box-label">Ảnh cắt Biển số xe (YOLOv8)</span>
-            <div class="snapshot-img-frame">
-              <img id="modal-plate-img" src="" alt="Ảnh cắt biển số xe" />
+
+        <!-- TÓM TẮT KẾT LUẬN ĐỐI CHIẾU -->
+        <div id="lost-case-verdict-banner" class="lost-case-verdict"></div>
+
+        <!-- 3 KHỐI THÔNG TIN: 1. CHECK IN | 2. CHECK OUT | 3. NGƯỜI LẤY XE -->
+        <div class="lost-case-grid">
+          <!-- KHỐI 1: CHECK IN (LÚC GỬI XE) -->
+          <section class="lost-case-col">
+            <div class="lost-case-col-header">
+              <span class="pill pos">1. CHECK IN (LÚC GỬI XE)</span>
+              <span id="checkin-record-id" class="stamp mono-num num">#-</span>
             </div>
-          </div>
-          <div class="snapshot-box">
-            <span class="snapshot-box-label">Ảnh cắt Khuôn mặt (MTCNN / FaceNet)</span>
-            <div class="snapshot-img-frame">
-              <img id="modal-face-img" src="" alt="Ảnh cắt khuôn mặt" />
+            <div class="lost-case-meta-list">
+              <div class="lost-case-meta-row">
+                <span>Thời gian vào:</span>
+                <strong id="checkin-time" class="mono-num num">-</strong>
+              </div>
+              <div class="lost-case-meta-row">
+                <span>Biển số lúc vào:</span>
+                <strong id="checkin-plate" class="plate-cell-main mono-num num">-</strong>
+              </div>
+              <div class="lost-case-meta-row">
+                <span>Nhận diện mặt:</span>
+                <strong id="checkin-face-status">-</strong>
+              </div>
             </div>
-          </div>
+            <div class="lost-case-photos-pair">
+              <div class="snapshot-box">
+                <span class="snapshot-box-label">Biển số Check-in</span>
+                <div class="snapshot-img-frame small-frame">
+                  <img id="modal-plate-img" src="" alt="Ảnh biển số lúc vào" />
+                </div>
+              </div>
+              <div class="snapshot-box">
+                <span class="snapshot-box-label">Người gửi xe (Check-in)</span>
+                <div class="snapshot-img-frame small-frame">
+                  <img id="modal-face-img" src="" alt="Ảnh khuôn mặt người gửi xe" />
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- KHỐI 2: CHECK OUT (LÚC LẤY XE) -->
+          <section class="lost-case-col">
+            <div class="lost-case-col-header">
+              <span id="checkout-badge-pill" class="pill warn">2. CHECK OUT (LÚC LẤY XE)</span>
+              <span id="checkout-record-id" class="stamp mono-num num">#-</span>
+            </div>
+            <div class="lost-case-meta-list">
+              <div class="lost-case-meta-row">
+                <span>Thời gian ra:</span>
+                <strong id="checkout-time" class="mono-num num">-</strong>
+              </div>
+              <div class="lost-case-meta-row">
+                <span>Trạng thái bãi:</span>
+                <strong id="checkout-parking-status">-</strong>
+              </div>
+              <div class="lost-case-meta-row">
+                <span>Đối chiếu FaceNet:</span>
+                <strong id="checkout-match-status">-</strong>
+              </div>
+            </div>
+            <div class="snapshot-box">
+              <span class="snapshot-box-label">Ảnh biển số lúc Check-out</span>
+              <div id="checkout-plate-frame" class="snapshot-img-frame small-frame">
+                <img id="modal-checkout-plate-img" src="" alt="Ảnh biển số lúc ra" />
+                <span id="checkout-plate-empty" class="snapshot-empty-hint hidden">Chưa có lượt Check-out qua cổng</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- KHỐI 3: NGƯỜI LẤY XE (TRÍCH XUẤT BẰNG CHỨNG) -->
+          <section class="lost-case-col highlight-taker-col">
+            <div class="lost-case-col-header">
+              <span class="pill neg">3. NGƯỜI LẤY XE</span>
+              <span id="taker-match-pill" class="pill mono-num num">-</span>
+            </div>
+            <div class="snapshot-box taker-photo-box">
+              <span class="snapshot-box-label">Ảnh khuôn mặt Người lấy xe (Camera cổng ra)</span>
+              <div id="taker-face-frame" class="snapshot-img-frame taker-frame">
+                <img id="modal-taker-face-img" src="" alt="Ảnh khuôn mặt người lấy xe" />
+                <span id="taker-face-empty" class="snapshot-empty-hint hidden">Xe chưa ghi nhận lượt lấy ra qua cổng</span>
+              </div>
+            </div>
+            <p id="taker-note-text" class="lost-case-note"></p>
+          </section>
         </div>
       </div>
     </div>
   </div>
 
-  <script src="app.js?v=20261120b"></script>
+  <script src="app.js?v=20261121a"></script>
 </body>
 </html>
