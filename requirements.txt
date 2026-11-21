@@ -1,12 +1,20 @@
-ultralytics>=8.0.0
-torch>=2.2.0
-torchvision>=0.17.0
-pillow>=10.2.0
-opencv-python-headless>=4.9.0
-numpy>=1.26.0
-fastapi>=0.110.0
-uvicorn>=0.30.0
-mysql-connector-python>=8.0.0
-python-dotenv>=1.0.0
-# Lưu ý: facenet-pytorch==2.6.0 được tự động cài kèm cờ --no-deps trong app.py / face_service.py
-# để không bị ép hạ cấp torch<2.3.0 gây xung đột với ultralytics và gradio.
+# Bộ phiên bản thư viện chuẩn đã kiểm chứng (Verified & Locked Range cho Python 3.10 - 3.14):
+# - Local verified environment: ultralytics==8.4.35, torch==2.11.0, torchvision==0.26.0,
+#   pillow==12.1.1, opencv-python==4.13.0.92, numpy==2.4.4, fastapi==0.135.3,
+#   uvicorn==0.44.0, mysql-connector-python==26.7.0, python-dotenv==1.2.4, facenet-pytorch==2.6.0
+# - Lưu ý: facenet-pytorch==2.6.0 ghim metadata cũ (torch<2.3.0, numpy<2.0.0) trên PyPI dù
+#   tương thích hoàn toàn với PyTorch 2.x mới, nên được cài tự động kèm cờ --no-deps trong
+#   app.py (khi khởi chạy trên Hugging Face Gradio Space) hoặc chạy:
+#     pip install -r requirements.txt
+#     pip install --no-deps facenet-pytorch==2.6.0
+
+ultralytics>=8.3.0,<8.5.0
+torch>=2.2.0,<2.12.0
+torchvision>=0.17.0,<0.27.0
+pillow>=10.2.0,<13.0.0
+opencv-python-headless>=4.9.0,<4.14.0
+numpy>=1.26.0,<2.5.0
+fastapi>=0.110.0,<0.136.0
+uvicorn>=0.30.0,<0.45.0
+mysql-connector-python>=8.0.0,<27.0.0
+python-dotenv>=1.0.0,<2.0.0

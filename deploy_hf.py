@@ -5,6 +5,7 @@ Cách dùng:
     python deploy_hf.py
 """
 
+import getpass
 import os
 import sys
 from pathlib import Path
@@ -33,7 +34,7 @@ def main() -> None:
     if not token and len(sys.argv) > 1:
         token = sys.argv[1].strip()
     if not token:
-        token = input("Hugging Face Write Token (hf_...): ").strip()
+        token = getpass.getpass("Hugging Face Write Token (hf_...): ").strip()
     if not token.startswith("hf_"):
         sys.exit("[LỖI] Token không hợp lệ (phải bắt đầu bằng 'hf_').")
 

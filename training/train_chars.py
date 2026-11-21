@@ -16,5 +16,6 @@ if __name__ == "__main__":
         device=device,
         workers=2,
         patience=20,
+        seed=0,
         verbose=True,
     )

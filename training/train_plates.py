@@ -11,10 +11,11 @@ if __name__ == "__main__":
     model.train(
         data=str(data_yaml),
         imgsz=640,
-        epochs=80,
-        batch=8,
+        epochs=50,
+        batch=16,
         device=device,
         workers=2,
-        patience=20,
+        patience=100,
+        seed=0,
         verbose=True,
     )

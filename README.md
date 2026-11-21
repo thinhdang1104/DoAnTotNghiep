@@ -40,14 +40,40 @@ Hệ thống tự động hóa quy trình kiểm soát phương tiện ra/vào b
 
 ---
 
-## 2. Thông tin Mô hình Huấn luyện (`weights/*.pt`) & Bộ dữ liệu
+## 2. Bộ dữ liệu, Quy trình Huấn luyện & Đánh giá Mô hình (`weights/*.pt`)
 
-Hai file trọng số YOLOv8 (`yolov8n.pt` base) trong thư mục [`weights/`](file:///C:/Study/DATN/weights) được huấn luyện bởi script [`training/train_plates.py`](file:///C:/Study/DATN/training/train_plates.py) và [`training/train_chars.py`](file:///C:/Study/DATN/training/train_chars.py) với cấu trúc nhãn khai báo tại [`datasets/plates/data.yaml`](file:///C:/Study/DATN/datasets/plates/data.yaml) và [`datasets/chars/data.yaml`](file:///C:/Study/DATN/datasets/chars/data.yaml) (đã kiểm tra SHA-256 đảm bảo 0 ảnh trùng lặp byte giữa các tập `train / valid / test`):
+### 2.1. Quy mô Bộ dữ liệu & Phân chia Tập (`train / valid / test`)
+Hai bộ dữ liệu huấn luyện theo chuẩn **YOLOv8 Roboflow format** được khai báo cấu hình tại [`datasets/plates/data.yaml`](datasets/plates/data.yaml) và [`datasets/chars/data.yaml`](datasets/chars/data.yaml) (các thư mục ảnh và nhãn `images/`, `labels/` được loại khỏi Git qua [`.gitignore`](.gitignore) để giữ kích thước repo gọn nhẹ):
 
-| Mô hình | File trọng số | Số lớp (`nc`) | Cấu hình huấn luyện | Precision | Recall | mAP@50 | mAP@50-95 |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Phát hiện biển số** | `weights/plate_best.pt` | `1` (`plate`) | `imgsz=640`, `epochs=50`, `batch=8` | `99.94%` | `100.0%` | `99.50%` | `80.49%` |
-| **Nhận diện ký tự OCR** | `weights/chars_best.pt` | `31` (`0-9`, `A-Z`) | `imgsz=640`, `epochs=80`, `batch=8` | `96.89%` | `93.95%` | `98.38%` | `74.56%` |
+| Bộ dữ liệu | Cấu hình | Số lớp (`nc`) | Train | Valid | Test | Tổng số ảnh | Kiểm tra rò rỉ dữ liệu (Data Leakage) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| **Biển số xe máy VN** | [`datasets/plates/data.yaml`](datasets/plates/data.yaml) | `1` (`plate`) | `704` | `200` | `101` | **`1.005` ảnh** | `0` ảnh trùng SHA-256 byte & `0` tên gốc trùng trước hậu tố `.rf.` giữa `train / valid / test` |
+| **Ký tự biển số OCR** | [`datasets/chars/data.yaml`](datasets/chars/data.yaml) | `31` (`0-9`, `A-Z`) | `2.675` | `764` | `380` | **`3.819` ảnh** | `0` ảnh trùng SHA-256 byte & `0` tên gốc trùng trước hậu tố `.rf.` giữa `train / valid / test` |
+
+*(Lưu ý: Kiểm tra trùng byte SHA-256 và tiền tố tên file `.rf.` đảm bảo không có file ảnh gốc bị chia trùng vào nhiều tập, nhưng chưa loại trừ hoàn toàn trường hợp hai khung hình gần giống nhau được chụp liên tiếp).*
+
+### 2.2. Lệnh tái lập huấn luyện & Kết quả đánh giá Checkpoint (`weights/*.pt`)
+Hai file trọng số trong thư mục [`weights/`](weights/) được huấn luyện từ mô hình gốc `yolov8n.pt` bằng hai script [`training/train_plates.py`](training/train_plates.py) và [`training/train_chars.py`](training/train_chars.py):
+
+- **Huấn luyện mô hình phát hiện biển số (`weights/plate_best.pt`)**:
+  ```bash
+  python training/train_plates.py
+  # Tham số khớp checkpoint: model=yolov8n.pt, imgsz=640, epochs=50, batch=16, patience=100, seed=0
+  ```
+- **Huấn luyện mô hình phân đoạn & đọc ký tự (`weights/chars_best.pt`)**:
+  ```bash
+  python training/train_chars.py
+  # Tham số khớp checkpoint: model=yolov8n.pt, imgsz=640, epochs=80, batch=8, patience=20, seed=0
+  ```
+
+| Mô hình | File trọng số | Phạm vi đo lường của Metric | Cấu hình (`train_args`) | Precision (Box) | Recall (Box) | mAP@50 (Box) | mAP@50-95 (Box) |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **Phát hiện biển số** | [`weights/plate_best.pt`](weights/plate_best.pt) | Phát hiện khung Bounding Box biển số xe (`plate`) trong ảnh toàn cảnh | `imgsz=640`, `epochs=50`, `batch=16`, `patience=100` | `99.94%` | `100.0%` | `99.50%` | `80.49%` |
+| **Nhận diện ký tự OCR** | [`weights/chars_best.pt`](weights/chars_best.pt) | Phát hiện & phân loại **từng ký tự đơn lẻ** (`character-level`) trong vùng ảnh cắt biển số | `imgsz=640`, `epochs=80`, `batch=8`, `patience=20` | `96.89%` | `93.95%` | `98.38%` | `74.56%` |
+
+> **Chú thích quan trọng về ý nghĩa Metric khi báo cáo**:
+> - Các chỉ số `Precision`, `Recall`, `mAP@50`, `mAP@50-95` ở bảng trên là **chỉ số phát hiện mức Bounding Box của từng mô hình trên tập Validation** (với `chars_best.pt` là độ chính xác phát hiện và phân loại **từng ký tự riêng lẻ**, chưa phải tỷ lệ đọc đúng trọn vẹn cả chuỗi biển số).
+> - Ở mức vận hành toàn hệ thống bãi giữ xe (*end-to-end plate recognition*), để một biển số được chốt hợp lệ, toàn bộ các ký tự trên biển phải được đọc đúng, vượt qua bước kiểm tra quy tắc định dạng biển số Việt Nam và đạt đồng thuận đa số (`Majority Voting >= 3 mẫu, >= 70%`) kết hợp xác thực khuôn mặt FaceNet (`Cosine Similarity >= 65%`). Khi đánh giá thực nghiệm ngoài thực tế, cần ghi nhận thêm **tỷ lệ đọc đúng toàn bộ biển số (end-to-end accuracy)**, **thời gian trung bình chốt 1 lượt xe** và **tỷ lệ lượt phải quét lại**.
 
 ---
 
@@ -58,20 +84,21 @@ Hai file trọng số YOLOv8 (`yolov8n.pt` base) trong thư mục [`weights/`](f
 ├── face_service.py          # Module AI Khuôn mặt (MTCNN + InceptionResnetV1 512-D & Cosine Similarity)
 ├── database.py              # Tầng lưu trữ & truy vấn MySQL (Lịch sử, Đối chiếu phiên mất xe, Doanh thu)
 ├── app.py                   # Entrypoint tích hợp Gradio + FastAPI cho Hugging Face Spaces (ZeroGPU)
+├── deploy_hf.py             # Script đẩy mã nguồn & trọng số lên Hugging Face Space (nhập token ẩn qua getpass)
 ├── datasets/
-│   ├── plates/data.yaml     # Cấu hình tập dữ liệu phát hiện biển số (1 class: plate)
-│   └── chars/data.yaml      # Cấu hình tập dữ liệu phân đoạn ký tự OCR (31 classes)
+│   ├── plates/data.yaml     # Cấu hình tập dữ liệu phát hiện biển số (1 class: plate, 704/200/101 ảnh)
+│   └── chars/data.yaml      # Cấu hình tập dữ liệu phân đoạn ký tự OCR (31 classes, 2675/764/380 ảnh)
 ├── training/
-│   ├── train_plates.py      # Script huấn luyện mô hình YOLOv8 phát hiện biển số
-│   └── train_chars.py       # Script huấn luyện mô hình YOLOv8 nhận diện ký tự OCR
+│   ├── train_plates.py      # Script huấn luyện YOLOv8 phát hiện biển số (epochs=50, batch=16, patience=100)
+│   └── train_chars.py       # Script huấn luyện YOLOv8 nhận diện ký tự OCR (epochs=80, batch=8, patience=20)
 ├── weights/
-│   ├── plate_best.pt        # Trọng số YOLOv8 phát hiện biển số xe (mAP50 = 99.50%)
-│   └── chars_best.pt        # Trọng số YOLOv8 nhận diện ký tự OCR (mAP50 = 98.38%)
+│   ├── plate_best.pt        # Trọng số YOLOv8 phát hiện biển số xe (mAP@50 = 99.50%)
+│   └── chars_best.pt        # Trọng số YOLOv8 nhận diện ký tự OCR (mAP@50 = 98.38%)
 ├── frontend/
 │   ├── index.html           # Giao diện Web (2 Camera nhận diện, Lịch sử & Quản lý, Quản lý doanh thu)
 │   ├── styles.css           # Thiết kế giao diện Dark Mode
 │   └── app.js               # Chọn thiết bị WebRTC theo tên, Top-up thông báo, Tra cứu mất xe & Xuất PDF
-├── requirements.txt         # Danh sách thư viện Python
+├── requirements.txt         # Danh sách thư viện Python kèm dải phiên bản đã kiểm chứng
 └── .env.example             # Mẫu cấu hình biến môi trường kết nối MySQL
 ```
 
@@ -86,10 +113,10 @@ Yêu cầu **Python 3.10+** và dịch vụ **MySQL** đang hoạt động (Loca
 pip install -r requirements.txt
 pip install --no-deps facenet-pytorch==2.6.0
 ```
-*(Lưu ý: `facenet-pytorch==2.6.0` ghim metadata `torch<2.3` cũ dù tương thích hoàn toàn với PyTorch 2.x mới, nên cần cài với cờ `--no-deps` để giữ nguyên bản PyTorch hiện tại).*
+*(Lưu ý: `facenet-pytorch==2.6.0` ghim metadata `torch<2.3` cũ trên PyPI dù tương thích hoàn toàn với PyTorch 2.x mới, nên cần cài với cờ `--no-deps` để giữ nguyên bộ thư viện đã kiểm chứng trong [`requirements.txt`](requirements.txt)).*
 
 ### Bước 2: Cấu hình Cơ sở dữ liệu MySQL (Bắt buộc)
-1. Sao chép file `.env.example` thành `.env`:
+1. Sao chép file [`.env.example`](.env.example) thành `.env`:
    ```bash
    cp .env.example .env
    ```
