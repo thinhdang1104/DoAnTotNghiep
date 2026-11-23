@@ -20,7 +20,6 @@ from pydantic import BaseModel, Field
 from ultralytics import YOLO
 
 from database import (
-    HISTORY_LIMIT,
     PARKING_FEE_VND,
     DatabaseConfigurationError,
     DatabaseOperationError,
@@ -379,7 +378,6 @@ class CameraUnitState:
     def __init__(self, cam_id: int, default_port: int) -> None:
         self.cam_id = cam_id
         self.device_index = default_port
-        self.backend_name: str | None = None
         self.active = False
         self.mode: str | None = None
         self.latest_boxes: dict = {"plates": [], "faces": []}
@@ -436,7 +434,6 @@ class SystemState:
         # - Cam nào chốt Biển số trước thì Cam đối diện (3 - plate_cam) bắt buộc xác thực Khuôn mặt
         # - Chiều VÀO (IN) / RA (OUT) tự động xác định theo trạng thái xe đang trong bãi (IN_PARKING)
         self.running = False
-        self.browser_mode = False
         self.infer_lock = threading.Lock()
         self.session_id = 0
         self.cams: dict[int, CameraUnitState] = {
@@ -446,7 +443,6 @@ class SystemState:
 
         self.frame_count = 0
         self.camera_error: str | None = None
-        self.confirm_seq = 0
 
         # Thông báo kết quả cổng & cảnh báo an ninh khi lệch mặt lúc ra
         self.feedback_seq = 0
@@ -548,6 +544,15 @@ class SystemState:
             return cached
 
         need_summary = cached_summary is None
+        if not include_records and not need_summary and cached_summary is not None:
+            return {
+                "stats": cached_summary["stats"],
+                "revenue": cached_summary["revenue"],
+                "matched": 0,
+                "page": 1,
+                "records": [],
+            }
+
         overview = fetch_overview(
             q,
             status,
@@ -707,41 +712,20 @@ class SystemState:
     # ------------------------------------------------- Camera độc lập (bật/tắt riêng)
     def _refresh_running_locked(self) -> None:
         self.running = any(c.active for c in self.cams.values())
-        self.browser_mode = any(
-            c.active and c.mode == "browser" for c in self.cams.values()
-        )
 
     def _clear_latch_locked(self) -> None:
         self.latched = None
         self.face_window_start = None
         self.best_face = None
 
-    def start_camera(
-        self, cam_id: int, device_index: int = 0, prefer_browser: bool = True
-    ) -> str:
-        """Đăng ký bật riêng 1 camera (Cam 1 hoặc Cam 2)."""
+    def start_camera(self, cam_id: int) -> str:
+        """Đăng ký bật riêng 1 camera WebRTC trình duyệt (Cam 1 hoặc Cam 2)."""
         if cam_id not in self.cams:
             raise ValueError("Camera ID phải là 1 hoặc 2.")
-
-        use_browser = bool(prefer_browser or os.getenv("SPACE_ID") is not None)
 
         with self.control_lock:
             with self.lock:
                 cam = self.cams[cam_id]
-                other = self.cams[3 - cam_id]
-                if (
-                    not use_browser
-                    and other.active
-                    and other.mode == "local"
-                    and other.device_index == device_index
-                ):
-                    msg = (
-                        f"Cổng {device_index} đang được dùng bởi Cam {other.cam_id}. "
-                        "Khi bật 2 Camera, mỗi Camera phải dùng 1 cổng thiết bị riêng (hoặc chỉ bật 1 Camera)."
-                    )
-                    self.camera_error = msg
-                    raise ValueError(msg)
-
                 was_running = self.running
                 if not was_running:
                     self.session_id += 1
@@ -753,9 +737,8 @@ class SystemState:
                     for c in self.cams.values():
                         c.observations.clear()
 
-                cam.device_index = (cam_id - 1) if use_browser else device_index
-                cam.backend_name = "WebRTC (trình duyệt)" if use_browser else "Local"
-                cam.mode = "browser" if use_browser else "local"
+                cam.device_index = cam_id - 1
+                cam.mode = "browser"
                 cam.active = True
                 cam.clear_display()
                 cam.reset_tracking()
@@ -778,7 +761,6 @@ class SystemState:
             return
         cam.active = False
         cam.mode = None
-        cam.backend_name = None
         cam.clear_display()
         cam.reset_tracking()
         self._clear_latch_locked()
@@ -1254,11 +1236,9 @@ class SystemState:
                         ):
                             latched_info = self.latched
                             best_face = self.best_face
-                            self.confirm_seq += 1
 
                             commit_pair = (
                                 {
-                                    "_seq": self.confirm_seq,
                                     "_session_id": session_id,
                                     "_plate_key": latched_info["plate_key"],
                                     "_active_session": latched_info.get("active_session"),
@@ -1321,10 +1301,7 @@ class SystemState:
         feedback_msg: str,
     ) -> None:
         try:
-            with self.lock:
-                if self.session_id != commit_session_id:
-                    return
-
+            # Luôn thực hiện ghi vào MySQL kể cả khi người dùng vừa bấm tắt camera hoặc server đang tắt
             saved = self._store_record(record)
             now = time.monotonic()
             if not saved:
@@ -1412,27 +1389,7 @@ class SystemState:
         plate = record["plate_number"]
 
         if direction == "OUT":
-            active_sess = cached_active_session
-            if active_sess is None:
-                with self.lock:
-                    db_ready = self.database_ready
-                if db_ready:
-                    try:
-                        active_sess = find_active_parking_session(plate)
-                    except (DatabaseConfigurationError, DatabaseOperationError) as error:
-                        self._set_db_status(False, str(error))
-
-            if active_sess is None:
-                with self.lock:
-                    if self.session_id == commit_session_id:
-                        for cam in self.cams.values():
-                            cam.observations.clear()
-                        self._set_feedback_locked(
-                            "error",
-                            f"Không tìm thấy phiên gửi xe của {plate}, vui lòng quét lại",
-                        )
-                return
-
+            active_sess = cached_active_session or {}
             prev_emb = active_sess.get("embedding")
             score_val = (
                 max(-1.0, min(1.0, cosine_similarity(embedding, prev_emb)))
@@ -1515,6 +1472,8 @@ class SystemState:
             self.load_ai_models()
         except Exception as error:  # noqa: BLE001
             print(f"[WARN] Không tải được mô hình AI: {error}")
+            with self.lock:
+                self.camera_error = f"Không tải được mô hình AI: {error}"
 
     def startup(self) -> None:
         # Khởi tạo kết nối MySQL và tải mô hình AI trên 2 luồng nền song song
@@ -1558,8 +1517,6 @@ class SystemState:
 
             return {
                 "running": self.running,
-                "mode": "browser" if self.browser_mode else "local",
-                "frame_count": self.frame_count,
                 "cam1": cam1_status,
                 "cam2": cam2_status,
                 "latched": latched_info,
@@ -1572,7 +1529,6 @@ class SystemState:
                 "records_version": self.records_version,
                 "database_ready": self.database_ready,
                 "models_ready": self.models_ready,
-                "face_matching": bool(self.face_service and self.face_service.can_embed),
                 "face_match_threshold": FACE_MATCH_THRESHOLD,
             }
 
@@ -1594,11 +1550,6 @@ app = FastAPI(
     title="Hệ thống Nhận diện Khuôn mặt & Biển số xe AI (2 Camera)",
     lifespan=lifespan,
 )
-
-
-class StartSingleCameraRequest(BaseModel):
-    device_index: int = Field(default=0, ge=0, le=10)
-    prefer_browser: bool = True
 
 
 class BrowserDualFrameRequest(BaseModel):
@@ -1641,12 +1592,9 @@ def _serialize_cam_unit(cam: CameraUnitState) -> dict:
             "vote_share": vote_share,
         }
     return {
-        "cam_id": cam.cam_id,
         "active": cam.active,
         "mode": cam.mode,
         "device_index": cam.device_index,
-        "backend": cam.backend_name,
-        "plate_in_view": cam.plate_in_view,
         "current_plates": list(cam.current_plates),
         "current_faces": list(cam.current_faces),
         "ambiguous_frame": cam.ambiguous_frame,
@@ -1671,13 +1619,11 @@ def api_resolve_alert(req: ResolveAlertRequest):
 
 
 @app.post("/api/camera/{cam_id}/start")
-def api_start_single_camera(cam_id: int, req: StartSingleCameraRequest):
+def api_start_single_camera(cam_id: int):
     if cam_id not in (1, 2):
         raise HTTPException(status_code=404, detail="Camera ID phải là 1 hoặc 2.")
     try:
-        mode = state.start_camera(
-            cam_id, req.device_index, prefer_browser=req.prefer_browser
-        )
+        mode = state.start_camera(cam_id)
         return {
             "status": "started",
             "cam_id": cam_id,
@@ -1744,6 +1690,7 @@ def get_management_overview(
             "stats": overview["stats"] if overview else None,
             "revenue": overview["revenue"] if overview else None,
             "matched": overview["matched"] if overview else 0,
+            "page": overview.get("page", safe_page) if overview else safe_page,
             "records": overview["records"] if overview else [],
             "records_version": state.records_version,
         }

@@ -138,6 +138,7 @@
   let lastCamError = { 1: "", 2: "" };
   let lastBackendError = "";
   let faceMatchThreshold = 0.65;
+  let modelsReady = true;
   let hasDiscoveredOnce = false;
   let cameraPermissionGranted = false;
   let deviceChangeBound = false;
@@ -982,11 +983,6 @@
 
       const res = await fetch(`/api/camera/${camId}/start`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          device_index: camId - 1,
-          prefer_browser: true,
-        }),
       });
       let data = {};
       try {
@@ -1021,7 +1017,9 @@
       const votePillEl = camId === 1 ? cam1VotePill : cam2VotePill;
       if (votePillEl) {
         votePillEl.className = "pill mono-num num";
-        votePillEl.textContent = `${targetDev.label} · Đang quét`;
+        votePillEl.textContent = modelsReady
+          ? `${targetDev.label} · Đang quét`
+          : `${targetDev.label} · Đang tải mô hình AI...`;
       }
 
       if (!silentSuccessBanner) {
@@ -1300,6 +1298,9 @@
         const pct = Math.round(camData.vote.vote_share * 100);
         votePillEl.className = "pill warn mono-num num";
         votePillEl.textContent = `${camData.vote.candidate} (${camData.vote.vote_count}/${camData.vote.sample_count} · ${pct}%)`;
+      } else if (!modelsReady) {
+        votePillEl.className = "pill warn mono-num num";
+        votePillEl.textContent = `${devLabel} · Đang tải mô hình AI...`;
       } else {
         votePillEl.className = "pill mono-num num";
         votePillEl.textContent = `${devLabel} · Đang quét`;
@@ -1342,6 +1343,9 @@
 
     if (typeof state.face_match_threshold === "number" && state.face_match_threshold > 0) {
       faceMatchThreshold = state.face_match_threshold;
+    }
+    if (typeof state.models_ready === "boolean") {
+      modelsReady = state.models_ready;
     }
 
     const active1 = syncSingleCamUI(1, state.cam1);
@@ -1724,6 +1728,9 @@
   function renderLostVehicleModalCase(caseData) {
     if (!snapshotModal || !caseData) return;
     activeLostCase = caseData;
+    if (btnExportLostCasePdf) {
+      btnExportLostCasePdf.disabled = false;
+    }
 
     if (snapshotModalTitle) {
       snapshotModalTitle.textContent = `Hồ sơ Xử lý Mất xe · Biển số ${caseData.plateNumber}`;
@@ -1875,6 +1882,10 @@
 
   function renderLostModalLoadingState(plateNumber) {
     if (!snapshotModal) return;
+    activeLostCase = null;
+    if (btnExportLostCasePdf) {
+      btnExportLostCasePdf.disabled = true;
+    }
     if (snapshotModalTitle) {
       snapshotModalTitle.textContent = `Hồ sơ Xử lý Mất xe · Biển số ${plateNumber || "-"}`;
     }
@@ -1882,6 +1893,30 @@
       lostCaseVerdictBanner.className = "lost-case-verdict";
       lostCaseVerdictBanner.textContent = "Đang tải hồ sơ đối chiếu từ cơ sở dữ liệu...";
     }
+    if (checkinRecordId) checkinRecordId.textContent = "#-";
+    if (checkinTime) checkinTime.textContent = "-";
+    if (checkinPlate) checkinPlate.textContent = plateNumber || "-";
+    if (checkinFaceStatus) checkinFaceStatus.textContent = "-";
+    applyImageOrEmptyHint(modalPlateImg, checkinPlateEmpty, "", "Đang tải...");
+    applyImageOrEmptyHint(modalFaceImg, checkinFaceEmpty, "", "Đang tải...");
+
+    if (checkoutBadgePill) {
+      checkoutBadgePill.className = "pill warn";
+      checkoutBadgePill.textContent = "2. CHECK OUT (ĐANG TẢI...)";
+    }
+    if (checkoutRecordId) checkoutRecordId.textContent = "#-";
+    if (checkoutTime) checkoutTime.textContent = "-";
+    if (checkoutParkingStatus) checkoutParkingStatus.textContent = "-";
+    if (checkoutMatchStatus) checkoutMatchStatus.textContent = "-";
+    applyImageOrEmptyHint(modalCheckoutPlateImg, checkoutPlateEmpty, "", "Đang tải...");
+
+    if (takerMatchPill) {
+      takerMatchPill.className = "pill mono-num num";
+      takerMatchPill.textContent = "-";
+    }
+    applyImageOrEmptyHint(modalTakerFaceImg, takerFaceEmpty, "", "Đang tải...");
+    if (takerNoteText) takerNoteText.textContent = "";
+
     snapshotModal.classList.remove("hidden");
   }
 
@@ -2122,6 +2157,9 @@
     }
 
     if (includeRecords) {
+      if (typeof data.page === "number" && data.page >= 1) {
+        currentPage = data.page;
+      }
       const matched = typeof data.matched === "number" ? data.matched : records.length;
       renderHistoryTable(records, matched, stats.total_records ?? 0);
     }
@@ -2377,6 +2415,14 @@
         idoc.write(fullHtml);
         idoc.close();
       }
+      const cleanupIframe = () => {
+        try {
+          iframe.remove();
+        } catch (_) {}
+      };
+      if (iframe.contentWindow) {
+        iframe.contentWindow.onafterprint = cleanupIframe;
+      }
       setTimeout(() => {
         try {
           if (iframe.contentWindow) {
@@ -2384,11 +2430,7 @@
             iframe.contentWindow.print();
           }
         } catch (_) {}
-        setTimeout(() => {
-          try {
-            iframe.remove();
-          } catch (_) {}
-        }, 1000);
+        setTimeout(cleanupIframe, 60000);
       }, 280);
       return { mode: "iframe", html: fullHtml };
     }
@@ -2400,120 +2442,127 @@
   }
 
   async function exportHistoryPdfReport() {
-    const filterNameMap = {
-      all: "Tất cả bản ghi",
-      in_parking: "Đang gửi trong bãi",
-      direction_in: "Lượt vào bãi",
-      direction_out: "Lượt ra bãi",
-    };
-    const filterLabel = filterNameMap[activeStatusFilter] || "Tất cả bản ghi";
-    const searchQuery = ((searchPlateInput && searchPlateInput.value) || "").trim();
-    const inParkingVal = (statInParking && statInParking.textContent) || "0";
-    const todayVal = (statTodayRecords && statTodayRecords.textContent) || "0";
-    const totalVal = (statTotalRecords && statTotalRecords.textContent) || "0";
+    if (btnExportHistoryPdf && btnExportHistoryPdf.disabled) return null;
+    if (btnExportHistoryPdf) btnExportHistoryPdf.disabled = true;
 
-    let recordsForPdf = cachedHistoryRecords;
-    let totalMatchedForPdf = cachedMatchedCount || cachedHistoryRecords.length;
     try {
-      const params = new URLSearchParams();
-      if (searchQuery) params.set("q", searchQuery);
-      if (activeStatusFilter && activeStatusFilter !== "all") {
-        params.set("status", activeStatusFilter);
-      }
-      params.set("limit", "200");
-      const res = await fetch(`/api/management/overview?${params.toString()}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data.records) && data.records.length > 0) {
-          recordsForPdf = data.records;
-          totalMatchedForPdf =
-            typeof data.matched === "number" ? data.matched : data.records.length;
+      const filterNameMap = {
+        all: "Tất cả bản ghi",
+        in_parking: "Đang gửi trong bãi",
+        direction_in: "Lượt vào bãi",
+        direction_out: "Lượt ra bãi",
+      };
+      const filterLabel = filterNameMap[activeStatusFilter] || "Tất cả bản ghi";
+      const searchQuery = ((searchPlateInput && searchPlateInput.value) || "").trim();
+      const inParkingVal = (statInParking && statInParking.textContent) || "0";
+      const todayVal = (statTodayRecords && statTodayRecords.textContent) || "0";
+      const totalVal = (statTotalRecords && statTotalRecords.textContent) || "0";
+
+      let recordsForPdf = cachedHistoryRecords;
+      let totalMatchedForPdf = cachedMatchedCount || cachedHistoryRecords.length;
+      try {
+        const params = new URLSearchParams();
+        if (searchQuery) params.set("q", searchQuery);
+        if (activeStatusFilter && activeStatusFilter !== "all") {
+          params.set("status", activeStatusFilter);
         }
-      }
-    } catch (_) {}
+        params.set("limit", "200");
+        const res = await fetch(`/api/management/overview?${params.toString()}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.records)) {
+            recordsForPdf = data.records;
+            totalMatchedForPdf =
+              typeof data.matched === "number" ? data.matched : data.records.length;
+          }
+        }
+      } catch (_) {}
 
-    const rowsHtml =
-      recordsForPdf.length === 0
-        ? `<tr><td colspan="6">Không có bản ghi nào khớp điều kiện lọc.</td></tr>`
-        : recordsForPdf
-            .map((row) => {
-              const snap = getRowSnapshots(row);
-              const imgHtml =
-                snap.hasRealPlate || snap.hasRealFace
-                  ? `<span class="thumb-pair">
-                      ${snap.hasRealPlate ? `<img class="thumb-plate" src="${snap.realPlateImg}" alt="Biển số" />` : `<span>Không có ảnh biển</span>`}
-                      ${snap.hasRealFace ? `<img class="thumb-face" src="${snap.realFaceImg}" alt="Khuôn mặt" />` : `<span>Không có ảnh mặt</span>`}
-                    </span>`
-                  : "Không có ảnh lưu trữ";
-              return `
-                <tr>
-                  <td><strong>${escapeHtml(row["Biển số"])}</strong></td>
-                  <td>${imgHtml}</td>
-                  <td>${escapeHtml(row["Luồng"])}</td>
-                  <td>${escapeHtml(row["Đối chiếu"] || "-")}</td>
-                  <td class="n">${escapeHtml(row["Thời gian nhận diện"])}</td>
-                  <td class="n">#${escapeHtml(row["ID"])}</td>
-                </tr>
-              `;
-            })
-            .join("");
+      const rowsHtml =
+        recordsForPdf.length === 0
+          ? `<tr><td colspan="6">Không có bản ghi nào khớp điều kiện lọc.</td></tr>`
+          : recordsForPdf
+              .map((row) => {
+                const snap = getRowSnapshots(row);
+                const imgHtml =
+                  snap.hasRealPlate || snap.hasRealFace
+                    ? `<span class="thumb-pair">
+                        ${snap.hasRealPlate ? `<img class="thumb-plate" src="${snap.realPlateImg}" alt="Biển số" />` : `<span>Không có ảnh biển</span>`}
+                        ${snap.hasRealFace ? `<img class="thumb-face" src="${snap.realFaceImg}" alt="Khuôn mặt" />` : `<span>Không có ảnh mặt</span>`}
+                      </span>`
+                    : "Không có ảnh lưu trữ";
+                return `
+                  <tr>
+                    <td><strong>${escapeHtml(row["Biển số"])}</strong></td>
+                    <td>${imgHtml}</td>
+                    <td>${escapeHtml(row["Luồng"])}</td>
+                    <td>${escapeHtml(row["Đối chiếu"] || "-")}</td>
+                    <td class="n">${escapeHtml(row["Thời gian nhận diện"])}</td>
+                    <td class="n">#${escapeHtml(row["ID"])}</td>
+                  </tr>
+                `;
+              })
+              .join("");
 
-    const limitNote =
-      totalMatchedForPdf > recordsForPdf.length
-        ? ` (hiển thị ${recordsForPdf.length}/${totalMatchedForPdf} bản ghi mới nhất)`
-        : "";
+      const limitNote =
+        totalMatchedForPdf > recordsForPdf.length
+          ? ` (hiển thị ${recordsForPdf.length}/${totalMatchedForPdf} bản ghi mới nhất)`
+          : "";
 
-    const bodyHtml = `
-      <header class="report-header">
-        <div>
-          <h1 class="report-title">BÁO CÁO LỊCH SỬ &amp; QUẢN LÝ RA VÀO BÃI XE</h1>
-          <p class="report-subtitle">Hệ thống Quản lý Bãi giữ xe Trường học AI Nhận diện Biển số &amp; Khuôn mặt</p>
-        </div>
-        <div class="report-meta">
-          <div>Ngày xuất: <strong>${escapeHtml(formatCurrentTimestamp())}</strong></div>
-          <div>Bộ lọc: <strong>${escapeHtml(filterLabel)}</strong>${
-      searchQuery ? ` · Tìm biển số: <strong>${escapeHtml(searchQuery)}</strong>` : ""
-    }</div>
-        </div>
-      </header>
+      const bodyHtml = `
+        <header class="report-header">
+          <div>
+            <h1 class="report-title">BÁO CÁO LỊCH SỬ &amp; QUẢN LÝ RA VÀO BÃI XE</h1>
+            <p class="report-subtitle">Hệ thống Quản lý Bãi giữ xe Trường học AI Nhận diện Biển số &amp; Khuôn mặt</p>
+          </div>
+          <div class="report-meta">
+            <div>Ngày xuất: <strong>${escapeHtml(formatCurrentTimestamp())}</strong></div>
+            <div>Bộ lọc: <strong>${escapeHtml(filterLabel)}</strong>${
+        searchQuery ? ` · Tìm biển số: <strong>${escapeHtml(searchQuery)}</strong>` : ""
+      }</div>
+          </div>
+        </header>
 
-      <div class="kpi-strip">
-        <div class="kpi-box">
-          <span class="kpi-box-label">Đang gửi trong bãi</span>
-          <strong class="kpi-box-val">${escapeHtml(inParkingVal)}</strong>
+        <div class="kpi-strip">
+          <div class="kpi-box">
+            <span class="kpi-box-label">Đang gửi trong bãi</span>
+            <strong class="kpi-box-val">${escapeHtml(inParkingVal)}</strong>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-box-label">Lượt vào / ra hôm nay</span>
+            <strong class="kpi-box-val">${escapeHtml(todayVal)}</strong>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-box-label">Tổng lượt lưu trữ</span>
+            <strong class="kpi-box-val">${escapeHtml(totalVal)}</strong>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-box-label">Số bản ghi trong báo cáo</span>
+            <strong class="kpi-box-val">${escapeHtml(recordsForPdf.length)}${escapeHtml(limitNote)}</strong>
+          </div>
         </div>
-        <div class="kpi-box">
-          <span class="kpi-box-label">Lượt vào / ra hôm nay</span>
-          <strong class="kpi-box-val">${escapeHtml(todayVal)}</strong>
-        </div>
-        <div class="kpi-box">
-          <span class="kpi-box-label">Tổng lượt lưu trữ</span>
-          <strong class="kpi-box-val">${escapeHtml(totalVal)}</strong>
-        </div>
-        <div class="kpi-box">
-          <span class="kpi-box-label">Số bản ghi trong báo cáo</span>
-          <strong class="kpi-box-val">${escapeHtml(recordsForPdf.length)}${escapeHtml(limitNote)}</strong>
-        </div>
-      </div>
 
-      <table>
-        <thead>
-          <tr>
-            <th>Biển số xe</th>
-            <th>Ảnh cắt (Biển &amp; Mặt)</th>
-            <th>Luồng</th>
-            <th>Đối chiếu FaceNet</th>
-            <th class="n">Thời gian</th>
-            <th class="n">Mã ghi</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rowsHtml}
-        </tbody>
-      </table>
-    `;
+        <table>
+          <thead>
+            <tr>
+              <th>Biển số xe</th>
+              <th>Ảnh cắt (Biển &amp; Mặt)</th>
+              <th>Luồng</th>
+              <th>Đối chiếu FaceNet</th>
+              <th class="n">Thời gian</th>
+              <th class="n">Mã ghi</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml}
+          </tbody>
+        </table>
+      `;
 
-    return openPrintablePdfDocument("Bao_Cao_Lich_Su_Bai_Xe", bodyHtml);
+      return openPrintablePdfDocument("Bao_Cao_Lich_Su_Bai_Xe", bodyHtml);
+    } finally {
+      if (btnExportHistoryPdf) btnExportHistoryPdf.disabled = false;
+    }
   }
 
   function exportRevenuePdfReport() {

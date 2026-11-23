@@ -1,4 +1,5 @@
 import sys
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -188,8 +189,8 @@ class TestSystemStateRegressions(unittest.TestCase):
 
     def test_commit_latched_pair_async_executor_and_committing_plates(self):
         """Regression Bước 2.1:
-        _commit_latched_pair() đẩy việc ghi DB sang commit_executor, chặn biển số trong committing_plates
-        và chỉ báo thành công sau khi MySQL commit hoàn tất.
+        _commit_latched_pair() với async_db=True đẩy việc ghi DB sang commit_executor,
+        khóa biển số trong committing_plates suốt thời gian chờ MySQL và gỡ khóa + báo thành công khi hoàn tất.
         """
         st = main.SystemState()
         st.session_id = 11
@@ -204,7 +205,6 @@ class TestSystemStateRegressions(unittest.TestCase):
         dummy_frame = np.zeros((80, 80, 3), dtype=np.uint8)
         best_face = (0.95, 0.96, dummy_frame, (10, 10, 50, 50), 26.0)
         rec = {
-            "_seq": 1,
             "_session_id": 11,
             "_plate_key": "59V179379",
             "_active_session": None,
@@ -219,15 +219,147 @@ class TestSystemStateRegressions(unittest.TestCase):
             "camera_index": 0,
         }
 
-        with mock.patch("main.insert_plate_record", return_value=(123, None)):
-            st._commit_latched_pair(dict(rec), best_face, async_db=False)
+        entered_db = threading.Event()
+        release_db = threading.Event()
+
+        def slow_insert(record_arg):
+            entered_db.set()
+            release_db.wait(timeout=3.0)
+            return (123, None)
+
+        with mock.patch("main.insert_plate_record", side_effect=slow_insert), mock.patch(
+            "main._save_snapshot_to_disk"
+        ):
+            st._commit_latched_pair(dict(rec), best_face, async_db=True)
+            self.assertTrue(entered_db.wait(timeout=2.0), "Background DB task did not start")
+            # Trong lúc MySQL đang ghi, biển số phải nằm trong committing_plates và chưa báo thành công sớm
+            self.assertIn("59V179379", st.committing_plates)
+            self.assertIsNone(st.gate_feedback)
+            release_db.set()
+            st.stop_db_writer()
 
         self.assertIsNotNone(st.gate_feedback)
         self.assertEqual(st.gate_feedback["type"], "success")
         self.assertIn("VÀO BÃI THÀNH CÔNG", st.gate_feedback["message"])
         self.assertIn("59V179379:IN", st.recent_confirms)
         self.assertNotIn("59V179379", st.committing_plates)
+
+    def test_stop_cameras_does_not_drop_inflight_commit(self):
+        """Regression Critical:
+        Nếu người dùng bấm 'Tắt tất cả' (hoặc tắt server gọi stop_cameras() làm tăng session_id)
+        đúng lúc bản ghi đã xác thực đang nằm trong commit_executor, bản ghi vẫn bắt buộc được ghi vào MySQL.
+        """
+        st = main.SystemState()
+        st.start_camera(1)
+        st.session_id = 20
+
+        class DummyFaceService:
+            can_embed = True
+
+            def embed_face(self, frame, box):
+                return [0.2] * 512
+
+        st.face_service = DummyFaceService()
+        dummy_frame = np.zeros((80, 80, 3), dtype=np.uint8)
+        best_face = (0.95, 0.96, dummy_frame, (10, 10, 50, 50), 26.0)
+        rec = {
+            "_session_id": 20,
+            "_plate_key": "30T41975",
+            "_active_session": None,
+            "plate_number": "30T4-1975",
+            "direction": "IN",
+            "recognized_at": database.now_vn(),
+            "vote_count": 4,
+            "sample_count": 4,
+            "consensus_rate": 1.0,
+            "face_detected": True,
+            "face_confidence": 0.96,
+            "camera_index": 0,
+        }
+
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+        insert_calls = []
+
+        def hold_executor():
+            blocker_started.set()
+            release_blocker.wait(timeout=3.0)
+
+        def tracked_insert(record_arg):
+            insert_calls.append(record_arg["plate_number"])
+            return (555, None)
+
+        with mock.patch("main.insert_plate_record", side_effect=tracked_insert), mock.patch(
+            "main._save_snapshot_to_disk"
+        ):
+            # Giữ worker của commit_executor để bản ghi _finalize_db_commit nằm chờ trong queue
+            st.commit_executor.submit(hold_executor)
+            self.assertTrue(blocker_started.wait(timeout=2.0))
+            st._commit_latched_pair(dict(rec), best_face, async_db=True)
+            self.assertIn("30T41975", st.committing_plates)
+            # Bấm tắt camera (làm tăng session_id từ 20 lên 21) trước khi _finalize_db_commit chạy
+            st.stop_cameras()
+            self.assertEqual(st.session_id, 21)
+            release_blocker.set()
+            st.stop_db_writer()
+
+        self.assertEqual(insert_calls, ["30T4-1975"], "In-flight authenticated record must not be dropped on stop_cameras()")
+        self.assertNotIn("30T41975", st.committing_plates)
+
+    def test_zero_db_revenue_tab_when_summary_cached(self):
+        """Regression Hiệu năng:
+        Khi tab Doanh thu gọi get_cached_overview(..., include_records=False) và overview_summary_cache đã ấm,
+        trả về ngay từ RAM mà không gọi fetch_overview / kết nối MySQL.
+        """
+        st = main.SystemState()
+        st.database_ready = True
+        today_str = database.now_vn().strftime("%Y-%m-%d")
+        st.overview_cache_date = today_str
+        st.records_version = 9
+        st.overview_summary_cache[(today_str, 9)] = {
+            "stats": {"total_records": 100, "in_parking": 12},
+            "revenue": {"unit_price": 2000, "total": {"tickets": 60, "revenue": 120000}},
+        }
+
+        with mock.patch("main.fetch_overview") as mock_fetch:
+            res = st.get_cached_overview("", "all", include_records=False)
+            mock_fetch.assert_not_called()
+
+        self.assertEqual(res["stats"]["total_records"], 100)
+        self.assertEqual(res["revenue"]["total"]["revenue"], 120000)
+        self.assertEqual(res["records"], [])
         st.stop_db_writer()
+
+    def test_connect_mysql_closes_leaked_conn_on_ping_failure(self):
+        """Regression Pool Leak:
+        Khi pool.get_connection() trả về kết nối bị ngắt và conn.ping() ném MySQLError,
+        phải gọi conn.close() để trả slot về pool rồi mới fallback sang mysql.connector.connect().
+        """
+        leaked_conn = mock.MagicMock()
+        leaked_conn.ping.side_effect = database.MySQLError("Server has gone away")
+        fresh_conn = mock.MagicMock()
+
+        fake_pool = mock.MagicMock()
+        fake_pool.get_connection.return_value = leaked_conn
+        fake_cfg = {
+            "host": "localhost",
+            "port": 3306,
+            "user": "root",
+            "password": "pw",
+            "database": "defaultdb",
+        }
+        cfg_key = ("localhost", 3306, "root", "pw", "defaultdb")
+
+        with mock.patch("database._connection_config", return_value=fake_cfg), mock.patch.object(
+            database, "_MYSQL_POOL", fake_pool
+        ), mock.patch.object(database, "_POOL_CONFIG_KEY", cfg_key), mock.patch(
+            "database.mysql.connector.connect", return_value=fresh_conn
+        ) as mock_direct_connect:
+            conn = database._connect_mysql()
+
+        self.assertIs(conn, fresh_conn)
+        leaked_conn.close.assert_called_once()
+        mock_direct_connect.assert_called_once()
 
 
 if __name__ == "__main__":

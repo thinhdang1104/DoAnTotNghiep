@@ -30,7 +30,7 @@ Hệ thống tự động hóa quy trình kiểm soát phương tiện ra/vào b
 - **Xác thực Khuôn mặt Sinh trắc học (FaceNet 512-D)**:
   - Sử dụng **MTCNN** phát hiện khuôn mặt và **InceptionResnetV1 (`vggface2`)** trích xuất vector đặc trưng `512` chiều chuẩn hóa L2, kết hợp đo độ sắc nét Laplacian trên vùng lõi khuôn mặt (`inner 70%`, ngưỡng sàn `15.0`, ngưỡng chuẩn `22.0`).
   - Tự động tính độ tương đồng **Cosine Similarity** giữa khuôn mặt lúc gửi xe và lúc lấy xe (ngưỡng an toàn $\ge 0.65$). Nếu thấp hơn ngưỡng, hệ thống tự động kích hoạt **Cảnh báo lệch khuôn mặt** ngay tại ô Top-up trên thanh tiêu đề để bảo vệ chọn **Cho phép ra** hoặc **Từ chối**.
-- **Cơ chế Chốt 2 Pha đối xứng (Symmetric Two-Phase Latch — `4.0 giây`) & Ghi MySQL đồng bộ**:
+- **Cơ chế Chốt 2 Pha đối xứng (Symmetric Two-Phase Latch — `4.0 giây`) & Chỉ báo thành công sau khi MySQL commit**:
   - Bất kỳ camera nào (`Cam 1` hoặc `Cam 2`) đạt đồng thuận biển số trước ($\ge 3$ mẫu, tỷ lệ $\ge 70\%$ trong cửa sổ `3.0 giây`) thì **camera đối diện (`3 - plate_cam`)** bắt buộc xác thực khuôn mặt người lái trong vòng `4.0 giây`.
   - Hệ thống chỉ khóa cooldown và thông báo **VÀO / RA BÃI THÀNH CÔNG** sau khi bản ghi đã được commit thành công vào cơ sở dữ liệu **MySQL**.
 - **Quản lý Lịch sử, Xử lý tình huống mất xe & Xuất báo cáo PDF**:

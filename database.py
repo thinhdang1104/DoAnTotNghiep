@@ -20,7 +20,6 @@ from face_service import (
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-HISTORY_LIMIT = 200
 PARKING_FEE_VND = 2000  # 2.000 VNĐ / lượt giữ xe
 VN_TZ = timezone(timedelta(hours=7))
 
@@ -90,12 +89,21 @@ def _connect_mysql():
                 _POOL_CONFIG_KEY = cfg_key
             pool = _MYSQL_POOL
 
+        conn = None
         try:
             conn = pool.get_connection()
             conn.ping(reconnect=True, attempts=1, delay=0)
             return conn
         except pooling.PoolError:
             # Khi pool tạm thời cạn kết nối -> mở kết nối trực tiếp dự phòng thay vì báo lỗi mất DB
+            return mysql.connector.connect(**config)
+        except MySQLError:
+            # Nếu kết nối cũ trong pool bị Aiven đóng và ping thất bại -> trả slot về pool rồi mở kết nối mới
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             return mysql.connector.connect(**config)
     except MySQLError as error:
         raise DatabaseOperationError(str(error)) from error
@@ -457,9 +465,6 @@ def format_record_row(record_id, record: dict) -> dict:
     direction = str(record.get("direction", "IN")).upper()
     parking_status = record.get("parking_status", "IN_PARKING")
     has_emb = bool(record.get("face_embedding"))
-    default_fee = 0 if direction == "OUT" else PARKING_FEE_VND
-    fee_amount = int(record.get("fee_amount", default_fee))
-    fee_label = "Đã thu lúc vào" if direction == "OUT" else format_vnd(fee_amount)
     raw_entry_id = record.get("entry_record_id")
     entry_record_id = int(raw_entry_id) if raw_entry_id is not None else None
     raw_match = record.get("face_match_score")
@@ -473,13 +478,7 @@ def format_record_row(record_id, record: dict) -> dict:
         "face_match_score": face_match_score,
         "Luồng": format_direction_label(direction),
         "Trạng thái bãi": format_parking_status_label(direction, parking_status),
-        "Phí giữ xe": fee_label,
-        "fee_amount": fee_amount,
         "Thời gian nhận diện": format_recognition_time(record["recognized_at"]),
-        "Đồng thuận biển số": (
-            f"{record['vote_count']}/{record['sample_count']} "
-            f"({float(record['consensus_rate']):.0%})"
-        ),
         "Khuôn mặt": format_face_label(
             record.get("face_detected"), record.get("face_confidence")
         ),
@@ -488,7 +487,6 @@ def format_record_row(record_id, record: dict) -> dict:
         ),
         "plate_image": record.get("plate_image"),
         "face_image": record.get("face_image"),
-        "Camera index": record["camera_index"],
     }
 
 
@@ -749,10 +747,12 @@ def fetch_overview(
 
         if limit is not None:
             effective_limit = max(1, int(limit))
+            safe_page = 1
             effective_offset = 0
         else:
             effective_limit = max(1, int(page_size))
-            safe_page = max(1, int(page))
+            total_pages = max(1, math.ceil(matched / effective_limit)) if matched > 0 else 1
+            safe_page = min(max(1, int(page)), total_pages)
             effective_offset = (safe_page - 1) * effective_limit
 
         cursor.execute(
@@ -775,6 +775,7 @@ def fetch_overview(
             "stats": stats_payload,
             "revenue": revenue_report,
             "matched": matched,
+            "page": safe_page,
             "records": records,
         }
     except MySQLError as error:
