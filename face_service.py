@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass
 import os
-import subprocess
-import sys
 
 import cv2
 import numpy as np
@@ -47,7 +45,7 @@ def embedding_to_bytes(embedding) -> bytes:
 
 
 def embedding_from_bytes(raw: bytes | None) -> list[float] | None:
-    if not raw:
+    if not raw or len(raw) != EMBEDDING_SIZE * 4:
         return None
     vector = np.frombuffer(raw, dtype=np.float32)
     if vector.size != EMBEDDING_SIZE:
@@ -57,24 +55,11 @@ def embedding_from_bytes(raw: bytes | None) -> list[float] | None:
 
 class FaceService:
     def __init__(self) -> None:
-        global InceptionResnetV1, MTCNN
         if MTCNN is None or InceptionResnetV1 is None:
-            print("[SYS] Đang cài đặt facenet-pytorch==2.6.0 (--no-deps) trong luồng nền...")
-            subprocess.check_call(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "-q",
-                    "--no-deps",
-                    "--root-user-action=ignore",
-                    "facenet-pytorch==2.6.0",
-                ]
+            raise RuntimeError(
+                "Chưa cài đặt thư viện 'facenet-pytorch'. Vui lòng chạy lệnh:\n"
+                "  pip install --no-deps facenet-pytorch==2.6.0"
             )
-            from facenet_pytorch import InceptionResnetV1 as _IRV1, MTCNN as _MTCNN
-
-            InceptionResnetV1, MTCNN = _IRV1, _MTCNN
 
         # Trên Hugging Face Spaces (đặc biệt ZeroGPU), không gọi torch.cuda.is_available() ở main process
         if os.getenv("SPACE_ID") or os.getenv("FORCE_CPU") == "1":

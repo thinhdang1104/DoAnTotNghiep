@@ -27,8 +27,6 @@
   const cam1FaceValue = document.getElementById("cam1-face-value");
   const cam2PlateValue = document.getElementById("cam2-plate-value");
   const cam2FaceValue = document.getElementById("cam2-face-value");
-  const cam1StreamImg = document.getElementById("cam1-stream-img");
-  const cam2StreamImg = document.getElementById("cam2-stream-img");
   const cam1LiveVideo = document.getElementById("cam1-live-video");
   const cam2LiveVideo = document.getElementById("cam2-live-video");
   const cam1OverlayCanvas = document.getElementById("cam1-overlay-canvas");
@@ -58,7 +56,8 @@
   const statTodayRecords = document.getElementById("stat-today-records");
   const statTotalRecords = document.getElementById("stat-total-records");
 
-  // Revenue Report elements (2.000 đ / lượt)
+  // Revenue Report elements
+  const revenueUnitPill = document.getElementById("revenue-unit-pill");
   const revTodayAmount = document.getElementById("rev-today-amount");
   const revTodayTickets = document.getElementById("rev-today-tickets");
   const revMonthAmount = document.getElementById("rev-month-amount");
@@ -92,6 +91,8 @@
   const snapshotModalMeta = document.getElementById("snapshot-modal-meta");
   const modalPlateImg = document.getElementById("modal-plate-img");
   const modalFaceImg = document.getElementById("modal-face-img");
+  const checkinPlateEmpty = document.getElementById("checkin-plate-empty");
+  const checkinFaceEmpty = document.getElementById("checkin-face-empty");
   const btnCloseSnapshotModal = document.getElementById("btn-close-snapshot-modal");
   const btnExportLostCasePdf = document.getElementById("btn-export-lost-case-pdf");
   const lostCaseVerdictBanner = document.getElementById("lost-case-verdict-banner");
@@ -119,6 +120,10 @@
   let cachedMatchedCount = 0;
   let cachedTotalRecords = 0;
   let activeLostCase = null;
+  let isLostModalOpen = false;
+  let lostCaseReqSeq = 0;
+  let overviewReqSeq = 0;
+  let overviewAbortCtrl = null;
   let currentPage = 1;
   let pageSize = 10;
   let isCameraStreaming = false;
@@ -126,10 +131,13 @@
   let selectedCamDeviceIds = { 1: "", 2: "" };
   let activeCamDeviceIds = { 1: null, 2: null };
   let activeCamDeviceLabels = { 1: null, 2: null };
+  let lastDeviceSelectSig = { 1: "", 2: "" };
   let camBusy = { 1: false, 2: false };
   let manualStoppingCam = { 1: false, 2: false };
   let trackEndedHandlers = { 1: null, 2: null };
   let lastCamError = { 1: "", 2: "" };
+  let lastBackendError = "";
+  let faceMatchThreshold = 0.65;
   let hasDiscoveredOnce = false;
   let cameraPermissionGranted = false;
   let deviceChangeBound = false;
@@ -226,10 +234,6 @@
   async function resolveAlert(action) {
     btnApproveExit.disabled = true;
     btnRejectExit.disabled = true;
-    // Ẩn ngay hộp cảnh báo (Optimistic UI) để giao diện phản hồi tức thì khi bấm nút
-    if (securityAlertBox) {
-      securityAlertBox.classList.add("hidden");
-    }
     try {
       const res = await fetch("/api/camera/resolve-alert", {
         method: "POST",
@@ -238,11 +242,28 @@
       });
       if (res.ok) {
         const data = await res.json();
-        if (data && data.message) {
-          showBanner(gateTopupBox || cameraAlertBox, data.type || "warn", data.message, 2500);
+        if (data && data.status === "db_error") {
+          if (securityAlertBox) {
+            securityAlertBox.classList.remove("hidden");
+          }
+          if (data.message) {
+            showBanner(cameraAlertBox, "error", data.message);
+          }
+        } else {
+          if (securityAlertBox) {
+            securityAlertBox.classList.add("hidden");
+          }
+          if (data && data.message) {
+            showBanner(
+              gateTopupBox || cameraAlertBox,
+              data.type || "warn",
+              data.message,
+              2500
+            );
+          }
         }
       }
-      pollCameraStatusOnce();
+      await pollCameraStatusOnce();
     } finally {
       btnApproveExit.disabled = false;
       btnRejectExit.disabled = false;
@@ -256,7 +277,7 @@
     btnRejectExit.addEventListener("click", () => resolveAlert("reject"));
   }
 
-  // ==================== DUAL CAMERA CONTROLS (LOCAL USB + CLOUD WEBRTC) ====================
+  // ==================== DUAL CAMERA CONTROLS (BROWSER WEBRTC) ====================
   let browserWebRTCActive = false;
   let isStartingCamera = false;
   let browserCamDevices = [];
@@ -265,26 +286,6 @@
   let browserCanvas = null;
   let browserFrameTimer = null;
   let browserInFlight = false;
-  let statusPollTimer = null;
-
-  function stopStatusPollLoop() {
-    if (statusPollTimer) {
-      clearTimeout(statusPollTimer);
-      statusPollTimer = null;
-    }
-  }
-
-  function scheduleLocalStatusPollIfNeeded(active1, active2) {
-    stopStatusPollLoop();
-    const anyLocalActive =
-      (active1 && !browserVideos[0]) || (active2 && !browserVideos[1]);
-    if (anyLocalActive) {
-      statusPollTimer = setTimeout(async () => {
-        statusPollTimer = null;
-        await pollCameraStatusOnce();
-      }, 320);
-    }
-  }
 
   function normalizeVideoInputDevices(rawDevices) {
     const videoInputs = (rawDevices || []).filter(
@@ -330,8 +331,12 @@
       name === "SecurityError"
     ) {
       const inIframe = window.self !== window.top;
+      const directOrigin =
+        (window.location && window.location.origin) ||
+        (window.location && window.location.href) ||
+        "trang trực tiếp";
       return inIframe
-        ? "Trình duyệt chặn quyền Camera trong khung nhúng. Vui lòng cấp quyền Camera trên thanh địa chỉ hoặc mở trực tiếp https://minhthinh-doan.hf.space"
+        ? `Trình duyệt chặn quyền Camera trong khung nhúng. Vui lòng cấp quyền Camera trên thanh địa chỉ hoặc mở trực tiếp ${directOrigin}`
         : "Bạn đã từ chối cấp quyền truy cập Camera. Vui lòng cho phép quyền Camera trên thanh địa chỉ trình duyệt rồi thử lại.";
     }
     if (
@@ -375,8 +380,26 @@
       const selectEl = camId === 1 ? cam1DeviceSelect : cam2DeviceSelect;
       if (!selectEl) return;
       const otherId = 3 - camId;
-      const otherReservedId = activeCamDeviceIds[otherId];
+      const otherReservedId = activeCamDeviceIds[otherId] || "";
       const currentVal = selectedCamDeviceIds[camId] || "";
+      const isDisabled = Boolean(
+        camStreaming[camId] || camBusy[camId] || browserCamDevices.length === 0
+      );
+      const devListSig = browserCamDevices
+        .map((d) => `${d.deviceId}:${d.label}`)
+        .join("|");
+      const nextSig = `${isDisabled ? 1 : 0}::${currentVal}::${otherReservedId}::${devListSig}`;
+
+      if (lastDeviceSelectSig[camId] === nextSig) {
+        if (selectEl.value !== currentVal) {
+          selectEl.value = currentVal;
+        }
+        if (selectEl.disabled !== isDisabled) {
+          selectEl.disabled = isDisabled;
+        }
+        return;
+      }
+      lastDeviceSelectSig[camId] = nextSig;
 
       const optionsHtml = [];
       if (browserCamDevices.length === 0) {
@@ -402,9 +425,7 @@
 
       selectEl.innerHTML = optionsHtml.join("");
       selectEl.value = currentVal;
-      selectEl.disabled = Boolean(
-        camStreaming[camId] || camBusy[camId] || browserCamDevices.length === 0
-      );
+      selectEl.disabled = isDisabled;
     });
   }
 
@@ -588,9 +609,7 @@
     video.srcObject = stream;
     try {
       await video.play();
-    } catch (_) {
-      // Ignore play() promise warning if autoplay already started
-    }
+    } catch (_) {}
     const ready = await waitVideoReady(video, 1800);
     if (!ready) {
       stream.getTracks().forEach((t) => t.stop());
@@ -683,27 +702,15 @@
   }
 
   function revealCamImagesIfReady() {
-    if (camStreaming[1]) {
-      if (browserVideos[0] && cam1LiveVideo) {
-        cam1LiveVideo.classList.remove("hidden");
-        if (cam1OverlayCanvas) cam1OverlayCanvas.classList.remove("hidden");
-        cam1StreamImg.classList.add("hidden");
-        cam1Placeholder.classList.add("hidden");
-      } else if (cam1StreamImg.getAttribute("src")) {
-        cam1StreamImg.classList.remove("hidden");
-        cam1Placeholder.classList.add("hidden");
-      }
+    if (camStreaming[1] && browserVideos[0] && cam1LiveVideo) {
+      cam1LiveVideo.classList.remove("hidden");
+      if (cam1OverlayCanvas) cam1OverlayCanvas.classList.remove("hidden");
+      cam1Placeholder.classList.add("hidden");
     }
-    if (camStreaming[2]) {
-      if (browserVideos[1] && cam2LiveVideo) {
-        cam2LiveVideo.classList.remove("hidden");
-        if (cam2OverlayCanvas) cam2OverlayCanvas.classList.remove("hidden");
-        cam2StreamImg.classList.add("hidden");
-        cam2Placeholder.classList.add("hidden");
-      } else if (cam2StreamImg.getAttribute("src")) {
-        cam2StreamImg.classList.remove("hidden");
-        cam2Placeholder.classList.add("hidden");
-      }
+    if (camStreaming[2] && browserVideos[1] && cam2LiveVideo) {
+      cam2LiveVideo.classList.remove("hidden");
+      if (cam2OverlayCanvas) cam2OverlayCanvas.classList.remove("hidden");
+      cam2Placeholder.classList.add("hidden");
     }
   }
 
@@ -859,15 +866,9 @@
   function hideCamStreamUI(camId) {
     camStreaming[camId] = false;
     isCameraStreaming = Boolean(camStreaming[1] || camStreaming[2]);
-    const imgEl = camId === 1 ? cam1StreamImg : cam2StreamImg;
     const liveVideoEl = camId === 1 ? cam1LiveVideo : cam2LiveVideo;
     const overlayCanvasEl = camId === 1 ? cam1OverlayCanvas : cam2OverlayCanvas;
     const phEl = camId === 1 ? cam1Placeholder : cam2Placeholder;
-    if (imgEl) {
-      imgEl.src = "";
-      imgEl.removeAttribute("src");
-      imgEl.classList.add("hidden");
-    }
     if (liveVideoEl) {
       liveVideoEl.srcObject = null;
       liveVideoEl.classList.add("hidden");
@@ -953,7 +954,6 @@
 
     let openedCamObj = null;
     try {
-      // Kiểm tra lại danh sách thiết bị hiện có để chắc chắn deviceId vẫn còn tồn tại
       const latestRaw = await navigator.mediaDevices.enumerateDevices();
       browserCamDevices = normalizeVideoInputDevices(latestRaw);
       const targetDev = browserCamDevices.find((d) => d.deviceId === selectedId);
@@ -971,7 +971,6 @@
         `Đang kết nối Cam ${camId} (${targetDev.label})...`
       );
 
-      // Mở ĐÚNG thiết bị bằng exact deviceId — tuyệt đối không fallback sang thiết bị khác hay video: true
       try {
         openedCamObj = await tryOpenStreamWithVideo({
           video: { deviceId: { exact: selectedId } },
@@ -981,7 +980,6 @@
         throw new Error(formatMediaError(openErr, targetDev.label));
       }
 
-      // Đăng ký phiên browser rõ ràng với backend (prefer_browser: true)
       const res = await fetch(`/api/camera/${camId}/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1002,7 +1000,7 @@
 
       browserStreams[slot] = openedCamObj.stream;
       browserVideos[slot] = openedCamObj.video;
-      openedCamObj = null; // đã bàn giao cho browserStreams[slot]
+      openedCamObj = null;
       browserWebRTCActive = Boolean(browserVideos[0] || browserVideos[1]);
       camStreaming[camId] = true;
       isCameraStreaming = Boolean(camStreaming[1] || camStreaming[2]);
@@ -1048,7 +1046,6 @@
       }
       stopBrowserWebRTCForCam(camId);
       hideCamStreamUI(camId);
-      // Giữ lại lựa chọn trong dropdown (nếu thiết bị vẫn còn trong danh sách) để người dùng sửa hoặc thử lại
       if (
         selectedId &&
         browserCamDevices.some((d) => d.deviceId === selectedId)
@@ -1079,9 +1076,6 @@
     hideCamStreamUI(camId);
     setPlaceholderText(camId, `Chưa kết nối Cam ${camId}`);
     updateIdleBadgeForCam(camId);
-    if (!camStreaming[1] && !camStreaming[2]) {
-      stopStatusPollLoop();
-    }
     try {
       await fetch(`/api/camera/${camId}/stop`, { method: "POST" });
     } catch (err) {
@@ -1250,7 +1244,6 @@
     if (camBusy[1] || camBusy[2]) return;
     btnStopCamera.disabled = true;
     isStartingCamera = true;
-    stopStatusPollLoop();
     stopBrowserWebRTC();
     hideCamStreamUI(1);
     hideCamStreamUI(2);
@@ -1299,9 +1292,7 @@
       const devLabel =
         activeCamDeviceLabels[camId] ||
         getSelectedDeviceLabel(camId) ||
-        (camData && camData.mode === "local"
-          ? `Camera nội bộ #${camData.device_index}`
-          : "Chưa chọn thiết bị");
+        "Chưa chọn thiết bị";
       if (!running) {
         votePillEl.className = "pill mono-num num";
         votePillEl.textContent = `${devLabel} · Ngắt`;
@@ -1316,29 +1307,14 @@
     }
   }
 
-  function syncSingleCamUI(
-    camId,
-    camState,
-    imgEl,
-    phEl
-  ) {
+  function syncSingleCamUI(camId, camState) {
     const slot = camId - 1;
     const ownsBrowserStream = Boolean(browserVideos[slot] && browserStreams[slot]);
-    const isLocalActive = Boolean(
-      camState && camState.active && camState.mode === "local"
-    );
-    const isActiveHere = Boolean(ownsBrowserStream || isLocalActive);
 
-    if (isActiveHere) {
+    if (ownsBrowserStream) {
       if (!camStreaming[camId]) {
         camStreaming[camId] = true;
-        if (isLocalActive && !ownsBrowserStream && imgEl && phEl) {
-          imgEl.src = `/api/camera/stream/${camId}?t=${Date.now()}`;
-          imgEl.classList.remove("hidden");
-          phEl.classList.add("hidden");
-        } else {
-          revealCamImagesIfReady();
-        }
+        revealCamImagesIfReady();
       }
     } else {
       if (camStreaming[camId] && !camBusy[camId]) {
@@ -1358,30 +1334,30 @@
         );
       }
     }
-    return isActiveHere;
+    return ownsBrowserStream;
   }
 
   async function applyCameraStatus(state) {
     if (!state || isStartingCamera) return;
 
-    const active1 = syncSingleCamUI(
-      1,
-      state.cam1,
-      cam1StreamImg,
-      cam1Placeholder
-    );
-    const active2 = syncSingleCamUI(
-      2,
-      state.cam2,
-      cam2StreamImg,
-      cam2Placeholder
-    );
+    if (typeof state.face_match_threshold === "number" && state.face_match_threshold > 0) {
+      faceMatchThreshold = state.face_match_threshold;
+    }
+
+    const active1 = syncSingleCamUI(1, state.cam1);
+    const active2 = syncSingleCamUI(2, state.cam2);
 
     renderDeviceSelects();
     refreshCamControlButtons();
 
     if (state.error) {
+      lastBackendError = state.error;
       showBanner(cameraAlertBox, "error", state.error);
+    } else if (lastBackendError) {
+      if (cameraAlertBox && cameraAlertBox.textContent === lastBackendError) {
+        showBanner(cameraAlertBox, "", "");
+      }
+      lastBackendError = "";
     }
 
     if (
@@ -1442,7 +1418,6 @@
       latchStatusBox.classList.add("hidden");
       if (cam1UnitCard) cam1UnitCard.classList.remove("cam-target-highlight");
       if (cam2UnitCard) cam2UnitCard.classList.remove("cam-target-highlight");
-      refreshCamControlButtons();
     }
 
     // Security Alert UI (Face mismatch on exit — Top-up in blue box area)
@@ -1452,9 +1427,10 @@
       }
       securityAlertBox.classList.remove("hidden");
       alertScorePill.textContent = `Độ khớp: ${state.security_alert.match_score_pct}`;
+      const threshPct = Math.round(faceMatchThreshold * 100);
       alertDetailText.textContent =
         `Xe ${state.security_alert.plate_number} (gửi lúc ${state.security_alert.entry_time}) ` +
-        `có khuôn mặt người lấy xe LỆCH so với lúc gửi xe vào bãi (Cosine ${state.security_alert.match_score_pct} < 65%).`;
+        `có khuôn mặt người lấy xe LỆCH so với lúc gửi xe vào bãi (Cosine ${state.security_alert.match_score_pct} < ${threshPct}%).`;
     } else {
       securityAlertBox.classList.add("hidden");
     }
@@ -1470,8 +1446,6 @@
         fetchManagementOverview();
       }
     }
-
-    scheduleLocalStatusPollIfNeeded(active1, active2);
   }
 
   async function pollCameraStatusOnce() {
@@ -1482,7 +1456,7 @@
       const state = await res.json();
       await applyCameraStatus(state);
     } catch {
-      // Giữ nguyên số lượng bản ghi chờ hiện tại nếu lỗi mạng tạm thời
+      // Bỏ qua lỗi mạng tạm thời
     }
   }
 
@@ -1506,6 +1480,9 @@
 
     const unitFee = (cachedRevenueData && cachedRevenueData.unit_price) || 2000;
     const unitFeeText = formatVnd(unitFee);
+    if (revenueUnitPill) {
+      revenueUnitPill.textContent = `Đơn giá: ${unitFeeText} / lượt gửi`;
+    }
     const rows =
       (cachedRevenueData && cachedRevenueData[activeRevenuePeriod]) || [];
 
@@ -1600,21 +1577,19 @@
   }
 
   function getRowSnapshots(row) {
+    if (!row) return { plateImg: "", faceImg: "", hasRealPlate: false, hasRealFace: false };
+    const hasRealPlate = Boolean(row.plate_image);
+    const hasRealFace = Boolean(row.face_image);
     const plateImg = row.plate_image || makeFallbackPlateSvg(row["Biển số"]);
     const faceImg = row.face_image || makeFallbackFaceSvg(row["Biển số"], row["Khuôn mặt"]);
-    return { plateImg, faceImg };
-  }
-
-  function normalizePlateKey(plate) {
-    return String(plate || "")
-      .toUpperCase()
-      .replace(/[^A-Z0-9]/g, "");
-  }
-
-  function isOutRow(row) {
-    if (!row) return false;
-    if (row.direction_code) return String(row.direction_code).toUpperCase() === "OUT";
-    return String(row["Luồng"] || "").includes("Ra");
+    return {
+      plateImg,
+      faceImg,
+      realPlateImg: row.plate_image || "",
+      realFaceImg: row.face_image || "",
+      hasRealPlate,
+      hasRealFace,
+    };
   }
 
   function computeLostCaseDetails(checkinRow, checkoutRow, fallbackPlate = "-") {
@@ -1627,8 +1602,12 @@
     const checkinSnap = checkinRow
       ? getRowSnapshots(checkinRow)
       : {
-          plateImg: makeFallbackPlateSvg(plateNumber),
-          faceImg: makeFallbackFaceSvg(plateNumber, "-"),
+          plateImg: "",
+          faceImg: "",
+          realPlateImg: "",
+          realFaceImg: "",
+          hasRealPlate: false,
+          hasRealFace: false,
         };
     const checkoutSnap = checkoutRow ? getRowSnapshots(checkoutRow) : null;
 
@@ -1655,7 +1634,7 @@
       Boolean(checkoutRow) &&
       (matchLabel.includes("Lệch") ||
         (typeof checkoutRow.face_match_score === "number" &&
-          checkoutRow.face_match_score < 0.65));
+          checkoutRow.face_match_score < faceMatchThreshold));
 
     let verdictType = "warn";
     let verdictText = "";
@@ -1707,70 +1686,6 @@
     };
   }
 
-  function buildLostVehicleCase(targetRow) {
-    if (!targetRow) return null;
-    const plateKey = normalizePlateKey(targetRow["Biển số"]);
-    const targetId = Number(targetRow["ID"]);
-    let checkinRow = null;
-    let checkoutRow = null;
-
-    if (isOutRow(targetRow)) {
-      checkoutRow = targetRow;
-      const linkedInId =
-        targetRow.entry_record_id != null ? Number(targetRow.entry_record_id) : null;
-      if (linkedInId != null && !Number.isNaN(linkedInId)) {
-        checkinRow =
-          cachedHistoryRecords.find((r) => Number(r["ID"]) === linkedInId) || null;
-      }
-      if (!checkinRow) {
-        const outTime = String(targetRow["Thời gian nhận diện"] || "");
-        const candidates = cachedHistoryRecords.filter(
-          (r) =>
-            !isOutRow(r) &&
-            normalizePlateKey(r["Biển số"]) === plateKey &&
-            (String(r["Thời gian nhận diện"] || "") <= outTime ||
-              Number(r["ID"]) < targetId)
-        );
-        checkinRow = candidates[0] || null;
-      }
-    } else {
-      checkinRow = targetRow;
-      checkoutRow =
-        cachedHistoryRecords.find(
-          (r) =>
-            isOutRow(r) &&
-            r.entry_record_id != null &&
-            Number(r.entry_record_id) === targetId
-        ) || null;
-      if (!checkoutRow) {
-        const inTime = String(targetRow["Thời gian nhận diện"] || "");
-        const nextIn = cachedHistoryRecords
-          .filter(
-            (r) =>
-              !isOutRow(r) &&
-              normalizePlateKey(r["Biển số"]) === plateKey &&
-              Number(r["ID"]) > targetId
-          )
-          .sort((a, b) => Number(a["ID"]) - Number(b["ID"]))[0];
-        const nextInId = nextIn ? Number(nextIn["ID"]) : Infinity;
-
-        const outCandidates = cachedHistoryRecords
-          .filter(
-            (r) =>
-              isOutRow(r) &&
-              normalizePlateKey(r["Biển số"]) === plateKey &&
-              Number(r["ID"]) > targetId &&
-              Number(r["ID"]) < nextInId &&
-              String(r["Thời gian nhận diện"] || "") >= inTime
-          )
-          .sort((a, b) => Number(a["ID"]) - Number(b["ID"]));
-        checkoutRow = outCandidates[0] || null;
-      }
-    }
-
-    return computeLostCaseDetails(checkinRow, checkoutRow, targetRow["Biển số"]);
-  }
-
   function renderSnapshotCell(row) {
     const { plateImg, faceImg } = getRowSnapshots(row);
     const plate = escapeHtml(row["Biển số"]);
@@ -1783,6 +1698,27 @@
         </button>
       </div>
     `;
+  }
+
+  function applyImageOrEmptyHint(imgEl, emptyEl, srcUrl, emptyText) {
+    if (srcUrl) {
+      if (imgEl) {
+        imgEl.src = srcUrl;
+        imgEl.classList.remove("hidden");
+      }
+      if (emptyEl) {
+        emptyEl.classList.add("hidden");
+      }
+    } else {
+      if (imgEl) {
+        imgEl.src = "";
+        imgEl.classList.add("hidden");
+      }
+      if (emptyEl) {
+        emptyEl.textContent = emptyText;
+        emptyEl.classList.remove("hidden");
+      }
+    }
   }
 
   function renderLostVehicleModalCase(caseData) {
@@ -1818,8 +1754,18 @@
         ? caseData.checkinRow["Khuôn mặt"] || "Đã lưu mẫu mặt"
         : "-";
     }
-    if (modalPlateImg) modalPlateImg.src = caseData.checkinSnap.plateImg || "";
-    if (modalFaceImg) modalFaceImg.src = caseData.checkinSnap.faceImg || "";
+    applyImageOrEmptyHint(
+      modalPlateImg,
+      checkinPlateEmpty,
+      caseData.checkinSnap.realPlateImg,
+      "Không có ảnh lưu trữ"
+    );
+    applyImageOrEmptyHint(
+      modalFaceImg,
+      checkinFaceEmpty,
+      caseData.checkinSnap.realFaceImg,
+      "Không có ảnh lưu trữ"
+    );
 
     // 2. Check-out & 3. Người lấy xe
     if (caseData.checkoutRow && caseData.checkoutSnap) {
@@ -1839,13 +1785,12 @@
       if (checkoutMatchStatus) {
         checkoutMatchStatus.textContent = caseData.matchLabel;
       }
-      if (modalCheckoutPlateImg) {
-        modalCheckoutPlateImg.src = caseData.checkoutSnap.plateImg;
-        modalCheckoutPlateImg.classList.remove("hidden");
-      }
-      if (checkoutPlateEmpty) {
-        checkoutPlateEmpty.classList.add("hidden");
-      }
+      applyImageOrEmptyHint(
+        modalCheckoutPlateImg,
+        checkoutPlateEmpty,
+        caseData.checkoutSnap.realPlateImg,
+        "Không có ảnh lưu trữ"
+      );
 
       if (takerMatchPill) {
         takerMatchPill.className = caseData.isMismatch
@@ -1853,13 +1798,12 @@
           : "pill pos mono-num num";
         takerMatchPill.textContent = caseData.matchLabel;
       }
-      if (modalTakerFaceImg) {
-        modalTakerFaceImg.src = caseData.checkoutSnap.faceImg;
-        modalTakerFaceImg.classList.remove("hidden");
-      }
-      if (takerFaceEmpty) {
-        takerFaceEmpty.classList.add("hidden");
-      }
+      applyImageOrEmptyHint(
+        modalTakerFaceImg,
+        takerFaceEmpty,
+        caseData.checkoutSnap.realFaceImg,
+        "Không có ảnh lưu trữ"
+      );
     } else if (caseData.sessionClosedMissingExit) {
       if (checkoutBadgePill) {
         checkoutBadgePill.className = "pill warn";
@@ -1876,27 +1820,23 @@
         checkoutMatchStatus.textContent = "Không có dữ liệu lượt ra";
       }
 
-      if (modalCheckoutPlateImg) {
-        modalCheckoutPlateImg.src = "";
-        modalCheckoutPlateImg.classList.add("hidden");
-      }
-      if (checkoutPlateEmpty) {
-        checkoutPlateEmpty.textContent = "Phiên đã đóng, thiếu thông tin lượt ra";
-        checkoutPlateEmpty.classList.remove("hidden");
-      }
+      applyImageOrEmptyHint(
+        modalCheckoutPlateImg,
+        checkoutPlateEmpty,
+        "",
+        "Phiên đã đóng, thiếu thông tin lượt ra"
+      );
 
       if (takerMatchPill) {
         takerMatchPill.className = "pill warn mono-num num";
         takerMatchPill.textContent = "Thiếu lượt ra";
       }
-      if (modalTakerFaceImg) {
-        modalTakerFaceImg.src = "";
-        modalTakerFaceImg.classList.add("hidden");
-      }
-      if (takerFaceEmpty) {
-        takerFaceEmpty.textContent = "Phiên đã đóng, thiếu thông tin lượt ra";
-        takerFaceEmpty.classList.remove("hidden");
-      }
+      applyImageOrEmptyHint(
+        modalTakerFaceImg,
+        takerFaceEmpty,
+        "",
+        "Phiên đã đóng, thiếu thông tin lượt ra"
+      );
     } else {
       if (checkoutBadgePill) {
         checkoutBadgePill.className = "pill warn";
@@ -1907,27 +1847,23 @@
       if (checkoutParkingStatus) checkoutParkingStatus.textContent = "Đang gửi trong bãi";
       if (checkoutMatchStatus) checkoutMatchStatus.textContent = "Chưa đối chiếu";
 
-      if (modalCheckoutPlateImg) {
-        modalCheckoutPlateImg.src = "";
-        modalCheckoutPlateImg.classList.add("hidden");
-      }
-      if (checkoutPlateEmpty) {
-        checkoutPlateEmpty.textContent = "Chưa có lượt Check-out qua cổng";
-        checkoutPlateEmpty.classList.remove("hidden");
-      }
+      applyImageOrEmptyHint(
+        modalCheckoutPlateImg,
+        checkoutPlateEmpty,
+        "",
+        "Chưa có lượt Check-out qua cổng"
+      );
 
       if (takerMatchPill) {
         takerMatchPill.className = "pill warn mono-num num";
         takerMatchPill.textContent = "Chưa xác định";
       }
-      if (modalTakerFaceImg) {
-        modalTakerFaceImg.src = "";
-        modalTakerFaceImg.classList.add("hidden");
-      }
-      if (takerFaceEmpty) {
-        takerFaceEmpty.textContent = "Xe chưa ghi nhận lượt lấy ra qua cổng";
-        takerFaceEmpty.classList.remove("hidden");
-      }
+      applyImageOrEmptyHint(
+        modalTakerFaceImg,
+        takerFaceEmpty,
+        "",
+        "Xe chưa ghi nhận lượt lấy ra qua cổng"
+      );
     }
 
     if (takerNoteText) {
@@ -1937,21 +1873,32 @@
     snapshotModal.classList.remove("hidden");
   }
 
+  function renderLostModalLoadingState(plateNumber) {
+    if (!snapshotModal) return;
+    if (snapshotModalTitle) {
+      snapshotModalTitle.textContent = `Hồ sơ Xử lý Mất xe · Biển số ${plateNumber || "-"}`;
+    }
+    if (lostCaseVerdictBanner) {
+      lostCaseVerdictBanner.className = "lost-case-verdict";
+      lostCaseVerdictBanner.textContent = "Đang tải hồ sơ đối chiếu từ cơ sở dữ liệu...";
+    }
+    snapshotModal.classList.remove("hidden");
+  }
+
   async function openLostVehicleModalByRow(row) {
     if (!snapshotModal || !row) return;
     const recId = Number(row["ID"]);
-
-    // Hiển thị tức thì từ dữ liệu sẵn có, sau đó đồng bộ cặp bản ghi chuẩn từ Backend theo ID & entry_record_id
-    const localCase = buildLostVehicleCase(row);
-    if (localCase) {
-      renderLostVehicleModalCase(localCase);
-    }
+    const reqId = ++lostCaseReqSeq;
+    isLostModalOpen = true;
+    renderLostModalLoadingState(row["Biển số"]);
 
     if (!Number.isNaN(recId) && recId > 0) {
       try {
         const res = await fetch(`/api/management/session-case/${recId}`);
+        if (reqId !== lostCaseReqSeq || !isLostModalOpen) return;
         if (res.ok) {
           const payload = await res.json();
+          if (reqId !== lostCaseReqSeq || !isLostModalOpen) return;
           if (payload && ("checkin_row" in payload || "checkout_row" in payload)) {
             const authoritativeCase = computeLostCaseDetails(
               payload.checkin_row || null,
@@ -1959,15 +1906,30 @@
               payload.plate_number || row["Biển số"]
             );
             renderLostVehicleModalCase(authoritativeCase);
+            return;
           }
         }
       } catch (_) {
-        // Giữ nguyên dữ liệu localCase nếu lỗi mạng tạm thời
+        if (reqId !== lostCaseReqSeq || !isLostModalOpen) return;
       }
+    }
+
+    if (reqId === lostCaseReqSeq && isLostModalOpen) {
+      const isOut =
+        String(row.direction_code || "").toUpperCase() === "OUT" ||
+        String(row["Luồng"] || "").includes("Ra");
+      const fallbackCase = computeLostCaseDetails(
+        isOut ? null : row,
+        isOut ? row : null,
+        row["Biển số"]
+      );
+      renderLostVehicleModalCase(fallbackCase);
     }
   }
 
   function closeSnapshotModal() {
+    isLostModalOpen = false;
+    lostCaseReqSeq += 1;
     if (!snapshotModal) return;
     snapshotModal.classList.add("hidden");
   }
@@ -2061,7 +2023,7 @@
       ledgerCountText.textContent = `${cachedMatchedCount} / ${cachedTotalRecords}`;
     }
 
-    const totalItems = cachedHistoryRecords.length;
+    const totalItems = cachedMatchedCount;
     const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
     if (currentPage > totalPages) {
       currentPage = totalPages;
@@ -2070,7 +2032,7 @@
       currentPage = 1;
     }
 
-    if (totalItems === 0) {
+    if (totalItems === 0 || cachedHistoryRecords.length === 0) {
       historyTableBody.innerHTML = `
         <tr>
           <td colspan="6">Không có bản ghi nào khớp điều kiện lọc.</td>
@@ -2080,8 +2042,14 @@
       return;
     }
 
-    const startOffset = (currentPage - 1) * pageSize;
-    const pageSlice = cachedHistoryRecords.slice(startOffset, startOffset + pageSize);
+    // Hỗ trợ cả hai chế độ: server đã cắt đúng trang (<= pageSize) hoặc mảng nhiều trang
+    const pageSlice =
+      cachedHistoryRecords.length > pageSize
+        ? cachedHistoryRecords.slice(
+            (currentPage - 1) * pageSize,
+            (currentPage - 1) * pageSize + pageSize
+          )
+        : cachedHistoryRecords;
 
     historyTableBody.innerHTML = pageSlice
       .map(
@@ -2112,7 +2080,7 @@
       const targetPage = parseInt(btn.getAttribute("data-page") || "1", 10);
       if (!Number.isNaN(targetPage) && targetPage !== currentPage) {
         currentPage = targetPage;
-        renderHistoryTable(cachedHistoryRecords, cachedMatchedCount, cachedTotalRecords);
+        fetchManagementOverview();
       }
     });
   }
@@ -2122,11 +2090,11 @@
       const val = parseInt(pageSizeSelect.value || "10", 10);
       pageSize = Number.isNaN(val) || val < 1 ? 10 : val;
       currentPage = 1;
-      renderHistoryTable(cachedHistoryRecords, cachedMatchedCount, cachedTotalRecords);
+      fetchManagementOverview();
     });
   }
 
-  function applyManagementData(data) {
+  function applyManagementData(data, includeRecords = true) {
     const records = data.records || [];
     const stats = data.stats || {
       total_records: records.length,
@@ -2153,30 +2121,54 @@
       showBanner(managementAlertBox, "", "");
     }
 
-    const matched = typeof data.matched === "number" ? data.matched : records.length;
-    renderHistoryTable(records, matched, stats.total_records ?? 0);
+    if (includeRecords) {
+      const matched = typeof data.matched === "number" ? data.matched : records.length;
+      renderHistoryTable(records, matched, stats.total_records ?? 0);
+    }
   }
 
   async function fetchManagementOverview() {
+    const reqSeq = ++overviewReqSeq;
+    if (overviewAbortCtrl && typeof overviewAbortCtrl.abort === "function") {
+      try {
+        overviewAbortCtrl.abort();
+      } catch (_) {}
+    }
+    overviewAbortCtrl =
+      typeof AbortController === "function" ? new AbortController() : null;
+
+    const isRevenueOnly = activeViewId === "view-revenue";
     const query = (searchPlateInput.value || "").trim();
     const params = new URLSearchParams();
-    if (query) params.set("q", query);
-    if (activeStatusFilter && activeStatusFilter !== "all") {
-      params.set("status", activeStatusFilter);
+    if (isRevenueOnly) {
+      params.set("include_records", "false");
+    } else {
+      if (query) params.set("q", query);
+      if (activeStatusFilter && activeStatusFilter !== "all") {
+        params.set("status", activeStatusFilter);
+      }
+      params.set("page", String(currentPage));
+      params.set("page_size", String(pageSize));
     }
-    params.set("limit", "200");
     const qs = params.toString();
     const url = `/api/management/overview?${qs}`;
 
     try {
-      const res = await fetch(url);
+      const fetchOpts = overviewAbortCtrl
+        ? { signal: overviewAbortCtrl.signal }
+        : undefined;
+      const res = await fetch(url, fetchOpts);
+      if (reqSeq !== overviewReqSeq) return;
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
+      if (reqSeq !== overviewReqSeq) return;
       if (typeof data.records_version === "number") {
         lastRecordsVersion = data.records_version;
       }
-      applyManagementData(data);
-    } catch {
+      applyManagementData(data, !isRevenueOnly);
+    } catch (err) {
+      if (err && err.name === "AbortError") return;
+      if (reqSeq !== overviewReqSeq) return;
       showBanner(managementAlertBox, "error", "Không kết nối được tới máy chủ FastAPI.");
     }
   }
@@ -2370,13 +2362,44 @@
       }, 280);
       return { mode: "popup", html: fullHtml };
     }
+
+    // Fallback khi trình duyệt chặn Popup: tạo <iframe> ẩn và gọi contentWindow.print() trên đúng mẫu A4 nền trắng
+    if (document && typeof document.createElement === "function" && document.body) {
+      const iframe = document.createElement("iframe");
+      iframe.style.cssText =
+        "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden;";
+      document.body.appendChild(iframe);
+      const idoc =
+        iframe.contentDocument ||
+        (iframe.contentWindow && iframe.contentWindow.document);
+      if (idoc) {
+        idoc.open();
+        idoc.write(fullHtml);
+        idoc.close();
+      }
+      setTimeout(() => {
+        try {
+          if (iframe.contentWindow) {
+            iframe.contentWindow.focus();
+            iframe.contentWindow.print();
+          }
+        } catch (_) {}
+        setTimeout(() => {
+          try {
+            iframe.remove();
+          } catch (_) {}
+        }, 1000);
+      }, 280);
+      return { mode: "iframe", html: fullHtml };
+    }
+
     if (typeof window.print === "function") {
       window.print();
     }
     return { mode: "fallback", html: fullHtml };
   }
 
-  function exportHistoryPdfReport() {
+  async function exportHistoryPdfReport() {
     const filterNameMap = {
       all: "Tất cả bản ghi",
       in_parking: "Đang gửi trong bãi",
@@ -2384,26 +2407,48 @@
       direction_out: "Lượt ra bãi",
     };
     const filterLabel = filterNameMap[activeStatusFilter] || "Tất cả bản ghi";
-    const searchQuery = (searchPlateInput && searchPlateInput.value || "").trim();
+    const searchQuery = ((searchPlateInput && searchPlateInput.value) || "").trim();
     const inParkingVal = (statInParking && statInParking.textContent) || "0";
     const todayVal = (statTodayRecords && statTodayRecords.textContent) || "0";
     const totalVal = (statTotalRecords && statTotalRecords.textContent) || "0";
 
+    let recordsForPdf = cachedHistoryRecords;
+    let totalMatchedForPdf = cachedMatchedCount || cachedHistoryRecords.length;
+    try {
+      const params = new URLSearchParams();
+      if (searchQuery) params.set("q", searchQuery);
+      if (activeStatusFilter && activeStatusFilter !== "all") {
+        params.set("status", activeStatusFilter);
+      }
+      params.set("limit", "200");
+      const res = await fetch(`/api/management/overview?${params.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.records) && data.records.length > 0) {
+          recordsForPdf = data.records;
+          totalMatchedForPdf =
+            typeof data.matched === "number" ? data.matched : data.records.length;
+        }
+      }
+    } catch (_) {}
+
     const rowsHtml =
-      cachedHistoryRecords.length === 0
+      recordsForPdf.length === 0
         ? `<tr><td colspan="6">Không có bản ghi nào khớp điều kiện lọc.</td></tr>`
-        : cachedHistoryRecords
+        : recordsForPdf
             .map((row) => {
-              const { plateImg, faceImg } = getRowSnapshots(row);
+              const snap = getRowSnapshots(row);
+              const imgHtml =
+                snap.hasRealPlate || snap.hasRealFace
+                  ? `<span class="thumb-pair">
+                      ${snap.hasRealPlate ? `<img class="thumb-plate" src="${snap.realPlateImg}" alt="Biển số" />` : `<span>Không có ảnh biển</span>`}
+                      ${snap.hasRealFace ? `<img class="thumb-face" src="${snap.realFaceImg}" alt="Khuôn mặt" />` : `<span>Không có ảnh mặt</span>`}
+                    </span>`
+                  : "Không có ảnh lưu trữ";
               return `
                 <tr>
                   <td><strong>${escapeHtml(row["Biển số"])}</strong></td>
-                  <td>
-                    <span class="thumb-pair">
-                      <img class="thumb-plate" src="${plateImg}" alt="Biển số" />
-                      <img class="thumb-face" src="${faceImg}" alt="Khuôn mặt" />
-                    </span>
-                  </td>
+                  <td>${imgHtml}</td>
                   <td>${escapeHtml(row["Luồng"])}</td>
                   <td>${escapeHtml(row["Đối chiếu"] || "-")}</td>
                   <td class="n">${escapeHtml(row["Thời gian nhận diện"])}</td>
@@ -2412,6 +2457,11 @@
               `;
             })
             .join("");
+
+    const limitNote =
+      totalMatchedForPdf > recordsForPdf.length
+        ? ` (hiển thị ${recordsForPdf.length}/${totalMatchedForPdf} bản ghi mới nhất)`
+        : "";
 
     const bodyHtml = `
       <header class="report-header">
@@ -2442,7 +2492,7 @@
         </div>
         <div class="kpi-box">
           <span class="kpi-box-label">Số bản ghi trong báo cáo</span>
-          <strong class="kpi-box-val">${escapeHtml(cachedHistoryRecords.length)}</strong>
+          <strong class="kpi-box-val">${escapeHtml(recordsForPdf.length)}${escapeHtml(limitNote)}</strong>
         </div>
       </div>
 
@@ -2570,11 +2620,11 @@
           <div>Biển số: <strong>${escapeHtml(c.plateNumber)}</strong></div>
           <div class="case-img-box">
             <div>Ảnh biển số Check-in</div>
-            <img src="${c.checkinSnap.plateImg}" alt="Biển số lúc vào" />
+            ${c.checkinSnap.realPlateImg ? `<img src="${c.checkinSnap.realPlateImg}" alt="Biển số lúc vào" />` : `<p>Không có ảnh lưu trữ</p>`}
           </div>
           <div class="case-img-box">
             <div>Ảnh khuôn mặt Người gửi xe</div>
-            <img src="${c.checkinSnap.faceImg}" alt="Người gửi xe" />
+            ${c.checkinSnap.realFaceImg ? `<img src="${c.checkinSnap.realFaceImg}" alt="Người gửi xe" />` : `<p>Không có ảnh lưu trữ</p>`}
           </div>
         </div>
 
@@ -2587,7 +2637,7 @@
             c.checkoutSnap
               ? `<div class="case-img-box">
                   <div>Ảnh biển số Check-out</div>
-                  <img src="${c.checkoutSnap.plateImg}" alt="Biển số lúc ra" />
+                  ${c.checkoutSnap.realPlateImg ? `<img src="${c.checkoutSnap.realPlateImg}" alt="Biển số lúc ra" />` : `<p>Không có ảnh lưu trữ</p>`}
                 </div>`
               : `<p>${c.sessionClosedMissingExit ? "Phiên đã đóng, thiếu thông tin lượt ra." : "Chưa ghi nhận lượt Check-out qua cổng."}</p>`
           }
@@ -2600,7 +2650,7 @@
             c.checkoutSnap
               ? `<div class="case-img-box">
                   <div>Ảnh khuôn mặt Người lấy xe</div>
-                  <img src="${c.checkoutSnap.faceImg}" alt="Người lấy xe" />
+                  ${c.checkoutSnap.realFaceImg ? `<img src="${c.checkoutSnap.realFaceImg}" alt="Người lấy xe" />` : `<p>Không có ảnh lưu trữ</p>`}
                 </div>`
               : `<p>Chưa có ảnh Người lấy xe.</p>`
           }

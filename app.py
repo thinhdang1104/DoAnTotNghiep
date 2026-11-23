@@ -5,6 +5,7 @@ và API thực sự vẫn là FastAPI trong `main.py`, được gắn trực ti�
 Chạy cục bộ thì dùng `python main.py` như bình thường.
 """
 
+import atexit
 import os
 import subprocess
 import sys
@@ -86,8 +87,20 @@ with gr.Blocks(title="Hệ thống Quản lý Bãi giữ xe AI (2 Camera)") as d
     warmup_btn.click(fn=_gpu_warmup, inputs=[], outputs=[warmup_out])
 
 
+def _shutdown_backend_services() -> None:
+    try:
+        state.stop_cameras()
+    except Exception:
+        pass
+    try:
+        state.stop_db_writer()
+    except Exception:
+        pass
+
+
 def _init_backend_services() -> None:
     """Tương đương `lifespan` của FastAPI (lifespan không chạy khi route được gắn vào Gradio)."""
+    atexit.register(_shutdown_backend_services)
     state.startup()
 
 

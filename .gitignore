@@ -4,7 +4,7 @@ __pycache__/
 *.pyo
 .env
 
-# Runtime data (bản ghi chờ đồng bộ MySQL)
+# Runtime data (ảnh snapshot tùy chọn trên đĩa)
 data/
 
 # Training outputs
@@ -22,7 +22,6 @@ last.pt
 
 # Công cụ thiết kế / agent
 .agents/
-.taste-skill/
 skills-lock.json
 GEMINI.md
 

@@ -136,6 +136,13 @@ python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 Mở trình duyệt truy cập: **`http://127.0.0.1:8000`**, bấm **"Tìm camera"**, cấp quyền truy cập camera trên trình duyệt và chọn thiết bị từ dropdown cho **Cam 1** và **Cam 2**.
 
+### Bước 4: Đẩy bản cập nhật lên Hugging Face Space (Tùy chọn)
+Khi cần cập nhật mã nguồn và trọng số lên Hugging Face Space (`MinhThinh/DoAn`), cài thêm `huggingface_hub` và chạy [`deploy_hf.py`](deploy_hf.py):
+```bash
+pip install huggingface_hub
+python deploy_hf.py
+```
+
 ---
 
 ## 5. Công nghệ sử dụng

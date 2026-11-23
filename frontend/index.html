@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=20261121b" />
+  <link rel="stylesheet" href="styles.css?v=20261123a" />
 </head>
 <body>
   <div class="app-shell">
@@ -166,7 +166,6 @@
                 <span class="hud-corner bl" aria-hidden="true"></span>
                 <span class="hud-corner br" aria-hidden="true"></span>
 
-                <img id="cam1-stream-img" class="camera-stream hidden" alt="Luồng hình Cam 1" />
                 <video id="cam1-live-video" class="camera-stream hidden" playsinline muted autoplay></video>
                 <canvas id="cam1-overlay-canvas" class="camera-overlay-canvas hidden"></canvas>
                 <div id="cam1-placeholder" class="camera-standby">
@@ -211,7 +210,6 @@
                 <span class="hud-corner bl" aria-hidden="true"></span>
                 <span class="hud-corner br" aria-hidden="true"></span>
 
-                <img id="cam2-stream-img" class="camera-stream hidden" alt="Luồng hình Cam 2" />
                 <video id="cam2-live-video" class="camera-stream hidden" playsinline muted autoplay></video>
                 <canvas id="cam2-overlay-canvas" class="camera-overlay-canvas hidden"></canvas>
                 <div id="cam2-placeholder" class="camera-standby">
@@ -378,7 +376,7 @@
             </div>
 
             <div class="revenue-header-actions">
-              <div class="cam-switcher" role="tablist" aria-label="Chu kỳ thống kê doanh thu">
+              <div class="cam-switcher" role="group" aria-label="Chu kỳ thống kê doanh thu">
                 <button
                   type="button"
                   class="cam-switch-btn rev-period-btn"
@@ -515,12 +513,14 @@
                 <span class="snapshot-box-label">Biển số Check-in</span>
                 <div class="snapshot-img-frame small-frame">
                   <img id="modal-plate-img" src="" alt="Ảnh biển số lúc vào" />
+                  <span id="checkin-plate-empty" class="snapshot-empty-hint hidden">Không có ảnh lưu trữ</span>
                 </div>
               </div>
               <div class="snapshot-box">
                 <span class="snapshot-box-label">Người gửi xe (Check-in)</span>
                 <div class="snapshot-img-frame small-frame">
                   <img id="modal-face-img" src="" alt="Ảnh khuôn mặt người gửi xe" />
+                  <span id="checkin-face-empty" class="snapshot-empty-hint hidden">Không có ảnh lưu trữ</span>
                 </div>
               </div>
             </div>
@@ -575,6 +575,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261121b"></script>
+  <script src="app.js?v=20261123a"></script>
 </body>
 </html>

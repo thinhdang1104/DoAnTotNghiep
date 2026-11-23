@@ -1,10 +1,12 @@
 import math
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import mysql.connector
 from mysql.connector import Error as MySQLError
+from mysql.connector import pooling
 from dotenv import load_dotenv
 
 from face_service import (
@@ -21,6 +23,10 @@ load_dotenv(BASE_DIR / ".env")
 HISTORY_LIMIT = 200
 PARKING_FEE_VND = 2000  # 2.000 VNĐ / lượt giữ xe
 VN_TZ = timezone(timedelta(hours=7))
+
+_POOL_LOCK = threading.Lock()
+_MYSQL_POOL: pooling.MySQLConnectionPool | None = None
+_POOL_CONFIG_KEY: tuple | None = None
 
 
 def now_vn() -> datetime:
@@ -63,9 +69,34 @@ def _connection_config():
 
 
 def _connect_mysql():
+    global _MYSQL_POOL, _POOL_CONFIG_KEY
     config = _connection_config()
+    cfg_key = (
+        config["host"],
+        config["port"],
+        config["user"],
+        config["password"],
+        config["database"],
+    )
     try:
-        return mysql.connector.connect(**config)
+        with _POOL_LOCK:
+            if _MYSQL_POOL is None or _POOL_CONFIG_KEY != cfg_key:
+                _MYSQL_POOL = pooling.MySQLConnectionPool(
+                    pool_name="datn_mysql_pool",
+                    pool_size=6,
+                    pool_reset_session=True,
+                    **config,
+                )
+                _POOL_CONFIG_KEY = cfg_key
+            pool = _MYSQL_POOL
+
+        try:
+            conn = pool.get_connection()
+            conn.ping(reconnect=True, attempts=1, delay=0)
+            return conn
+        except pooling.PoolError:
+            # Khi pool tạm thời cạn kết nối -> mở kết nối trực tiếp dự phòng thay vì báo lỗi mất DB
+            return mysql.connector.connect(**config)
     except MySQLError as error:
         raise DatabaseOperationError(str(error)) from error
 
@@ -76,6 +107,7 @@ def _ensure_mysql_table(cursor):
         CREATE TABLE IF NOT EXISTS plate_recognition_history (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
             plate_number VARCHAR(32) NOT NULL,
+            plate_key VARCHAR(32) NULL,
             direction VARCHAR(8) NOT NULL DEFAULT 'IN',
             parking_status VARCHAR(16) NOT NULL DEFAULT 'IN_PARKING',
             entry_record_id BIGINT UNSIGNED NULL,
@@ -95,7 +127,9 @@ def _ensure_mysql_table(cursor):
             INDEX idx_plate_recognized_at (plate_number, recognized_at),
             INDEX idx_recognized_at (recognized_at),
             INDEX idx_plate_status (plate_number, parking_status),
-            INDEX idx_status_dir (parking_status, direction)
+            INDEX idx_status_dir (parking_status, direction),
+            INDEX idx_plate_key_dir_status (plate_key, direction, parking_status),
+            INDEX idx_entry_record_id (entry_record_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """
     )
@@ -105,6 +139,11 @@ def _ensure_mysql_table(cursor):
         row["Field"] if isinstance(row, dict) else row[0] for row in cursor.fetchall()
     }
     column_migrations = [
+        (
+            "plate_key",
+            "ALTER TABLE plate_recognition_history "
+            "ADD COLUMN plate_key VARCHAR(32) NULL AFTER plate_number",
+        ),
         (
             "direction",
             "ALTER TABLE plate_recognition_history "
@@ -158,6 +197,11 @@ def _ensure_mysql_table(cursor):
             cursor.execute(ddl)
 
     cursor.execute(
+        "UPDATE plate_recognition_history "
+        "SET plate_key = UPPER(REPLACE(REPLACE(plate_number, '-', ''), '.', '')) "
+        "WHERE plate_key IS NULL OR plate_key = ''"
+    )
+    cursor.execute(
         "UPDATE plate_recognition_history SET fee_amount = 0 WHERE direction = 'OUT' AND fee_amount <> 0"
     )
 
@@ -180,6 +224,16 @@ def _ensure_mysql_table(cursor):
         cursor.execute(
             "ALTER TABLE plate_recognition_history "
             "ADD INDEX idx_status_dir (parking_status, direction)"
+        )
+    if "idx_plate_key_dir_status" not in existing_indexes:
+        cursor.execute(
+            "ALTER TABLE plate_recognition_history "
+            "ADD INDEX idx_plate_key_dir_status (plate_key, direction, parking_status)"
+        )
+    if "idx_entry_record_id" not in existing_indexes:
+        cursor.execute(
+            "ALTER TABLE plate_recognition_history "
+            "ADD INDEX idx_entry_record_id (entry_record_id)"
         )
 
 
@@ -224,18 +278,18 @@ def _build_demo_records_list() -> list[dict]:
     now = now_vn()
     records: list[dict] = []
 
-    # 1. Các lượt xe hoàn tất ở các tháng/ngày trước (để báo cáo Năm & Tháng sinh động)
+    # 1. Các lượt xe hoàn tất ở các tháng/ngày trước (định dạng chuẩn normalize_plate không dấu chấm)
     historical_completed = [
-        ("59H1-304.88", 42, 180, 5, 5, 1.00, 0.98, 0.94, 1),
-        ("60F2-719.25", 38, 210, 4, 5, 0.80, 0.97, 0.92, 2),
-        ("59N2-841.60", 32, 145, 5, 6, 0.83, 0.99, 0.96, 3),
-        ("71B3-209.14", 18, 195, 5, 5, 1.00, 0.96, 0.91, 4),
-        ("59T1-662.39", 12, 160, 4, 5, 0.80, 0.98, 0.95, 5),
-        ("61G1-530.72", 7, 240, 5, 5, 1.00, 0.97, 0.93, 6),
-        ("59K2-194.55", 4, 175, 5, 6, 0.83, 0.99, 0.97, 7),
-        ("62L1-883.07", 2, 150, 5, 5, 1.00, 0.96, 0.92, 8),
-        ("59U1-417.90", 1, 200, 4, 5, 0.80, 0.98, 0.94, 9),
-        ("59D2-756.31", 1, 130, 5, 5, 1.00, 0.97, 0.95, 10),
+        ("59H1-30488", 42, 180, 5, 5, 1.00, 0.98, 0.94, 1),
+        ("60F2-71925", 38, 210, 4, 5, 0.80, 0.97, 0.92, 2),
+        ("59N2-84160", 32, 145, 5, 6, 0.83, 0.99, 0.96, 3),
+        ("71B3-20914", 18, 195, 5, 5, 1.00, 0.96, 0.91, 4),
+        ("59T1-66239", 12, 160, 4, 5, 0.80, 0.98, 0.95, 5),
+        ("61G1-53072", 7, 240, 5, 5, 1.00, 0.97, 0.93, 6),
+        ("59K2-19455", 4, 175, 5, 6, 0.83, 0.99, 0.97, 7),
+        ("62L1-88307", 2, 150, 5, 5, 1.00, 0.96, 0.92, 8),
+        ("59U1-41790", 1, 200, 4, 5, 0.80, 0.98, 0.94, 9),
+        ("59D2-75631", 1, 130, 5, 5, 1.00, 0.97, 0.95, 10),
     ]
     for plate, days_ago, dur_min, vc, sc, rate, f_conf, m_score, s_idx in historical_completed:
         in_time = (now - timedelta(days=days_ago, hours=4, minutes=dur_min)).replace(
@@ -251,12 +305,12 @@ def _build_demo_records_list() -> list[dict]:
 
     # 2. Các lượt xe đã gửi và đã lấy xe RA trong ngày HÔM NAY
     today_completed = [
-        ("59A3-128.45", 240, 55, 5, 5, 1.00, 0.99, 0.96, 21),
-        ("59G2-604.12", 215, 50, 4, 5, 0.80, 0.97, 0.93, 22),
-        ("60B1-889.30", 185, 45, 5, 6, 0.83, 0.98, 0.95, 23),
-        ("61C1-442.78", 155, 40, 5, 5, 1.00, 0.96, 0.91, 24),
-        ("72D1-319.56", 125, 35, 5, 5, 1.00, 0.99, 0.97, 25),
-        ("59P2-910.23", 95, 30, 4, 5, 0.80, 0.98, 0.94, 26),
+        ("59A3-12845", 240, 55, 5, 5, 1.00, 0.99, 0.96, 21),
+        ("59G2-60412", 215, 50, 4, 5, 0.80, 0.97, 0.93, 22),
+        ("60B1-88930", 185, 45, 5, 6, 0.83, 0.98, 0.95, 23),
+        ("61C1-44278", 155, 40, 5, 5, 1.00, 0.96, 0.91, 24),
+        ("72D1-31956", 125, 35, 5, 5, 1.00, 0.99, 0.97, 25),
+        ("59P2-91023", 95, 30, 4, 5, 0.80, 0.98, 0.94, 26),
     ]
     for plate, in_mins_ago, out_mins_ago, vc, sc, rate, f_conf, m_score, s_idx in today_completed:
         in_time = now - timedelta(minutes=in_mins_ago)
@@ -274,12 +328,12 @@ def _build_demo_records_list() -> list[dict]:
 
     # 3. Các xe hiện ĐANG GỬI TRONG BÃI (IN_PARKING) hôm nay
     active_in_parking = [
-        ("59S2-482.19", 72, 5, 5, 1.00, 0.99, 31),
-        ("59X3-715.04", 58, 5, 6, 0.83, 0.97, 32),
-        ("60B8-339.62", 44, 4, 5, 0.80, 0.98, 33),
-        ("61D1-904.27", 31, 5, 5, 1.00, 0.96, 34),
-        ("72C1-558.11", 19, 5, 5, 1.00, 0.99, 35),
-        ("49E1-267.85", 8, 4, 5, 0.80, 0.98, 36),
+        ("59S2-48219", 72, 5, 5, 1.00, 0.99, 31),
+        ("59X3-71504", 58, 5, 6, 0.83, 0.97, 32),
+        ("60B8-33962", 44, 4, 5, 0.80, 0.98, 33),
+        ("61D1-90427", 31, 5, 5, 1.00, 0.96, 34),
+        ("72C1-55811", 19, 5, 5, 1.00, 0.99, 35),
+        ("49E1-26785", 8, 4, 5, 0.80, 0.98, 36),
     ]
     for plate, mins_ago, vc, sc, rate, f_conf, s_idx in active_in_parking:
         in_time = now - timedelta(minutes=mins_ago)
@@ -303,14 +357,14 @@ def seed_demo_records_if_empty() -> int:
     if not _demo_seeding_enabled():
         return 0
 
-    marker_plate = "59S2-482.19"
+    marker_key = "59S248219"
     try:
         connection = _connect_mysql()
         cursor = connection.cursor()
         try:
             cursor.execute(
-                "SELECT COUNT(*) FROM plate_recognition_history WHERE plate_number = %s",
-                (marker_plate,),
+                "SELECT COUNT(*) FROM plate_recognition_history WHERE plate_key = %s",
+                (marker_key,),
             )
             row = cursor.fetchone()
             if row and int(row[0]) > 0:
@@ -458,7 +512,7 @@ def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
             """
             SELECT id, plate_number, recognized_at, face_embedding
             FROM plate_recognition_history
-            WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+            WHERE plate_key = %s
               AND direction = 'IN'
               AND parking_status = 'IN_PARKING'
             ORDER BY recognized_at DESC, id DESC
@@ -498,39 +552,6 @@ def _find_last_embedding_mysql(cursor, plate_number: str) -> tuple[int | None, l
     if active:
         return active["id"], active.get("embedding")
     return None, None
-
-
-def verify_checkout_face(
-    plate_number: str, exit_embedding: list[float] | None
-) -> dict:
-    active = find_active_parking_session(plate_number)
-    if active is None:
-        return {
-            "has_active_session": False,
-            "entry_id": None,
-            "entry_time": None,
-            "match_score": None,
-            "matched": True,
-        }
-
-    entry_emb = active.get("embedding")
-    if not exit_embedding or not entry_emb:
-        return {
-            "has_active_session": True,
-            "entry_id": active["id"],
-            "entry_time": active["recognized_at"],
-            "match_score": None,
-            "matched": False,
-        }
-
-    score = max(-1.0, min(1.0, cosine_similarity(exit_embedding, entry_emb)))
-    return {
-        "has_active_session": True,
-        "entry_id": active["id"],
-        "entry_time": active["recognized_at"],
-        "match_score": score,
-        "matched": score >= FACE_MATCH_THRESHOLD,
-    }
 
 
 def _fetch_revenue_report_mysql(cursor) -> dict:
@@ -656,10 +677,13 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
 def fetch_overview(
     query: str = "",
     status_filter: str = "all",
-    limit: int = HISTORY_LIMIT,
+    limit: int | None = None,
+    page: int = 1,
+    page_size: int = 10,
+    include_records: bool = True,
     include_stats_and_revenue: bool = True,
 ):
-    """Thống kê toàn bộ bảng + báo cáo doanh thu Ngày/Tháng/Năm + danh sách bản ghi."""
+    """Thống kê toàn bộ bảng + báo cáo doanh thu Ngày/Tháng/Năm + danh sách bản ghi phân trang."""
     connection = _connect_mysql()
     cursor = connection.cursor(dictionary=True)
     try:
@@ -674,15 +698,13 @@ def fetch_overview(
                     COALESCE(SUM(recognized_at >= %s), 0) AS today,
                     COALESCE(SUM(direction = 'IN' AND parking_status = 'IN_PARKING'), 0) AS in_parking,
                     COALESCE(SUM(direction = 'IN'), 0) AS total_in,
-                    COALESCE(SUM(direction = 'OUT'), 0) AS total_out,
-                    COALESCE(SUM(face_detected = 1), 0) AS with_face
+                    COALESCE(SUM(direction = 'OUT'), 0) AS total_out
                 FROM plate_recognition_history
                 """,
                 (today_start,),
             )
             stats_row = cursor.fetchone() or {}
             total = int(stats_row.get("total") or 0)
-            with_face = int(stats_row.get("with_face") or 0)
             in_parking = int(stats_row.get("in_parking") or 0)
             total_in = int(stats_row.get("total_in") or 0)
             total_out = int(stats_row.get("total_out") or 0)
@@ -692,19 +714,22 @@ def fetch_overview(
                 "in_parking": in_parking,
                 "total_in": total_in,
                 "total_out": total_out,
-                "with_face": with_face,
-                "no_face": total - with_face,
-                "face_rate": round(with_face / total * 100) if total else 0,
             }
             revenue_report = _fetch_revenue_report_mysql(cursor)
+
+        if not include_records:
+            return {
+                "stats": stats_payload,
+                "revenue": revenue_report,
+                "matched": 0,
+                "records": [],
+            }
 
         conditions = []
         params = []
         normalized_query = _normalize_search(query)
         if normalized_query:
-            conditions.append(
-                "REPLACE(REPLACE(plate_number, '-', ''), '.', '') LIKE %s"
-            )
+            conditions.append("plate_key LIKE %s")
             params.append(f"%{normalized_query}%")
 
         if status_filter == "in_parking":
@@ -713,10 +738,6 @@ def fetch_overview(
             conditions.append("direction = 'IN'")
         elif status_filter == "direction_out":
             conditions.append("direction = 'OUT'")
-        elif status_filter == "with_face":
-            conditions.append("face_detected = 1")
-        elif status_filter == "no_face":
-            conditions.append("face_detected = 0")
 
         where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
@@ -725,6 +746,14 @@ def fetch_overview(
             params,
         )
         matched = int((cursor.fetchone() or {}).get("matched") or 0)
+
+        if limit is not None:
+            effective_limit = max(1, int(limit))
+            effective_offset = 0
+        else:
+            effective_limit = max(1, int(page_size))
+            safe_page = max(1, int(page))
+            effective_offset = (safe_page - 1) * effective_limit
 
         cursor.execute(
             f"""
@@ -736,9 +765,9 @@ def fetch_overview(
             FROM plate_recognition_history
             {where_sql}
             ORDER BY recognized_at DESC, id DESC
-            LIMIT %s
+            LIMIT %s OFFSET %s
             """,
-            [*params, int(limit)],
+            [*params, effective_limit, effective_offset],
         )
         records = [format_record_row(row["id"], row) for row in cursor.fetchall()]
 
@@ -760,7 +789,7 @@ def fetch_parking_session_case(record_id: int) -> dict | None:
     connection = _connect_mysql()
     cursor = connection.cursor(dictionary=True)
     select_cols = """
-        SELECT id, plate_number, direction, parking_status, entry_record_id,
+        SELECT id, plate_number, plate_key, direction, parking_status, entry_record_id,
                fee_amount, recognized_at, vote_count, sample_count,
                consensus_rate, face_detected, face_confidence,
                face_embedding IS NOT NULL AS face_embedding, face_match_score,
@@ -784,11 +813,13 @@ def fetch_parking_session_case(record_id: int) -> dict | None:
                 cursor.execute(f"{select_cols} WHERE id = %s LIMIT 1", (int(entry_id),))
                 checkin_raw = cursor.fetchone()
             if checkin_raw is None:
-                norm_plate = _normalize_search(target.get("plate_number") or "")
+                norm_plate = target.get("plate_key") or _normalize_search(
+                    target.get("plate_number") or ""
+                )
                 cursor.execute(
                     f"""
                     {select_cols}
-                    WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+                    WHERE plate_key = %s
                       AND direction = 'IN'
                       AND (recognized_at < %s OR (recognized_at = %s AND id < %s))
                     ORDER BY recognized_at DESC, id DESC
@@ -816,12 +847,14 @@ def fetch_parking_session_case(record_id: int) -> dict | None:
             checkout_raw = cursor.fetchone()
 
             if checkout_raw is None:
-                norm_plate = _normalize_search(target.get("plate_number") or "")
+                norm_plate = target.get("plate_key") or _normalize_search(
+                    target.get("plate_number") or ""
+                )
                 cursor.execute(
                     """
                     SELECT id, recognized_at
                     FROM plate_recognition_history
-                    WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+                    WHERE plate_key = %s
                       AND direction = 'IN'
                       AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
                     ORDER BY recognized_at ASC, id ASC
@@ -839,7 +872,7 @@ def fetch_parking_session_case(record_id: int) -> dict | None:
                     cursor.execute(
                         f"""
                         {select_cols}
-                        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+                        WHERE plate_key = %s
                           AND direction = 'OUT'
                           AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
                           AND (recognized_at < %s OR (recognized_at = %s AND id < %s))
@@ -860,7 +893,7 @@ def fetch_parking_session_case(record_id: int) -> dict | None:
                     cursor.execute(
                         f"""
                         {select_cols}
-                        WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+                        WHERE plate_key = %s
                           AND direction = 'OUT'
                           AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
                         ORDER BY recognized_at ASC, id ASC
@@ -924,6 +957,7 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
         embedding = record.get("face_embedding")
         match_score = record.get("face_match_score")
         entry_id = record.get("entry_record_id")
+        plate_key = _normalize_search(record["plate_number"])
 
         if direction == "OUT":
             parking_status = "EXITED"
@@ -947,25 +981,26 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
             """
             UPDATE plate_recognition_history
             SET parking_status = 'COMPLETED'
-            WHERE REPLACE(REPLACE(plate_number, '-', ''), '.', '') = %s
+            WHERE plate_key = %s
               AND direction = 'IN'
               AND parking_status = 'IN_PARKING'
             """,
-            (_normalize_search(record["plate_number"]),),
+            (plate_key,),
         )
 
         cursor.execute(
             """
             INSERT INTO plate_recognition_history (
-                plate_number, direction, parking_status, entry_record_id,
+                plate_number, plate_key, direction, parking_status, entry_record_id,
                 fee_amount, recognized_at, vote_count, sample_count,
                 consensus_rate, face_detected, face_confidence,
                 face_embedding, face_match_score, plate_image, face_image, camera_index
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 record["plate_number"],
+                plate_key,
                 direction,
                 parking_status,
                 entry_id,
