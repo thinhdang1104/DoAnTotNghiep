@@ -45,27 +45,31 @@ CHAR_MODEL_PATH = BASE_DIR / "weights" / "chars_best.pt"
 
 CONF_PLATE = 0.40
 CONF_CHAR = 0.35
+PLATE_IMGSZ = 512
+CHAR_IMGSZ = 320
 
 # Bỏ phiếu đồng thuận biển số độc lập trên từng Camera
 VOTE_WINDOW_SECONDS = 3.0
-VOTE_SAMPLE_INTERVAL_SECONDS = 0.12
+VOTE_SAMPLE_INTERVAL_SECONDS = 0.08
 VOTE_MIN_SAMPLES = 3
 VOTE_MIN_SHARE = 0.70
+FAST_VOTE_MIN_SAMPLES = 2
+FAST_VOTE_MIN_CHAR_CONF = 0.75
 
 # Cơ chế "Lưu hờ" (Two-Phase Latch): đợi khuôn mặt chuẩn nhất ở Camera đối diện (tối đa 4 giây)
 # Ngưỡng độ nét (Laplacian Variance 128x128 trên vùng lõi 70% mặt):
 # - Ảnh mặt mờ thực tế (media_1794468081037_1e129541.png) đo được = 13.95
-# - Ngưỡng sàn thử nghiệm: FACE_FLOOR_SHARPNESS = 15.0 (chấp nhận sau 0.50s chờ)
-# - Ngưỡng chuẩn: FACE_MIN_SHARPNESS = 22.0 (chấp nhận sau 0.18s lấy mẫu)
-# - Chốt tức thì: FACE_INSTANT_SHARPNESS = 28.0 kèm confidence >= 0.92
+# - Ngưỡng sàn thử nghiệm: FACE_FLOOR_SHARPNESS = 15.0 (chấp nhận sau 0.40s chờ)
+# - Ngưỡng chuẩn / chốt tức thì: FACE_MIN_SHARPNESS = FACE_INSTANT_SHARPNESS = 22.0 kèm confidence >= 0.88
 FACE_MIN_CONFIDENCE = 0.85
+FACE_INSTANT_CONFIDENCE = 0.88
 FACE_FLOOR_SHARPNESS = 15.0
 FACE_MIN_SHARPNESS = 22.0
-FACE_INSTANT_SHARPNESS = 28.0
-FACE_SAMPLE_WINDOW_SECONDS = 0.18
-FACE_MAX_SHARPNESS_WAIT_SECONDS = 0.50
-FACE_PRE_LATCH_LOOKBACK_SECONDS = 0.85
-FACE_RECENT_BUFFER_SECONDS = 1.20
+FACE_INSTANT_SHARPNESS = 22.0
+FACE_SAMPLE_WINDOW_SECONDS = 0.15
+FACE_MAX_SHARPNESS_WAIT_SECONDS = 0.40
+FACE_PRE_LATCH_LOOKBACK_SECONDS = 1.80
+FACE_RECENT_BUFFER_SECONDS = 2.00
 LATCH_TIMEOUT_SECONDS = 4.0
 MAX_BROWSER_FRAME_B64_CHARS = 2_500_000
 
@@ -75,7 +79,7 @@ PLATE_LOST_RESET_SECONDS = 1.5
 PLATE_COOLDOWN_SECONDS = 20.0
 # Khóa ngắn hạn chiều ngược lại ngay sau khi xe vừa hoàn tất VÀO hoặc RA
 # (tránh việc xe chạy qua mặt camera kia khi di chuyển qua cổng bị bắt nhầm chiều ngược lại)
-CROSS_DIRECTION_COOLDOWN_SECONDS = 12.0
+CROSS_DIRECTION_COOLDOWN_SECONDS = 6.0
 FACE_IDLE_EVERY_N_FRAMES = 2
 
 DB_RETRY_SECONDS = 15.0
@@ -268,18 +272,16 @@ def _save_snapshot_to_disk(kind: str, plate_number: str, data_url: str | None) -
         pass
 
 
-def detect_plates(frame, plate_model: YOLO, char_model: YOLO):
-    results = plate_model.predict(
-        frame, conf=CONF_PLATE, iou=0.5, imgsz=640, verbose=False, **_yolo_kwargs()
-    )[0]
+def _extract_plates_from_result(frame, result, char_model: YOLO):
     names = char_model.names
     height, width = frame.shape[:2]
     plate_present = False
     readings: dict[str, str] = {}
+    reading_confs: dict[str, float] = {}
     plate_boxes: list[dict] = []
     plate_crops: dict[str, tuple[float, str]] = {}
 
-    for box in results.boxes:
+    for box in result.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         x1, x2 = max(0, x1), min(width, x2)
         y1, y2 = max(0, y1), min(height, y2)
@@ -289,7 +291,7 @@ def detect_plates(frame, plate_model: YOLO, char_model: YOLO):
         plate_present = True
         crop = frame[y1:y2, x1:x2]
         char_res = char_model.predict(
-            crop, conf=CONF_CHAR, iou=0.5, imgsz=640, verbose=False, **_yolo_kwargs()
+            crop, conf=CONF_CHAR, iou=0.5, imgsz=CHAR_IMGSZ, verbose=False, **_yolo_kwargs()
         )[0]
 
         raw_chars = []
@@ -307,19 +309,25 @@ def detect_plates(frame, plate_model: YOLO, char_model: YOLO):
 
         chars = _deduplicate_chars(raw_chars)
         raw_text = _assemble_plate_text(chars) if chars else ""
+        avg_char_conf = (
+            round(sum(c[3] for c in chars) / len(chars), 4) if chars else 0.0
+        )
 
         normalized = normalize_plate(raw_text)
         label = normalized[1] if normalized else (raw_text or "?")
         if normalized:
-            readings[normalized[0]] = normalized[1]
+            p_key, p_disp = normalized
+            readings[p_key] = p_disp
+            if avg_char_conf > reading_confs.get(p_key, 0.0):
+                reading_confs[p_key] = avg_char_conf
             plate_sharpness = _region_sharpness(frame, (x1, y1, x2, y2))
             crop_url = _crop_to_data_url(
                 frame, (x1, y1, x2, y2), max_w=360, max_h=180, pad_ratio=0.06
             )
             if crop_url:
-                prev = plate_crops.get(normalized[0])
+                prev = plate_crops.get(p_key)
                 if prev is None or plate_sharpness >= prev[0]:
-                    plate_crops[normalized[0]] = (plate_sharpness, crop_url)
+                    plate_crops[p_key] = (plate_sharpness, crop_url)
 
         plate_boxes.append(
             {
@@ -332,23 +340,48 @@ def detect_plates(frame, plate_model: YOLO, char_model: YOLO):
             }
         )
 
+    return plate_present, readings, plate_boxes, plate_crops, reading_confs
+
+
+def detect_plates(frame, plate_model: YOLO, char_model: YOLO):
+    result = plate_model.predict(
+        frame, conf=CONF_PLATE, iou=0.5, imgsz=PLATE_IMGSZ, verbose=False, **_yolo_kwargs()
+    )[0]
+    plate_present, readings, plate_boxes, plate_crops, _ = _extract_plates_from_result(
+        frame, result, char_model
+    )
     return plate_present, readings, plate_boxes, plate_crops
 
 
 def get_vote_result(observations):
     if not observations:
         return None
-    votes = Counter(key for _, key, _ in observations)
+    votes = Counter(item[1] for item in observations)
     key, vote_count = votes.most_common(1)[0]
-    display = Counter(d for _, k, d in observations if k == key).most_common(1)[0][0]
+    display = Counter(item[2] for item in observations if item[1] == key).most_common(1)[0][0]
     return key, display, vote_count, vote_count / len(observations), len(observations)
 
 
-def is_vote_confirmed(vote_result) -> bool:
+def is_vote_confirmed(vote_result, observations=None) -> bool:
     if vote_result is None:
         return False
-    _, _, _, vote_share, sample_count = vote_result
-    return sample_count >= VOTE_MIN_SAMPLES and vote_share >= VOTE_MIN_SHARE
+    key, _, _, vote_share, sample_count = vote_result
+    if sample_count >= VOTE_MIN_SAMPLES and vote_share >= VOTE_MIN_SHARE:
+        return True
+    if (
+        observations is not None
+        and len(observations) >= FAST_VOTE_MIN_SAMPLES
+        and vote_share >= VOTE_MIN_SHARE
+    ):
+        tail = list(observations)[-FAST_VOTE_MIN_SAMPLES:]
+        if all(
+            len(item) >= 4
+            and item[1] == key
+            and float(item[3]) >= FAST_VOTE_MIN_CHAR_CONF
+            for item in tail
+        ):
+            return True
+    return False
 
 
 def _face_score(face: FaceData, frame) -> tuple[float, float]:
@@ -474,7 +507,7 @@ class SystemState:
             "seq": self.feedback_seq,
             "type": fb_type,
             "message": message,
-            "expires_at": time.monotonic() + 2.0,
+            "expires_at": time.monotonic() + 3.0,
         }
 
     def _reset_session_state_locked(self) -> None:
@@ -682,11 +715,12 @@ class SystemState:
             self.writer_thread.join(timeout=timeout)
 
     # ------------------------------------------------- Latch & Security Alert APIs
-    def cancel_latch(self) -> None:
+    def cancel_latch(self) -> dict:
         with self.lock:
             self._clear_latch_locked()
             for cam in self.cams.values():
                 cam.observations.clear()
+        return {"status": "cancelled", "camera_status": self.get_status_payload()}
 
     def resolve_security_alert(self, approve: bool) -> dict:
         if self.writer_stop.is_set():
@@ -695,6 +729,7 @@ class SystemState:
         plate_key = ""
         plate_number = ""
         direction = "OUT"
+        rejected_msg = None
         with self.lock:
             alert = self.security_alert
             if alert is None or self.alert_resolving:
@@ -710,13 +745,20 @@ class SystemState:
             else:
                 self.security_alert = None
                 self.alert_resolving = False
-                msg = f"XE {plate_number} RA BÃI BỊ TỪ CHỐI"
+                rejected_msg = f"XE {plate_number} RA BÃI BỊ TỪ CHỐI"
                 if plate_key:
                     self.recent_confirms.pop(f"{plate_key}:OUT", None)
                 for cam in self.cams.values():
                     cam.observations.clear()
-                self._set_feedback_locked("error", msg)
-                return {"status": "rejected", "message": msg, "type": "error"}
+                self._set_feedback_locked("error", rejected_msg)
+
+        if rejected_msg is not None:
+            return {
+                "status": "rejected",
+                "message": rejected_msg,
+                "type": "error",
+                "camera_status": self.get_status_payload(),
+            }
 
         if record_to_save is not None:
             saved = False
@@ -732,7 +774,12 @@ class SystemState:
                 with self.lock:
                     # Giữ nguyên self.security_alert để bảo vệ có thể bấm duyệt lại ngay khi MySQL phục hồi
                     self._set_feedback_locked("error", err_msg)
-                return {"status": "db_error", "message": err_msg, "type": "error"}
+                return {
+                    "status": "db_error",
+                    "message": err_msg,
+                    "type": "error",
+                    "camera_status": self.get_status_payload(),
+                }
 
             msg = f"XE {plate_number} RA BÃI ĐƯỢC DUYỆT"
             _save_snapshot_to_disk(
@@ -750,7 +797,12 @@ class SystemState:
                 if plate_key:
                     self._lock_plate_cooldown_locked(plate_key, direction, now)
                 self._set_feedback_locked("warn", msg)
-            return {"status": "approved", "message": msg, "type": "warn"}
+            return {
+                "status": "approved",
+                "message": msg,
+                "type": "warn",
+                "camera_status": self.get_status_payload(),
+            }
         return {"status": "none", "message": ""}
 
     # ------------------------------------------------- Camera độc lập (bật/tắt riêng)
@@ -891,17 +943,47 @@ class SystemState:
         run_face_idle: bool,
         is_required_face_cam: bool,
         skip_plate_ocr: bool = False,
+        precomputed_plate_result=None,
     ):
         if (
             not skip_plate_ocr
             and self.plate_model is not None
             and self.char_model is not None
         ):
-            plate_present, readings, plate_boxes, plate_crops = detect_plates(
-                frame, self.plate_model, self.char_model
-            )
+            if precomputed_plate_result is not None:
+                (
+                    plate_present,
+                    readings,
+                    plate_boxes,
+                    plate_crops,
+                    reading_confs,
+                ) = _extract_plates_from_result(
+                    frame, precomputed_plate_result, self.char_model
+                )
+            else:
+                single_res = self.plate_model.predict(
+                    frame,
+                    conf=CONF_PLATE,
+                    iou=0.5,
+                    imgsz=PLATE_IMGSZ,
+                    verbose=False,
+                    **_yolo_kwargs(),
+                )[0]
+                (
+                    plate_present,
+                    readings,
+                    plate_boxes,
+                    plate_crops,
+                    reading_confs,
+                ) = _extract_plates_from_result(frame, single_res, self.char_model)
         else:
-            plate_present, readings, plate_boxes, plate_crops = False, {}, [], {}
+            plate_present, readings, plate_boxes, plate_crops, reading_confs = (
+                False,
+                {},
+                [],
+                {},
+                {},
+            )
 
         faces: list[FaceData] = []
         if self.face_service is not None and (
@@ -922,7 +1004,15 @@ class SystemState:
         ]
         overlay_boxes = {"plates": plate_boxes, "faces": face_boxes}
 
-        return plate_present, readings, plate_crops, faces, overlay_boxes, skip_plate_ocr
+        return (
+            plate_present,
+            readings,
+            reading_confs,
+            plate_crops,
+            faces,
+            overlay_boxes,
+            skip_plate_ocr,
+        )
 
     def _process_dual_frames(
         self, session_id: int, frame1, frame2
@@ -941,33 +1031,93 @@ class SystemState:
             )
             active1 = self.cams[1].active
             active2 = self.cams[2].active
+            cam1_has_plate = bool(
+                self.cams[1].plate_in_view or self.cams[1].observations
+            )
+            cam2_has_plate = bool(
+                self.cams[2].plate_in_view or self.cams[2].observations
+            )
 
         dual_cam_mode = bool(active1 and active2)
         run_face_idle = current_frame_idx % FACE_IDLE_EVERY_N_FRAMES == 0
 
+        # Phối hợp thông minh 2 Cam: khi 1 cam đang thấy biển số còn cam đối diện chưa có biển số,
+        # ưu tiên quét sẵn MTCNN liên tục ở cam đối diện và giảm quét biển số dư thừa ở cam đó
+        prioritize_face_1 = bool(
+            dual_cam_mode
+            and required_face_cam is None
+            and cam2_has_plate
+            and not cam1_has_plate
+        )
+        prioritize_face_2 = bool(
+            dual_cam_mode
+            and required_face_cam is None
+            and cam1_has_plate
+            and not cam2_has_plate
+        )
+
         skip_plate_1 = bool(
             dual_cam_mode
-            and required_face_cam is not None
             and (
-                required_face_cam == 1
-                or (latched_plate_cam == 1 and current_frame_idx % 2 == 1)
+                (
+                    required_face_cam is not None
+                    and (
+                        required_face_cam == 1
+                        or (latched_plate_cam == 1 and current_frame_idx % 2 == 1)
+                    )
+                )
+                or (prioritize_face_1 and current_frame_idx % 3 != 0)
             )
         )
         skip_plate_2 = bool(
             dual_cam_mode
-            and required_face_cam is not None
             and (
-                required_face_cam == 2
-                or (latched_plate_cam == 2 and current_frame_idx % 2 == 1)
+                (
+                    required_face_cam is not None
+                    and (
+                        required_face_cam == 2
+                        or (latched_plate_cam == 2 and current_frame_idx % 2 == 1)
+                    )
+                )
+                or (prioritize_face_2 and current_frame_idx % 3 != 0)
             )
         )
+
+        need_plate_1 = bool(
+            active1
+            and frame1 is not None
+            and not skip_plate_1
+            and self.plate_model is not None
+            and self.char_model is not None
+        )
+        need_plate_2 = bool(
+            active2
+            and frame2 is not None
+            and not skip_plate_2
+            and self.plate_model is not None
+            and self.char_model is not None
+        )
+
+        pre_plate_1 = None
+        pre_plate_2 = None
+        if need_plate_1 and need_plate_2:
+            batch_results = self.plate_model.predict(
+                [frame1, frame2],
+                conf=CONF_PLATE,
+                iou=0.5,
+                imgsz=PLATE_IMGSZ,
+                verbose=False,
+                **_yolo_kwargs(),
+            )
+            pre_plate_1, pre_plate_2 = batch_results[0], batch_results[1]
 
         res1 = (
             self._analyze_single_cam_frame(
                 frame1,
-                run_face_idle and required_face_cam is None,
+                (run_face_idle or prioritize_face_1) and required_face_cam is None,
                 required_face_cam == 1 or not dual_cam_mode,
                 skip_plate_ocr=skip_plate_1,
+                precomputed_plate_result=pre_plate_1,
             )
             if (active1 and frame1 is not None)
             else None
@@ -975,13 +1125,86 @@ class SystemState:
         res2 = (
             self._analyze_single_cam_frame(
                 frame2,
-                run_face_idle and required_face_cam is None,
+                (run_face_idle or prioritize_face_2) and required_face_cam is None,
                 required_face_cam == 2 or not dual_cam_mode,
                 skip_plate_ocr=skip_plate_2,
+                precomputed_plate_result=pre_plate_2,
             )
             if (active2 and frame2 is not None)
             else None
         )
+
+        # Nếu Cam A vừa mới phát hiện biển số ngay trong chính frame này mà Cam B chưa chạy MTCNN ở nhịp lẻ,
+        # quét bổ sung MTCNN ngay lập tức trên Cam B để sẵn sàng chốt mặt tức thì ở frame kế tiếp / hiện tại
+        if (
+            dual_cam_mode
+            and required_face_cam is None
+            and self.face_service is not None
+        ):
+            if (
+                res1 is not None
+                and res1[0]
+                and res2 is not None
+                and not res2[0]
+                and not res2[4]
+                and not (run_face_idle or prioritize_face_2)
+                and frame2 is not None
+            ):
+                extra_faces_2 = self.face_service.detect_from_bgr(frame2)
+                h2, w2 = frame2.shape[:2]
+                res2 = (
+                    res2[0],
+                    res2[1],
+                    res2[2],
+                    res2[3],
+                    extra_faces_2,
+                    {
+                        "plates": res2[5]["plates"],
+                        "faces": [
+                            {
+                                "x1": round(f.box[0] / w2, 4),
+                                "y1": round(f.box[1] / h2, 4),
+                                "x2": round(f.box[2] / w2, 4),
+                                "y2": round(f.box[3] / h2, 4),
+                                "label": f"Mặt {idx} ({f.confidence:.0%})",
+                            }
+                            for idx, f in enumerate(extra_faces_2, start=1)
+                        ],
+                    },
+                    res2[6],
+                )
+            elif (
+                res2 is not None
+                and res2[0]
+                and res1 is not None
+                and not res1[0]
+                and not res1[4]
+                and not (run_face_idle or prioritize_face_1)
+                and frame1 is not None
+            ):
+                extra_faces_1 = self.face_service.detect_from_bgr(frame1)
+                h1, w1 = frame1.shape[:2]
+                res1 = (
+                    res1[0],
+                    res1[1],
+                    res1[2],
+                    res1[3],
+                    extra_faces_1,
+                    {
+                        "plates": res1[5]["plates"],
+                        "faces": [
+                            {
+                                "x1": round(f.box[0] / w1, 4),
+                                "y1": round(f.box[1] / h1, 4),
+                                "x2": round(f.box[2] / w1, 4),
+                                "y2": round(f.box[3] / h1, 4),
+                                "label": f"Mặt {idx} ({f.confidence:.0%})",
+                            }
+                            for idx, f in enumerate(extra_faces_1, start=1)
+                        ],
+                    },
+                    res1[6],
+                )
 
         now = time.monotonic()
         commit_pair = None
@@ -1000,6 +1223,7 @@ class SystemState:
                 (
                     plate_present,
                     readings,
+                    reading_confs,
                     plate_crops,
                     faces,
                     overlay_boxes,
@@ -1039,12 +1263,13 @@ class SystemState:
                         and now - cam.last_sample_time >= VOTE_SAMPLE_INTERVAL_SECONDS
                     ):
                         key, display = next(iter(readings.items()))
+                        avg_conf = reading_confs.get(key, 0.0)
                         self.plate_last_seen_global[key] = now
                         if (
                             key not in self.plates_must_leave
                             and key not in self.committing_plates
                         ):
-                            cam.observations.append((now, key, display))
+                            cam.observations.append((now, key, display, avg_conf))
                             cam.last_sample_time = now
                     elif readings:
                         for r_key in readings:
@@ -1106,7 +1331,7 @@ class SystemState:
             ):
                 for cid in (1, 2):
                     v_check = get_vote_result(self.cams[cid].observations)
-                    if is_vote_confirmed(v_check):
+                    if is_vote_confirmed(v_check, self.cams[cid].observations):
                         cand_key, cand_display, _, _, _ = v_check
                         if (
                             cand_key in self.plates_must_leave
@@ -1135,7 +1360,7 @@ class SystemState:
                     for plate_cam_id in active_cam_ids:
                         cam = self.cams[plate_cam_id]
                         vote = get_vote_result(cam.observations)
-                        if not is_vote_confirmed(vote):
+                        if not is_vote_confirmed(vote, cam.observations):
                             continue
 
                         key, display, vote_count, vote_share, sample_count = vote
@@ -1256,7 +1481,7 @@ class SystemState:
                         )
                         is_instant_sharp = (
                             self.best_face is not None
-                            and self.best_face[1] >= 0.92
+                            and self.best_face[1] >= FACE_INSTANT_CONFIDENCE
                             and self.best_face[4] >= FACE_INSTANT_SHARPNESS
                         )
                         is_sharp_enough = (
@@ -1561,6 +1786,7 @@ class SystemState:
 
             return {
                 "running": self.running,
+                "committing": bool(self.committing_plates),
                 "cam1": cam1_status,
                 "cam2": cam2_status,
                 "latched": latched_info,
@@ -1653,8 +1879,7 @@ def get_camera_status():
 
 @app.post("/api/camera/cancel-latch")
 def api_cancel_latch():
-    state.cancel_latch()
-    return {"status": "cancelled"}
+    return state.cancel_latch()
 
 
 @app.post("/api/camera/resolve-alert")

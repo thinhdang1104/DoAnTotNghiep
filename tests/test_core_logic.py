@@ -91,6 +91,31 @@ class TestMajorityVoting(unittest.TestCase):
         self.assertAlmostEqual(res_valid[3], 0.75)
         self.assertTrue(main.is_vote_confirmed(res_valid))
 
+    def test_fast_confirm_two_high_confidence_samples(self):
+        # 2 mẫu liên tiếp cùng biển số chuẩn + avg_char_conf >= 0.75 -> Fast-Confirm ngay ở mẫu thứ 2
+        obs_fast = [
+            (1.0, "59V179379", "59V1-79379", 0.86),
+            (1.15, "59V179379", "59V1-79379", 0.89),
+        ]
+        res_fast = main.get_vote_result(obs_fast)
+        self.assertTrue(main.is_vote_confirmed(res_fast, obs_fast))
+
+        # 2 mẫu liên tiếp nhưng độ tin cậy ký tự thấp (< 0.75) -> chưa chốt sớm, phải đợi đủ 3 mẫu
+        obs_low_conf = [
+            (1.0, "59V179379", "59V1-79379", 0.62),
+            (1.15, "59V179379", "59V1-79379", 0.68),
+        ]
+        res_low = main.get_vote_result(obs_low_conf)
+        self.assertFalse(main.is_vote_confirmed(res_low, obs_low_conf))
+
+        # 2 mẫu khác biển số -> không bao giờ chốt sớm
+        obs_conflict = [
+            (1.0, "59V179379", "59V1-79379", 0.92),
+            (1.15, "59V179378", "59V1-79378", 0.92),
+        ]
+        res_conflict = main.get_vote_result(obs_conflict)
+        self.assertFalse(main.is_vote_confirmed(res_conflict, obs_conflict))
+
 
 class TestFaceEmbeddings(unittest.TestCase):
     def test_cosine_similarity_and_serialization(self):
@@ -178,13 +203,29 @@ class TestSystemStateRegressions(unittest.TestCase):
         self.assertFalse(st.alert_resolving)
         self.assertNotIn("30T41975:OUT", st.recent_confirms)
 
-        # Lần 2: MySQL phục hồi -> bấm duyệt lại thành công
+        # Lần 2: MySQL phục hồi -> bấm duyệt lại thành công, kèm sẵn camera_status và khóa chiều ngược 6.0s
+        self.assertEqual(main.CROSS_DIRECTION_COOLDOWN_SECONDS, 6.0)
         with mock.patch("main.insert_plate_record", return_value=(99, 0.45)):
             res_ok = st.resolve_security_alert(approve=True)
 
         self.assertEqual(res_ok["status"], "approved")
+        self.assertIn("camera_status", res_ok)
+        self.assertIsNone(res_ok["camera_status"]["security_alert"])
         self.assertIsNone(st.security_alert, "security_alert must be cleared after DB commit succeeds")
         self.assertIn("30T41975:OUT", st.recent_confirms)
+
+        # Kiểm tra nút Từ chối (approve=False) trả kèm camera_status ngay trong 1 vòng
+        st.security_alert = {
+            "plate_key": "59A112345",
+            "plate_number": "59A1-12345",
+            "entry_time": "2026-11-23 09:00:00",
+            "match_score_pct": "32%",
+            "record": {"plate_number": "59A1-12345", "direction": "OUT"},
+        }
+        res_rej = st.resolve_security_alert(approve=False)
+        self.assertEqual(res_rej["status"], "rejected")
+        self.assertIn("camera_status", res_rej)
+        self.assertIsNone(res_rej["camera_status"]["security_alert"])
         st.stop_db_writer()
 
     def test_commit_latched_pair_async_executor_and_committing_plates(self):
@@ -522,6 +563,96 @@ class TestSystemStateRegressions(unittest.TestCase):
             st.get_cached_session_case(230)
             self.assertEqual(mock_fetch_case.call_count, 2)
         st.stop_db_writer()
+
+    def test_dual_cam_batched_yolo_and_two_frame_instant_commit(self):
+        """Kiểm chứng gói tăng tốc nhận diện 2 Camera:
+        - Khung 1: gọi batch plate_model.predict([frame1, frame2]) trong 1 lần duy nhất; Cam 1 ghi nhận mẫu 1, Cam 2 lưu sẵn mặt nét.
+        - Khung 2: phối hợp 2 Cam bỏ qua quét biển dư thừa ở Cam 2, Cam 1 đủ 2 mẫu Fast-Confirm và chốt mặt tức thì ngay trong Khung 2 (0 frame chờ thêm ở Lưu hờ).
+        """
+        st = main.SystemState()
+        st.database_ready = True
+        st.start_camera(1)
+        st.start_camera(2)
+        sid = st.session_id
+
+        predict_inputs = []
+
+        class FakePlateResult:
+            def __init__(self, has_plate: bool):
+                self.boxes = ["dummy_box"] if has_plate else []
+
+        class FakePlateModel:
+            def predict(self, source, **kwargs):
+                predict_inputs.append(source)
+                if isinstance(source, list):
+                    return [FakePlateResult(True), FakePlateResult(False)]
+                return [FakePlateResult(True)]
+
+        class FakeFaceService:
+            can_embed = True
+
+            def detect_from_bgr(self, frame):
+                return [face_service.FaceData(box=(10, 10, 90, 90), confidence=0.91)]
+
+            def embed_face(self, frame, box):
+                return [0.25] * 512
+
+        st.plate_model = FakePlateModel()
+        st.char_model = mock.MagicMock()
+        st.face_service = FakeFaceService()
+
+        # Tạo khung hình có vân kẻ cờ vua để độ sắc nét Laplacian > 22.0 (đạt chuẩn chốt tức thì)
+        sharp_frame = np.zeros((120, 120, 3), dtype=np.uint8)
+        sharp_frame[::2, ::2] = 255
+        frame1 = sharp_frame.copy()
+        frame2 = sharp_frame.copy()
+
+        def fake_extract(frame, result, char_model):
+            if result.boxes:
+                return (
+                    True,
+                    {"59V179379": "59V1-79379"},
+                    [{"x1": 0.1, "y1": 0.1, "x2": 0.5, "y2": 0.4, "label": "59V1-79379", "valid": True}],
+                    {"59V179379": (40.0, "data:image/jpeg;base64,AA==")},
+                    {"59V179379": 0.88},
+                )
+            return False, {}, [], {}, {}
+
+        insert_done = threading.Event()
+
+        def fast_insert(rec):
+            insert_done.set()
+            return (777, None)
+
+        clock = [100.0]
+        with mock.patch("main._extract_plates_from_result", side_effect=fake_extract), mock.patch(
+            "main.find_active_parking_session", return_value=None
+        ), mock.patch("main.insert_plate_record", side_effect=fast_insert), mock.patch(
+            "main._save_snapshot_to_disk"
+        ), mock.patch("main.time.monotonic", side_effect=lambda: clock[0]):
+            # Khung 1: gom batch 2 ảnh trong 1 lần gọi plate_model.predict
+            st._process_dual_frames(sid, frame1, frame2)
+            self.assertEqual(len(predict_inputs), 1)
+            self.assertIsInstance(predict_inputs[0], list)
+            self.assertEqual(len(predict_inputs[0]), 2)
+            self.assertEqual(len(st.cams[1].observations), 1)
+            self.assertEqual(len(st.cams[2].recent_faces), 1)
+
+            # Khung 2 (+0.12s): bỏ qua quét biển ở Cam 2, Cam 1 chốt Fast-Confirm 2/2 + chốt mặt tức thì
+            clock[0] = 100.12
+            st._process_dual_frames(sid, frame1, frame2)
+            self.assertEqual(len(predict_inputs), 2)
+            self.assertNotIsInstance(
+                predict_inputs[1], list, "Cam 2 plate OCR should be skipped while Cam 1 tracks plate"
+            )
+            self.assertIsNone(st.latched, "Must commit immediately in Frame 2 without lingering in latched state")
+            self.assertTrue(insert_done.wait(timeout=2.0))
+            st.stop_db_writer()
+            status_payload = st.get_status_payload()
+
+        self.assertFalse(status_payload["committing"])
+        self.assertIsNotNone(status_payload["gate_feedback"])
+        self.assertIn("VÀO BÃI THÀNH CÔNG", status_payload["gate_feedback"]["message"])
 
 
 if __name__ == "__main__":

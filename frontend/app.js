@@ -144,6 +144,9 @@
   let deviceChangeBound = false;
   let lastRecordsVersion = -1;
   let lastFeedbackSeq = -1;
+  let hasActiveSecurityAlert = false;
+  let activeSecurityAlertPlate = "";
+  let resolvingAlertInFlight = false;
   let searchDebounceTimer = null;
   const OVERVIEW_CLIENT_CACHE_MAX = 30;
   const overviewPageCache = new Map();
@@ -252,45 +255,112 @@
   // ==================== LATCH & ALERT CONTROLS ====================
   if (btnCancelLatch) {
     btnCancelLatch.addEventListener("click", async () => {
-      await fetch("/api/camera/cancel-latch", { method: "POST" });
+      if (latchStatusBox) latchStatusBox.classList.add("hidden");
+      try {
+        const res = await fetch("/api/camera/cancel-latch", { method: "POST" });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.camera_status) {
+            await applyCameraStatus(data.camera_status);
+            return;
+          }
+        }
+      } catch (_) {}
       await pollCameraStatusOnce();
     });
   }
 
   async function resolveAlert(action) {
+    if (resolvingAlertInFlight) return;
+    resolvingAlertInFlight = true;
     btnApproveExit.disabled = true;
     btnRejectExit.disabled = true;
+
+    // Phản hồi giao diện tức thì (0 ms) ngay khi bấm nút; tự khôi phục hộp cảnh báo nếu ghi CSDL lỗi
+    const plateText = activeSecurityAlertPlate || "";
+    if (securityAlertBox) {
+      securityAlertBox.classList.add("hidden");
+    }
+    const optimisticMsg =
+      action === "approve"
+        ? plateText
+          ? `XE ${plateText} RA BÃI ĐƯỢC DUYỆT`
+          : "ĐÃ DUYỆT CHO XE RA BÃI"
+        : plateText
+        ? `XE ${plateText} RA BÃI BỊ TỪ CHỐI`
+        : "ĐÃ TỪ CHỐI CHO XE RA BÃI";
+    const optimisticType = action === "approve" ? "warn" : "error";
+    showBanner(gateTopupBox || cameraAlertBox, optimisticType, optimisticMsg, 2500);
+
     try {
       const res = await fetch("/api/camera/resolve-alert", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data && data.status === "db_error") {
-          if (securityAlertBox) {
-            securityAlertBox.classList.remove("hidden");
-          }
-          if (data.message) {
-            showBanner(cameraAlertBox, "error", data.message);
-          }
-        } else {
-          if (securityAlertBox) {
-            securityAlertBox.classList.add("hidden");
-          }
-          if (data && data.message) {
-            showBanner(
-              gateTopupBox || cameraAlertBox,
-              data.type || "warn",
-              data.message,
-              2500
-            );
-          }
-        }
+      if (!res.ok) {
+        throw new Error("HTTP " + res.status);
       }
-      await pollCameraStatusOnce();
+      const data = await res.json();
+      resolvingAlertInFlight = false;
+
+      if (data && data.status === "db_error") {
+        hasActiveSecurityAlert = true;
+        if (gateTopupBox) {
+          showBanner(gateTopupBox, "", "");
+        }
+        if (securityAlertBox) {
+          securityAlertBox.classList.remove("hidden");
+        }
+        if (data.message) {
+          showBanner(cameraAlertBox, "error", data.message);
+        }
+        if (data.camera_status) {
+          await applyCameraStatus(data.camera_status);
+        }
+        return;
+      }
+
+      hasActiveSecurityAlert = false;
+      activeSecurityAlertPlate = "";
+      if (
+        data &&
+        data.camera_status &&
+        data.camera_status.gate_feedback &&
+        typeof data.camera_status.gate_feedback.seq === "number"
+      ) {
+        lastFeedbackSeq = data.camera_status.gate_feedback.seq;
+      }
+      if (data && data.message) {
+        showBanner(
+          gateTopupBox || cameraAlertBox,
+          data.type || optimisticType,
+          data.message,
+          2500
+        );
+      }
+      if (data && data.camera_status) {
+        await applyCameraStatus(data.camera_status);
+      } else {
+        pollCameraStatusOnce();
+      }
+      ensureBrowserFrameLoop();
+    } catch (_) {
+      resolvingAlertInFlight = false;
+      hasActiveSecurityAlert = true;
+      if (gateTopupBox) {
+        showBanner(gateTopupBox, "", "");
+      }
+      if (securityAlertBox) {
+        securityAlertBox.classList.remove("hidden");
+      }
+      showBanner(
+        cameraAlertBox,
+        "error",
+        "Không gửi được yêu cầu duyệt cảnh báo, vui lòng thử lại."
+      );
     } finally {
+      resolvingAlertInFlight = false;
       btnApproveExit.disabled = false;
       btnRejectExit.disabled = false;
     }
@@ -312,6 +382,28 @@
   let browserCanvas = null;
   let browserFrameTimer = null;
   let browserInFlight = false;
+  let commitPollTimer = null;
+  let commitPollInFlight = false;
+
+  function stopCommitStatusPoll() {
+    if (commitPollTimer) {
+      clearInterval(commitPollTimer);
+      commitPollTimer = null;
+    }
+  }
+
+  function ensureCommitStatusPoll() {
+    if (commitPollTimer) return;
+    commitPollTimer = setInterval(async () => {
+      if (commitPollInFlight || isStartingCamera) return;
+      commitPollInFlight = true;
+      try {
+        await pollCameraStatusOnce();
+      } finally {
+        commitPollInFlight = false;
+      }
+    }, 180);
+  }
 
   function normalizeVideoInputDevices(rawDevices) {
     const videoInputs = (rawDevices || []).filter(
@@ -740,43 +832,64 @@
     }
   }
 
-  function ensureBrowserFrameLoop() {
-    if (browserFrameTimer) return;
-    browserFrameTimer = setInterval(async () => {
-      if (!browserWebRTCActive || browserInFlight) return;
-      const v1 = browserVideos[0];
-      const v2 = browserVideos[1];
-      if (!v1 && !v2) return;
+  async function runBrowserFrameTick() {
+    browserFrameTimer = null;
+    if (!browserWebRTCActive) return;
+    if (hasActiveSecurityAlert || resolvingAlertInFlight) {
+      // Tạm ngưng gửi ảnh nặng khi đang hiện hộp Cảnh báo an ninh để thao tác bấm Duyệt / Từ chối phản hồi tức thì
+      browserFrameTimer = setTimeout(runBrowserFrameTick, 120);
+      return;
+    }
+    if (browserInFlight) {
+      browserFrameTimer = setTimeout(runBrowserFrameTick, 35);
+      return;
+    }
+    const v1 = browserVideos[0];
+    const v2 = browserVideos[1];
+    if (!v1 && !v2) return;
 
-      const img1 = v1 ? captureVideoToJpegDataUrl(v1) : null;
-      const img2 = v2 ? captureVideoToJpegDataUrl(v2) : null;
-      if (!img1 && !img2) return;
+    const img1 = v1 ? captureVideoToJpegDataUrl(v1) : null;
+    const img2 = v2 ? captureVideoToJpegDataUrl(v2) : null;
+    if (!img1 && !img2) {
+      browserFrameTimer = setTimeout(runBrowserFrameTick, 80);
+      return;
+    }
 
-      browserInFlight = true;
-      try {
-        const res = await fetch("/api/camera/browser-frame", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cam1_image: img1, cam2_image: img2 }),
-        });
-        if (res.ok) {
-          const out = await res.json();
-          if (v1 && out.cam1_boxes) {
-            drawOverlayBoxes(cam1LiveVideo || v1, cam1OverlayCanvas, out.cam1_boxes);
-          }
-          if (v2 && out.cam2_boxes) {
-            drawOverlayBoxes(cam2LiveVideo || v2, cam2OverlayCanvas, out.cam2_boxes);
-          }
-          if (out.status) {
-            await applyCameraStatus(out.status);
-          }
+    const t0 = performance.now();
+    browserInFlight = true;
+    try {
+      const res = await fetch("/api/camera/browser-frame", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cam1_image: img1, cam2_image: img2 }),
+      });
+      if (res.ok) {
+        const out = await res.json();
+        if (v1 && out.cam1_boxes) {
+          drawOverlayBoxes(cam1LiveVideo || v1, cam1OverlayCanvas, out.cam1_boxes);
         }
-      } catch (_) {
-        // Bỏ qua lỗi mạng tạm thời
-      } finally {
-        browserInFlight = false;
+        if (v2 && out.cam2_boxes) {
+          drawOverlayBoxes(cam2LiveVideo || v2, cam2OverlayCanvas, out.cam2_boxes);
+        }
+        if (out.status) {
+          await applyCameraStatus(out.status);
+        }
       }
-    }, 140);
+    } catch (_) {
+      // Bỏ qua lỗi mạng tạm thời
+    } finally {
+      browserInFlight = false;
+      if (browserWebRTCActive && !browserFrameTimer) {
+        const elapsed = performance.now() - t0;
+        const nextDelay = Math.max(25, Math.round(115 - elapsed));
+        browserFrameTimer = setTimeout(runBrowserFrameTick, nextDelay);
+      }
+    }
+  }
+
+  function ensureBrowserFrameLoop() {
+    if (browserFrameTimer || browserInFlight) return;
+    browserFrameTimer = setTimeout(runBrowserFrameTick, 20);
   }
 
   function detachTrackEndedHandler(camId, stream) {
@@ -875,9 +988,12 @@
       }
 
       browserWebRTCActive = Boolean(browserVideos[0] || browserVideos[1]);
-      if (!browserWebRTCActive && browserFrameTimer) {
-        clearInterval(browserFrameTimer);
-        browserFrameTimer = null;
+      if (!browserWebRTCActive) {
+        stopCommitStatusPoll();
+        if (browserFrameTimer) {
+          clearTimeout(browserFrameTimer);
+          browserFrameTimer = null;
+        }
       }
     } finally {
       manualStoppingCam[camId] = false;
@@ -1451,20 +1567,32 @@
 
     // Security Alert UI (Face mismatch on exit — Top-up in blue box area)
     if (state.security_alert) {
-      if (gateTopupBox) {
-        showBanner(gateTopupBox, "", "");
+      hasActiveSecurityAlert = true;
+      activeSecurityAlertPlate = state.security_alert.plate_number || "";
+      if (!resolvingAlertInFlight) {
+        if (gateTopupBox) {
+          showBanner(gateTopupBox, "", "");
+        }
+        securityAlertBox.classList.remove("hidden");
+        alertScorePill.textContent = `Độ khớp: ${state.security_alert.match_score_pct}`;
+        const threshPct = Math.round(faceMatchThreshold * 100);
+        alertDetailText.textContent =
+          `Xe ${state.security_alert.plate_number} (gửi lúc ${state.security_alert.entry_time}) ` +
+          `có khuôn mặt người lấy xe LỆCH so với lúc gửi xe vào bãi (Cosine ${state.security_alert.match_score_pct} < ${threshPct}%).`;
       }
-      securityAlertBox.classList.remove("hidden");
-      alertScorePill.textContent = `Độ khớp: ${state.security_alert.match_score_pct}`;
-      const threshPct = Math.round(faceMatchThreshold * 100);
-      alertDetailText.textContent =
-        `Xe ${state.security_alert.plate_number} (gửi lúc ${state.security_alert.entry_time}) ` +
-        `có khuôn mặt người lấy xe LỆCH so với lúc gửi xe vào bãi (Cosine ${state.security_alert.match_score_pct} < ${threshPct}%).`;
     } else {
+      hasActiveSecurityAlert = false;
+      activeSecurityAlertPlate = "";
       securityAlertBox.classList.add("hidden");
     }
 
     voteAmbiguousWarning.classList.toggle("hidden", !state.ambiguous_frame);
+
+    if (state.committing) {
+      ensureCommitStatusPoll();
+    } else {
+      stopCommitStatusPoll();
+    }
 
     if (
       typeof state.records_version === "number" &&
