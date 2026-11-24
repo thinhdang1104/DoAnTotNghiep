@@ -352,7 +352,11 @@ class TestSystemStateRegressions(unittest.TestCase):
 
         with mock.patch("database._connection_config", return_value=fake_cfg), mock.patch.object(
             database, "_MYSQL_POOL", fake_pool
-        ), mock.patch.object(database, "_POOL_CONFIG_KEY", cfg_key), mock.patch(
+        ), mock.patch.object(database, "_POOL_CONFIG_KEY", cfg_key), mock.patch.object(
+            database, "_POOL_CREATED_AT", -100.0
+        ), mock.patch.object(
+            database, "_CONN_LAST_ACTIVE", {}
+        ), mock.patch(
             "database.mysql.connector.connect", return_value=fresh_conn
         ) as mock_direct_connect:
             conn = database._connect_mysql()
@@ -360,6 +364,164 @@ class TestSystemStateRegressions(unittest.TestCase):
         self.assertIs(conn, fresh_conn)
         leaked_conn.close.assert_called_once()
         mock_direct_connect.assert_called_once()
+
+    def test_connect_mysql_skips_ping_when_recently_active_and_retries_stale_read(self):
+        """Kiểm chứng cắt 2 vòng mạng thừa:
+        - Kết nối vừa hoạt động (< 30s) không gọi conn.ping().
+        - Nếu câu đọc gặp MySQLError trên kết nối ngầm bị đóng trước 30s, _run_read_query tự retry 1 lần với force_ping=True.
+        """
+        warm_conn = mock.MagicMock()
+        raw_id = database._raw_conn_id(warm_conn)
+        fake_pool = mock.MagicMock()
+        fake_pool.get_connection.return_value = warm_conn
+        fake_cfg = {
+            "host": "localhost",
+            "port": 3306,
+            "user": "root",
+            "password": "pw",
+            "database": "defaultdb",
+            "autocommit": True,
+        }
+        cfg_key = ("localhost", 3306, "root", "pw", "defaultdb")
+        now_val = database.time.monotonic()
+
+        with mock.patch("database._connection_config", return_value=fake_cfg), mock.patch.object(
+            database, "_MYSQL_POOL", fake_pool
+        ), mock.patch.object(database, "_POOL_CONFIG_KEY", cfg_key), mock.patch.object(
+            database, "_POOL_CREATED_AT", now_val
+        ), mock.patch.object(
+            database, "_CONN_LAST_ACTIVE", {raw_id: now_val}
+        ):
+            conn = database._connect_mysql()
+            self.assertIs(conn, warm_conn)
+            warm_conn.ping.assert_not_called()
+
+            # Giả lập lần đọc thứ 1 bị đứt kết nối ngầm, lần retry thứ 2 thành công
+            stale_cursor = mock.MagicMock()
+            stale_cursor.execute.side_effect = database.MySQLError("Lost connection during query")
+            good_cursor = mock.MagicMock()
+            good_cursor.fetchone.return_value = {"ok": 1}
+            warm_conn.cursor.side_effect = [stale_cursor, good_cursor]
+
+            result = database._run_read_query(
+                lambda cur: (cur.execute("SELECT 1"), cur.fetchone())[1]
+            )
+            self.assertEqual(result, {"ok": 1})
+            warm_conn.ping.assert_called_once_with(reconnect=True, attempts=1, delay=0)
+
+    def test_fetch_overview_skips_revenue_and_count_queries_on_history_tab(self):
+        """Kiểm chứng giảm vòng mạng tab Lịch sử & Phân trang:
+        - Mở tab Lịch sử (include_revenue=False, q=''): chỉ chạy 2 câu SQL (stats + SELECT page), bỏ 4 câu revenue và bỏ SELECT COUNT(*).
+        - Sang Trang 2 (known_stats có sẵn, include_stats=False, include_revenue=False): chỉ chạy đúng 1 câu SQL SELECT page.
+        """
+        executed_sqls = []
+        fake_cursor = mock.MagicMock()
+
+        def track_execute(sql, params=None):
+            executed_sqls.append(" ".join(sql.split()))
+
+        fake_cursor.execute.side_effect = track_execute
+        fake_cursor.fetchone.return_value = {
+            "total": 25,
+            "today": 8,
+            "in_parking": 7,
+            "total_in": 16,
+            "total_out": 9,
+        }
+        fake_cursor.fetchall.return_value = []
+
+        with mock.patch(
+            "database._run_read_query", side_effect=lambda fn: fn(fake_cursor)
+        ), mock.patch("database._fetch_revenue_report_mysql") as mock_rev:
+            res_p1 = database.fetch_overview(
+                query="",
+                status_filter="in_parking",
+                page=1,
+                page_size=10,
+                include_records=True,
+                include_stats=True,
+                include_revenue=False,
+            )
+            mock_rev.assert_not_called()
+            self.assertEqual(res_p1["matched"], 7)
+            self.assertIsNone(res_p1["revenue"])
+            self.assertEqual(
+                len(executed_sqls),
+                2,
+                f"Expected exactly 2 SQL queries (stats + page), got: {executed_sqls}",
+            )
+
+            # Sang trang 2 khi đã có stats trong cache -> chỉ tốn đúng 1 câu SQL
+            executed_sqls.clear()
+            res_p2 = database.fetch_overview(
+                query="",
+                status_filter="all",
+                page=2,
+                page_size=10,
+                include_records=True,
+                include_stats=False,
+                include_revenue=False,
+                known_stats=res_p1["stats"],
+            )
+            self.assertEqual(res_p2["matched"], 25)
+            self.assertEqual(res_p2["page"], 2)
+            self.assertEqual(
+                len(executed_sqls),
+                1,
+                f"Expected 1 SQL query on cached stats pagination, got: {executed_sqls}",
+            )
+
+    def test_session_case_short_circuits_in_parking_and_caches_by_version(self):
+        """Kiểm chứng Modal Hồ sơ Mất xe:
+        - Dòng IN đang IN_PARKING chỉ chạy đúng 1 câu SELECT theo ID (bỏ 3 câu tìm OUT).
+        - SystemState.get_cached_session_case() lưu cache theo records_version và tự xóa khi _bump_version().
+        """
+        executed_sqls = []
+        fake_cursor = mock.MagicMock()
+        fake_cursor.execute.side_effect = lambda sql, params=None: executed_sqls.append(sql)
+        fake_cursor.fetchone.return_value = {
+            "id": 230,
+            "plate_number": "72C1-60266",
+            "plate_key": "72C160266",
+            "direction": "IN",
+            "parking_status": "IN_PARKING",
+            "entry_record_id": None,
+            "fee_amount": 2000,
+            "recognized_at": database.now_vn(),
+            "vote_count": 4,
+            "sample_count": 4,
+            "consensus_rate": 1.0,
+            "face_detected": 1,
+            "face_confidence": 0.98,
+            "face_embedding": 1,
+            "face_match_score": None,
+            "plate_image": None,
+            "face_image": None,
+            "camera_index": 0,
+        }
+
+        with mock.patch("database._run_read_query", side_effect=lambda fn: fn(fake_cursor)):
+            case_res = database.fetch_parking_session_case(230)
+
+        self.assertEqual(len(executed_sqls), 1, "IN_PARKING must short-circuit after 1 query")
+        self.assertEqual(case_res["plate_number"], "72C1-60266")
+        self.assertIsNone(case_res["checkout_row"])
+        self.assertEqual(case_res["in_parking_status"], "IN_PARKING")
+
+        st = main.SystemState()
+        with mock.patch(
+            "main.fetch_parking_session_case", return_value=case_res
+        ) as mock_fetch_case:
+            c1 = st.get_cached_session_case(230)
+            c2 = st.get_cached_session_case(230)
+            self.assertEqual(c1["target_id"], 230)
+            self.assertEqual(c2["target_id"], 230)
+            mock_fetch_case.assert_called_once_with(230)
+
+            st._bump_version()
+            st.get_cached_session_case(230)
+            self.assertEqual(mock_fetch_case.call_count, 2)
+        st.stop_db_writer()
 
 
 if __name__ == "__main__":

@@ -1330,6 +1330,12 @@ td.n {
   font-size: 12px;
 }
 
+#history-table-body.table-loading {
+  opacity: 0.52;
+  pointer-events: none;
+  transition: opacity 0.14s ease;
+}
+
 /* ==================== RESPONSIVE ==================== */
 @media (max-width: 960px) {
   .dual-camera-grid,

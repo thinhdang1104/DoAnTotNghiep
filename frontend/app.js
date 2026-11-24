@@ -145,6 +145,31 @@
   let lastRecordsVersion = -1;
   let lastFeedbackSeq = -1;
   let searchDebounceTimer = null;
+  const OVERVIEW_CLIENT_CACHE_MAX = 30;
+  const overviewPageCache = new Map();
+  const overviewPrefetchInFlight = new Set();
+  const lostCaseClientCache = new Map();
+  let cachedStatsData = null;
+
+  function clearClientManagementCaches() {
+    overviewPageCache.clear();
+    overviewPrefetchInFlight.clear();
+    lostCaseClientCache.clear();
+  }
+
+  function makeOverviewCacheKey(ver, query, statusFilter, page, size) {
+    return `${ver}|${String(query || "").trim()}|${statusFilter || "all"}|${page}|${size}`;
+  }
+
+  function setOverviewClientCache(key, payload) {
+    if (overviewPageCache.has(key)) {
+      overviewPageCache.delete(key);
+    } else if (overviewPageCache.size >= OVERVIEW_CLIENT_CACHE_MAX) {
+      const oldestKey = overviewPageCache.keys().next().value;
+      if (oldestKey !== undefined) overviewPageCache.delete(oldestKey);
+    }
+    overviewPageCache.set(key, payload);
+  }
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -1446,6 +1471,7 @@
       state.records_version !== lastRecordsVersion
     ) {
       lastRecordsVersion = state.records_version;
+      clearClientManagementCaches();
       if (activeViewId === "view-management" || activeViewId === "view-revenue") {
         fetchManagementOverview();
       }
@@ -1880,42 +1906,122 @@
     snapshotModal.classList.remove("hidden");
   }
 
-  function renderLostModalLoadingState(plateNumber) {
+  function renderLostModalLoadingState(row) {
     if (!snapshotModal) return;
     activeLostCase = null;
     if (btnExportLostCasePdf) {
       btnExportLostCasePdf.disabled = true;
     }
+
+    const plateNumber = (row && row["Biển số"]) || "-";
+    const isOut =
+      Boolean(row) &&
+      (String(row.direction_code || "").toUpperCase() === "OUT" ||
+        String(row["Luồng"] || "").includes("Ra"));
+    const rowSnap = row ? getRowSnapshots(row) : null;
+
     if (snapshotModalTitle) {
-      snapshotModalTitle.textContent = `Hồ sơ Xử lý Mất xe · Biển số ${plateNumber || "-"}`;
+      snapshotModalTitle.textContent = `Hồ sơ Xử lý Mất xe · Biển số ${plateNumber}`;
     }
     if (lostCaseVerdictBanner) {
       lostCaseVerdictBanner.className = "lost-case-verdict";
-      lostCaseVerdictBanner.textContent = "Đang tải hồ sơ đối chiếu từ cơ sở dữ liệu...";
+      lostCaseVerdictBanner.textContent = isOut
+        ? "Đang đối chiếu bản ghi Check-in từ cơ sở dữ liệu..."
+        : "Đang đối chiếu bản ghi Check-out từ cơ sở dữ liệu...";
     }
-    if (checkinRecordId) checkinRecordId.textContent = "#-";
-    if (checkinTime) checkinTime.textContent = "-";
-    if (checkinPlate) checkinPlate.textContent = plateNumber || "-";
-    if (checkinFaceStatus) checkinFaceStatus.textContent = "-";
-    applyImageOrEmptyHint(modalPlateImg, checkinPlateEmpty, "", "Đang tải...");
-    applyImageOrEmptyHint(modalFaceImg, checkinFaceEmpty, "", "Đang tải...");
 
-    if (checkoutBadgePill) {
-      checkoutBadgePill.className = "pill warn";
-      checkoutBadgePill.textContent = "2. CHECK OUT (ĐANG TẢI...)";
+    if (row && !isOut && rowSnap) {
+      // Hiển thị ngay toàn bộ thông tin & ảnh Check-in sẵn có của dòng đang chọn
+      if (checkinRecordId) checkinRecordId.textContent = `#${row["ID"]}`;
+      if (checkinTime) checkinTime.textContent = row["Thời gian nhận diện"] || "-";
+      if (checkinPlate) checkinPlate.textContent = plateNumber;
+      if (checkinFaceStatus) {
+        checkinFaceStatus.textContent = row["Khuôn mặt"] || "Đã lưu mẫu mặt";
+      }
+      applyImageOrEmptyHint(
+        modalPlateImg,
+        checkinPlateEmpty,
+        rowSnap.realPlateImg,
+        "Không có ảnh lưu trữ"
+      );
+      applyImageOrEmptyHint(
+        modalFaceImg,
+        checkinFaceEmpty,
+        rowSnap.realFaceImg,
+        "Không có ảnh lưu trữ"
+      );
+    } else {
+      if (checkinRecordId) checkinRecordId.textContent = "#-";
+      if (checkinTime) checkinTime.textContent = "Đang đối chiếu...";
+      if (checkinPlate) checkinPlate.textContent = plateNumber;
+      if (checkinFaceStatus) checkinFaceStatus.textContent = "-";
+      applyImageOrEmptyHint(modalPlateImg, checkinPlateEmpty, "", "Đang đối chiếu...");
+      applyImageOrEmptyHint(modalFaceImg, checkinFaceEmpty, "", "Đang đối chiếu...");
     }
-    if (checkoutRecordId) checkoutRecordId.textContent = "#-";
-    if (checkoutTime) checkoutTime.textContent = "-";
-    if (checkoutParkingStatus) checkoutParkingStatus.textContent = "-";
-    if (checkoutMatchStatus) checkoutMatchStatus.textContent = "-";
-    applyImageOrEmptyHint(modalCheckoutPlateImg, checkoutPlateEmpty, "", "Đang tải...");
 
-    if (takerMatchPill) {
-      takerMatchPill.className = "pill mono-num num";
-      takerMatchPill.textContent = "-";
+    if (row && isOut && rowSnap) {
+      // Hiển thị ngay thông tin & ảnh Check-out / Người lấy xe sẵn có của dòng đang chọn
+      const matchLabel = String(row["Đối chiếu"] || "-");
+      const isMismatch =
+        matchLabel.includes("Lệch") ||
+        (typeof row.face_match_score === "number" &&
+          row.face_match_score < faceMatchThreshold);
+      if (checkoutBadgePill) {
+        checkoutBadgePill.className = isMismatch ? "pill neg" : "pill pos";
+        checkoutBadgePill.textContent = "2. CHECK OUT (ĐÃ RA BÃI)";
+      }
+      if (checkoutRecordId) checkoutRecordId.textContent = `#${row["ID"]}`;
+      if (checkoutTime) checkoutTime.textContent = row["Thời gian nhận diện"] || "-";
+      if (checkoutParkingStatus) {
+        checkoutParkingStatus.textContent = "Đã lấy xe ra khỏi bãi";
+      }
+      if (checkoutMatchStatus) checkoutMatchStatus.textContent = matchLabel;
+      applyImageOrEmptyHint(
+        modalCheckoutPlateImg,
+        checkoutPlateEmpty,
+        rowSnap.realPlateImg,
+        "Không có ảnh lưu trữ"
+      );
+      if (takerMatchPill) {
+        takerMatchPill.className = isMismatch
+          ? "pill neg mono-num num"
+          : "pill pos mono-num num";
+        takerMatchPill.textContent = matchLabel;
+      }
+      applyImageOrEmptyHint(
+        modalTakerFaceImg,
+        takerFaceEmpty,
+        rowSnap.realFaceImg,
+        "Không có ảnh lưu trữ"
+      );
+      if (takerNoteText) takerNoteText.textContent = "";
+    } else {
+      if (checkoutBadgePill) {
+        checkoutBadgePill.className = "pill warn";
+        checkoutBadgePill.textContent = "2. CHECK OUT (ĐANG ĐỐI CHIẾU...)";
+      }
+      if (checkoutRecordId) checkoutRecordId.textContent = "#-";
+      if (checkoutTime) checkoutTime.textContent = "Đang đối chiếu...";
+      if (checkoutParkingStatus) checkoutParkingStatus.textContent = "-";
+      if (checkoutMatchStatus) checkoutMatchStatus.textContent = "-";
+      applyImageOrEmptyHint(
+        modalCheckoutPlateImg,
+        checkoutPlateEmpty,
+        "",
+        "Đang đối chiếu..."
+      );
+      if (takerMatchPill) {
+        takerMatchPill.className = "pill mono-num num";
+        takerMatchPill.textContent = "-";
+      }
+      applyImageOrEmptyHint(
+        modalTakerFaceImg,
+        takerFaceEmpty,
+        "",
+        "Đang đối chiếu..."
+      );
+      if (takerNoteText) takerNoteText.textContent = "";
     }
-    applyImageOrEmptyHint(modalTakerFaceImg, takerFaceEmpty, "", "Đang tải...");
-    if (takerNoteText) takerNoteText.textContent = "";
 
     snapshotModal.classList.remove("hidden");
   }
@@ -1925,7 +2031,43 @@
     const recId = Number(row["ID"]);
     const reqId = ++lostCaseReqSeq;
     isLostModalOpen = true;
-    renderLostModalLoadingState(row["Biển số"]);
+    const verSnapshot = lastRecordsVersion;
+    const cacheKey = `${verSnapshot}:${recId}`;
+
+    if (verSnapshot >= 0 && lostCaseClientCache.has(cacheKey)) {
+      renderLostVehicleModalCase(lostCaseClientCache.get(cacheKey));
+      return;
+    }
+
+    const dirCode = String(row.direction_code || "").toUpperCase();
+    const statusCode = String(row.parking_status_code || "").toUpperCase();
+
+    // Dòng IN đang gửi trong bãi (IN_PARKING) chắc chắn chưa có lượt OUT -> hiển thị đầy đủ tức thì 0 ms
+    if (verSnapshot >= 0 && dirCode === "IN" && statusCode === "IN_PARKING") {
+      const instantCase = computeLostCaseDetails(row, null, row["Biển số"]);
+      lostCaseClientCache.set(cacheKey, instantCase);
+      renderLostVehicleModalCase(instantCase);
+      return;
+    }
+
+    // Nếu dòng OUT có sẵn entry_record_id đang nằm ngay trong trang hiện tại -> ghép cặp tức thì 0 ms
+    if (verSnapshot >= 0 && dirCode === "OUT" && row.entry_record_id) {
+      const linkedCheckin = cachedHistoryRecords.find(
+        (r) => Number(r["ID"]) === Number(row.entry_record_id)
+      );
+      if (linkedCheckin) {
+        const instantLinkedCase = computeLostCaseDetails(
+          linkedCheckin,
+          row,
+          row["Biển số"]
+        );
+        lostCaseClientCache.set(cacheKey, instantLinkedCase);
+        renderLostVehicleModalCase(instantLinkedCase);
+        return;
+      }
+    }
+
+    renderLostModalLoadingState(row);
 
     if (!Number.isNaN(recId) && recId > 0) {
       try {
@@ -1940,6 +2082,9 @@
               payload.checkout_row || null,
               payload.plate_number || row["Biển số"]
             );
+            if (verSnapshot >= 0 && verSnapshot === lastRecordsVersion) {
+              lostCaseClientCache.set(cacheKey, authoritativeCase);
+            }
             renderLostVehicleModalCase(authoritativeCase);
             return;
           }
@@ -1951,8 +2096,7 @@
 
     if (reqId === lostCaseReqSeq && isLostModalOpen) {
       const isOut =
-        String(row.direction_code || "").toUpperCase() === "OUT" ||
-        String(row["Luồng"] || "").includes("Ra");
+        dirCode === "OUT" || String(row["Luồng"] || "").includes("Ra");
       const fallbackCase = computeLostCaseDetails(
         isOut ? null : row,
         isOut ? row : null,
@@ -2129,9 +2273,17 @@
     });
   }
 
+  function setHistoryTableLoading(isLoading) {
+    if (!historyTableBody) return;
+    historyTableBody.classList.toggle("table-loading", Boolean(isLoading));
+  }
+
   function applyManagementData(data, includeRecords = true) {
     const records = data.records || [];
-    const stats = data.stats || {
+    if (data.stats) {
+      cachedStatsData = data.stats;
+    }
+    const stats = data.stats || cachedStatsData || {
       total_records: records.length,
       today_records: 0,
       in_parking: 0,
@@ -2148,7 +2300,9 @@
     if (tabCountIn) tabCountIn.textContent = String(stats.total_in ?? 0);
     if (tabCountOut) tabCountOut.textContent = String(stats.total_out ?? 0);
 
-    renderRevenueSection(data.revenue);
+    if (data.revenue) {
+      renderRevenueSection(data.revenue);
+    }
 
     if (data.database_error) {
       showBanner(managementAlertBox, "error", `Chưa kết nối được MySQL: ${data.database_error}`);
@@ -2157,6 +2311,7 @@
     }
 
     if (includeRecords) {
+      setHistoryTableLoading(false);
       if (typeof data.page === "number" && data.page >= 1) {
         currentPage = data.page;
       }
@@ -2165,28 +2320,110 @@
     }
   }
 
-  async function fetchManagementOverview() {
+  function prefetchNextOverviewPage(ver, query, statusFilter, page, size, totalItems) {
+    if (typeof ver !== "number" || ver < 0) return;
+    const totalPages = Math.max(1, Math.ceil((Number(totalItems) || 0) / size));
+    const nextPage = page + 1;
+    if (nextPage > totalPages) return;
+
+    const nextKey = makeOverviewCacheKey(ver, query, statusFilter, nextPage, size);
+    if (overviewPageCache.has(nextKey) || overviewPrefetchInFlight.has(nextKey)) {
+      return;
+    }
+
+    const params = new URLSearchParams();
+    if (query) params.set("q", query);
+    if (statusFilter && statusFilter !== "all") {
+      params.set("status", statusFilter);
+    }
+    params.set("page", String(nextPage));
+    params.set("page_size", String(size));
+    params.set("include_revenue", "false");
+
+    overviewPrefetchInFlight.add(nextKey);
+    fetch(`/api/management/overview?${params.toString()}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data || data.database_error) return;
+        const dataVer =
+          typeof data.records_version === "number" ? data.records_version : ver;
+        if (dataVer === lastRecordsVersion) {
+          setOverviewClientCache(nextKey, data);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        overviewPrefetchInFlight.delete(nextKey);
+      });
+  }
+
+  async function fetchManagementOverview(options = {}) {
+    const forceNetwork = Boolean(options && options.forceNetwork);
     const reqSeq = ++overviewReqSeq;
     if (overviewAbortCtrl && typeof overviewAbortCtrl.abort === "function") {
       try {
         overviewAbortCtrl.abort();
       } catch (_) {}
     }
-    overviewAbortCtrl =
-      typeof AbortController === "function" ? new AbortController() : null;
+    overviewAbortCtrl = null;
 
     const isRevenueOnly = activeViewId === "view-revenue";
     const query = (searchPlateInput.value || "").trim();
+    const statusFilter = activeStatusFilter || "all";
+    const requestedPage = currentPage;
+    const requestedSize = pageSize;
+
+    // Trả ngay 0 ms từ RAM nếu trang đã có trong cache hoặc vừa được prefetch
+    if (!forceNetwork && !isRevenueOnly && lastRecordsVersion >= 0) {
+      const hitKey = makeOverviewCacheKey(
+        lastRecordsVersion,
+        query,
+        statusFilter,
+        requestedPage,
+        requestedSize
+      );
+      if (overviewPageCache.has(hitKey)) {
+        const cachedPayload = overviewPageCache.get(hitKey);
+        applyManagementData(cachedPayload, true);
+        prefetchNextOverviewPage(
+          lastRecordsVersion,
+          query,
+          statusFilter,
+          currentPage,
+          requestedSize,
+          cachedPayload.matched
+        );
+        return;
+      }
+    }
+    if (!forceNetwork && isRevenueOnly && lastRecordsVersion >= 0 && cachedRevenueData) {
+      if (cachedStatsData) {
+        applyManagementData(
+          { stats: cachedStatsData, revenue: cachedRevenueData, database_error: null },
+          false
+        );
+      } else {
+        renderRevenueSection(cachedRevenueData);
+      }
+      return;
+    }
+
+    overviewAbortCtrl =
+      typeof AbortController === "function" ? new AbortController() : null;
+
     const params = new URLSearchParams();
     if (isRevenueOnly) {
       params.set("include_records", "false");
+      params.set("include_revenue", "true");
     } else {
       if (query) params.set("q", query);
-      if (activeStatusFilter && activeStatusFilter !== "all") {
-        params.set("status", activeStatusFilter);
+      if (statusFilter && statusFilter !== "all") {
+        params.set("status", statusFilter);
       }
-      params.set("page", String(currentPage));
-      params.set("page_size", String(pageSize));
+      params.set("page", String(requestedPage));
+      params.set("page_size", String(requestedSize));
+      params.set("include_revenue", "false");
+      setHistoryTableLoading(true);
     }
     const qs = params.toString();
     const url = `/api/management/overview?${qs}`;
@@ -2201,12 +2438,36 @@
       const data = await res.json();
       if (reqSeq !== overviewReqSeq) return;
       if (typeof data.records_version === "number") {
+        if (data.records_version !== lastRecordsVersion) {
+          clearClientManagementCaches();
+        }
         lastRecordsVersion = data.records_version;
       }
       applyManagementData(data, !isRevenueOnly);
+      if (!isRevenueOnly && !data.database_error && lastRecordsVersion >= 0) {
+        const resolvedPage =
+          typeof data.page === "number" && data.page >= 1 ? data.page : requestedPage;
+        const storeKey = makeOverviewCacheKey(
+          lastRecordsVersion,
+          query,
+          statusFilter,
+          resolvedPage,
+          requestedSize
+        );
+        setOverviewClientCache(storeKey, data);
+        prefetchNextOverviewPage(
+          lastRecordsVersion,
+          query,
+          statusFilter,
+          resolvedPage,
+          requestedSize,
+          data.matched
+        );
+      }
     } catch (err) {
       if (err && err.name === "AbortError") return;
       if (reqSeq !== overviewReqSeq) return;
+      setHistoryTableLoading(false);
       showBanner(managementAlertBox, "error", "Không kết nối được tới máy chủ FastAPI.");
     }
   }
@@ -2722,16 +2983,18 @@
 
   btnRefreshManagement.addEventListener("click", async () => {
     btnRefreshManagement.disabled = true;
+    clearClientManagementCaches();
+    cachedRevenueData = null;
     try {
       const res = await fetch("/api/management/reconnect", { method: "POST" });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.detail || "Chưa kết nối được MySQL.");
       }
-      await fetchManagementOverview();
+      await fetchManagementOverview({ forceNetwork: true });
       showBanner(managementAlertBox, "success", "Đã làm mới dữ liệu từ MySQL.");
     } catch (err) {
-      await fetchManagementOverview();
+      await fetchManagementOverview({ forceNetwork: true });
       showBanner(managementAlertBox, "error", err.message);
     } finally {
       btnRefreshManagement.disabled = false;

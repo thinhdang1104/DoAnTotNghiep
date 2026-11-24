@@ -79,7 +79,8 @@ CROSS_DIRECTION_COOLDOWN_SECONDS = 12.0
 FACE_IDLE_EVERY_N_FRAMES = 2
 
 DB_RETRY_SECONDS = 15.0
-OVERVIEW_CACHE_MAX_SIZE = 6
+OVERVIEW_CACHE_MAX_SIZE = 20
+SESSION_CASE_CACHE_MAX_SIZE = 64
 MAX_PLATE_CROPS_PER_CAM = 8
 
 
@@ -422,6 +423,7 @@ class SystemState:
         self.records_version = 0
         self.overview_cache: dict[tuple, dict] = {}
         self.overview_summary_cache: dict[tuple, dict] = {}
+        self.session_case_cache: dict[tuple[int, int], dict] = {}
         self.overview_cache_date: str = ""
         self.writer_stop = threading.Event()
         self.writer_thread: threading.Thread | None = None
@@ -510,6 +512,7 @@ class SystemState:
             self.records_version += 1
             self.overview_cache.clear()
             self.overview_summary_cache.clear()
+            self.session_case_cache.clear()
 
     def get_cached_overview(
         self,
@@ -519,7 +522,11 @@ class SystemState:
         page: int = 1,
         page_size: int = 10,
         include_records: bool = True,
+        include_revenue: bool | None = None,
     ) -> dict | None:
+        effective_include_revenue = (
+            bool(include_revenue) if include_revenue is not None else (not include_records)
+        )
         today_str = now_vn().strftime("%Y-%m-%d")
         with self.lock:
             if self.overview_cache_date != today_str:
@@ -540,14 +547,23 @@ class SystemState:
             cached = self.overview_cache.get(key)
             summary_key = (today_str, ver)
             cached_summary = self.overview_summary_cache.get(summary_key)
-        if cached is not None:
-            return cached
 
-        need_summary = cached_summary is None
-        if not include_records and not need_summary and cached_summary is not None:
+        cached_stats = cached_summary.get("stats") if cached_summary else None
+        cached_revenue = cached_summary.get("revenue") if cached_summary else None
+
+        if cached is not None:
+            if not effective_include_revenue or cached.get("revenue") is not None:
+                return cached
+            if cached_revenue is not None:
+                return {**cached, "revenue": cached_revenue}
+
+        need_stats = cached_stats is None
+        need_revenue = effective_include_revenue and (cached_revenue is None)
+
+        if not include_records and not need_stats and not need_revenue:
             return {
-                "stats": cached_summary["stats"],
-                "revenue": cached_summary["revenue"],
+                "stats": cached_stats,
+                "revenue": cached_revenue,
                 "matched": 0,
                 "page": 1,
                 "records": [],
@@ -560,26 +576,54 @@ class SystemState:
             page=page,
             page_size=page_size,
             include_records=include_records,
-            include_stats_and_revenue=need_summary,
+            include_stats=need_stats,
+            include_revenue=need_revenue,
+            known_stats=cached_stats,
         )
 
-        # Luôn gắn stats & revenue từ cached_summary trước khi return (kể cả khi records_version vừa tăng giữa chừng)
-        if not need_summary and cached_summary is not None:
-            overview["stats"] = cached_summary["stats"]
-            overview["revenue"] = cached_summary["revenue"]
+        # Luôn gắn stats & revenue đã có trong cache trước khi return (kể cả khi records_version vừa tăng giữa chừng)
+        if overview.get("stats") is None and cached_stats is not None:
+            overview["stats"] = cached_stats
+        if overview.get("revenue") is None and cached_revenue is not None:
+            overview["revenue"] = cached_revenue
 
         with self.lock:
             if self.records_version == ver and self.overview_cache_date == today_str:
-                if need_summary and overview.get("stats") is not None:
-                    self.overview_summary_cache[summary_key] = {
-                        "stats": overview["stats"],
-                        "revenue": overview["revenue"],
-                    }
+                merged_summary = dict(
+                    self.overview_summary_cache.get(summary_key)
+                    or {"stats": None, "revenue": None}
+                )
+                if overview.get("stats") is not None:
+                    merged_summary["stats"] = overview["stats"]
+                if overview.get("revenue") is not None:
+                    merged_summary["revenue"] = overview["revenue"]
+                if merged_summary["stats"] is not None or merged_summary["revenue"] is not None:
+                    self.overview_summary_cache[summary_key] = merged_summary
+
                 if len(self.overview_cache) >= OVERVIEW_CACHE_MAX_SIZE:
                     oldest_key = next(iter(self.overview_cache))
                     self.overview_cache.pop(oldest_key, None)
                 self.overview_cache[key] = overview
         return overview
+
+    def get_cached_session_case(self, record_id: int) -> dict | None:
+        rec_id = int(record_id)
+        with self.lock:
+            ver = self.records_version
+            cache_key = (ver, rec_id)
+            cached_case = self.session_case_cache.get(cache_key)
+        if cached_case is not None:
+            return cached_case
+
+        case_data = fetch_parking_session_case(rec_id)
+        if case_data is not None:
+            with self.lock:
+                if self.records_version == ver:
+                    if len(self.session_case_cache) >= SESSION_CASE_CACHE_MAX_SIZE:
+                        oldest_key = next(iter(self.session_case_cache))
+                        self.session_case_cache.pop(oldest_key, None)
+                    self.session_case_cache[cache_key] = case_data
+        return case_data
 
     def connect_database(self) -> None:
         try:
@@ -1661,6 +1705,7 @@ def get_management_overview(
     page: int = 1,
     page_size: int = 10,
     include_records: bool = True,
+    include_revenue: bool | None = None,
 ):
     safe_limit = max(1, min(int(limit), 1000)) if limit is not None else None
     safe_page = max(1, int(page))
@@ -1679,6 +1724,7 @@ def get_management_overview(
                 page=safe_page,
                 page_size=safe_page_size,
                 include_records=include_records,
+                include_revenue=include_revenue,
             )
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
             state._set_db_status(False, str(error))
@@ -1699,7 +1745,7 @@ def get_management_overview(
 @app.get("/api/management/session-case/{record_id}")
 def get_parking_session_case(record_id: int):
     try:
-        case_data = fetch_parking_session_case(record_id)
+        case_data = state.get_cached_session_case(record_id)
         if case_data is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy bản ghi.")
         state._set_db_status(True, None)

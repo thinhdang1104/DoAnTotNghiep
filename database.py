@@ -1,6 +1,7 @@
 import math
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +27,9 @@ VN_TZ = timezone(timedelta(hours=7))
 _POOL_LOCK = threading.Lock()
 _MYSQL_POOL: pooling.MySQLConnectionPool | None = None
 _POOL_CONFIG_KEY: tuple | None = None
+_POOL_CREATED_AT: float = 0.0
+_CONN_LAST_ACTIVE: dict[int, float] = {}
+_POOL_IDLE_PING_SECONDS = 30.0
 
 
 def now_vn() -> datetime:
@@ -64,11 +68,31 @@ def _connection_config():
         "database": os.environ["MYSQL_DATABASE"],
         "connection_timeout": 8,
         "use_pure": True,
+        "autocommit": True,
     }
 
 
-def _connect_mysql():
-    global _MYSQL_POOL, _POOL_CONFIG_KEY
+def _raw_conn_id(conn) -> int:
+    return id(getattr(conn, "_cnx", conn))
+
+
+def _release_mysql(conn, had_error: bool = False) -> None:
+    if conn is None:
+        return
+    raw_id = _raw_conn_id(conn)
+    with _POOL_LOCK:
+        if had_error:
+            _CONN_LAST_ACTIVE[raw_id] = 0.0
+        else:
+            _CONN_LAST_ACTIVE[raw_id] = time.monotonic()
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _connect_mysql(force_ping: bool = False):
+    global _MYSQL_POOL, _POOL_CONFIG_KEY, _POOL_CREATED_AT
     config = _connection_config()
     cfg_key = (
         config["host"],
@@ -83,16 +107,26 @@ def _connect_mysql():
                 _MYSQL_POOL = pooling.MySQLConnectionPool(
                     pool_name="datn_mysql_pool",
                     pool_size=6,
-                    pool_reset_session=True,
+                    pool_reset_session=False,
                     **config,
                 )
                 _POOL_CONFIG_KEY = cfg_key
+                _POOL_CREATED_AT = time.monotonic()
+                _CONN_LAST_ACTIVE.clear()
             pool = _MYSQL_POOL
+            pool_created_at = _POOL_CREATED_AT
 
         conn = None
         try:
             conn = pool.get_connection()
-            conn.ping(reconnect=True, attempts=1, delay=0)
+            raw_id = _raw_conn_id(conn)
+            now_mono = time.monotonic()
+            with _POOL_LOCK:
+                last_ok = _CONN_LAST_ACTIVE.get(raw_id, pool_created_at)
+            if force_ping or (now_mono - last_ok) >= _POOL_IDLE_PING_SECONDS:
+                conn.ping(reconnect=True, attempts=1, delay=0)
+            with _POOL_LOCK:
+                _CONN_LAST_ACTIVE[raw_id] = time.monotonic()
             return conn
         except pooling.PoolError:
             # Khi pool tạm thời cạn kết nối -> mở kết nối trực tiếp dự phòng thay vì báo lỗi mất DB
@@ -100,13 +134,33 @@ def _connect_mysql():
         except MySQLError:
             # Nếu kết nối cũ trong pool bị Aiven đóng và ping thất bại -> trả slot về pool rồi mở kết nối mới
             if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                _release_mysql(conn, had_error=True)
             return mysql.connector.connect(**config)
     except MySQLError as error:
         raise DatabaseOperationError(str(error)) from error
+
+
+def _run_read_query(fn):
+    """Thực thi truy vấn đọc trên kết nối pool; nếu kết nối ngầm vừa bị đóng trước ngưỡng 30s thì tự kết nối lại 1 lần."""
+    last_error = None
+    for attempt in range(2):
+        connection = _connect_mysql(force_ping=(attempt > 0))
+        cursor = connection.cursor(dictionary=True)
+        had_error = False
+        try:
+            return fn(cursor)
+        except MySQLError as error:
+            had_error = True
+            last_error = error
+            if attempt == 1:
+                raise DatabaseOperationError(str(error)) from error
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            _release_mysql(connection, had_error=had_error)
+    raise DatabaseOperationError(str(last_error)) from last_error
 
 
 def _ensure_mysql_table(cursor):
@@ -392,8 +446,9 @@ def seed_demo_records_if_empty() -> int:
 
 def initialize_database() -> None:
     """Kết nối và khởi tạo bảng trên MySQL."""
-    connection = _connect_mysql()
+    connection = _connect_mysql(force_ping=True)
     cursor = connection.cursor(dictionary=True)
+    had_error = False
     try:
         _ensure_mysql_table(cursor)
         connection.commit()
@@ -402,10 +457,11 @@ def initialize_database() -> None:
             f"{os.getenv('MYSQL_HOST')}:{os.getenv('MYSQL_PORT', '3306')}/{os.getenv('MYSQL_DATABASE')}"
         )
     except MySQLError as error:
+        had_error = True
         raise DatabaseOperationError(str(error)) from error
     finally:
         cursor.close()
-        connection.close()
+        _release_mysql(connection, had_error=had_error)
     seed_demo_records_if_empty()
 
 
@@ -500,13 +556,9 @@ def _normalize_search(text: str) -> str:
 def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
     """Tìm phiên gửi xe đang ở trong bãi (IN_PARKING) gần nhất của biển số này."""
     norm_plate = _normalize_search(plate_number)
-    own_conn = cursor is None
-    connection = None
-    if own_conn:
-        connection = _connect_mysql()
-        cursor = connection.cursor(dictionary=True)
-    try:
-        cursor.execute(
+
+    def _query(cur):
+        cur.execute(
             """
             SELECT id, plate_number, recognized_at, face_embedding
             FROM plate_recognition_history
@@ -518,7 +570,7 @@ def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
             """,
             (norm_plate,),
         )
-        row = cursor.fetchone()
+        row = cur.fetchone()
         if not row:
             return None
         if not isinstance(row, dict):
@@ -537,12 +589,13 @@ def find_active_parking_session(plate_number: str, cursor=None) -> dict | None:
                 bytes(raw_emb) if raw_emb is not None else None
             ),
         }
-    except MySQLError as error:
-        raise DatabaseOperationError(str(error)) from error
-    finally:
-        if own_conn and connection is not None:
-            cursor.close()
-            connection.close()
+
+    if cursor is not None:
+        try:
+            return _query(cursor)
+        except MySQLError as error:
+            raise DatabaseOperationError(str(error)) from error
+    return _run_read_query(_query)
 
 
 def _find_last_embedding_mysql(cursor, plate_number: str) -> tuple[int | None, list[float] | None]:
@@ -672,6 +725,16 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
     }
 
 
+def _matched_from_stats(stats: dict, status_filter: str) -> int:
+    if status_filter == "in_parking":
+        return int(stats.get("in_parking") or 0)
+    if status_filter == "direction_in":
+        return int(stats.get("total_in") or 0)
+    if status_filter == "direction_out":
+        return int(stats.get("total_out") or 0)
+    return int(stats.get("total_records") or 0)
+
+
 def fetch_overview(
     query: str = "",
     status_filter: str = "all",
@@ -679,15 +742,20 @@ def fetch_overview(
     page: int = 1,
     page_size: int = 10,
     include_records: bool = True,
-    include_stats_and_revenue: bool = True,
+    include_stats: bool = True,
+    include_revenue: bool = False,
+    known_stats: dict | None = None,
+    include_stats_and_revenue: bool | None = None,
 ):
-    """Thống kê toàn bộ bảng + báo cáo doanh thu Ngày/Tháng/Năm + danh sách bản ghi phân trang."""
-    connection = _connect_mysql()
-    cursor = connection.cursor(dictionary=True)
-    try:
+    """Thống kê toàn bộ bảng + báo cáo doanh thu Ngày/Tháng/Năm (tùy chọn) + danh sách bản ghi phân trang."""
+    if include_stats_and_revenue is not None:
+        include_stats = bool(include_stats_and_revenue)
+        include_revenue = bool(include_stats_and_revenue)
+
+    def _query(cursor):
         stats_payload = None
         revenue_report = None
-        if include_stats_and_revenue:
+        if include_stats:
             today_start = now_vn().replace(hour=0, minute=0, second=0)
             cursor.execute(
                 """
@@ -713,6 +781,8 @@ def fetch_overview(
                 "total_in": total_in,
                 "total_out": total_out,
             }
+
+        if include_revenue:
             revenue_report = _fetch_revenue_report_mysql(cursor)
 
         if not include_records:
@@ -720,6 +790,7 @@ def fetch_overview(
                 "stats": stats_payload,
                 "revenue": revenue_report,
                 "matched": 0,
+                "page": 1,
                 "records": [],
             }
 
@@ -739,11 +810,15 @@ def fetch_overview(
 
         where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
-        cursor.execute(
-            f"SELECT COUNT(*) AS matched FROM plate_recognition_history {where_sql}",
-            params,
-        )
-        matched = int((cursor.fetchone() or {}).get("matched") or 0)
+        effective_stats = stats_payload or known_stats
+        if not normalized_query and effective_stats is not None:
+            matched = _matched_from_stats(effective_stats, status_filter)
+        else:
+            cursor.execute(
+                f"SELECT COUNT(*) AS matched FROM plate_recognition_history {where_sql}",
+                params,
+            )
+            matched = int((cursor.fetchone() or {}).get("matched") or 0)
 
         if limit is not None:
             effective_limit = max(1, int(limit))
@@ -755,21 +830,24 @@ def fetch_overview(
             safe_page = min(max(1, int(page)), total_pages)
             effective_offset = (safe_page - 1) * effective_limit
 
-        cursor.execute(
-            f"""
-            SELECT id, plate_number, direction, parking_status, entry_record_id,
-                   fee_amount, recognized_at, vote_count, sample_count,
-                   consensus_rate, face_detected, face_confidence,
-                   face_embedding IS NOT NULL AS face_embedding, face_match_score,
-                   plate_image, face_image, camera_index
-            FROM plate_recognition_history
-            {where_sql}
-            ORDER BY recognized_at DESC, id DESC
-            LIMIT %s OFFSET %s
-            """,
-            [*params, effective_limit, effective_offset],
-        )
-        records = [format_record_row(row["id"], row) for row in cursor.fetchall()]
+        if matched == 0:
+            records = []
+        else:
+            cursor.execute(
+                f"""
+                SELECT id, plate_number, direction, parking_status, entry_record_id,
+                       fee_amount, recognized_at, vote_count, sample_count,
+                       consensus_rate, face_detected, face_confidence,
+                       face_embedding IS NOT NULL AS face_embedding, face_match_score,
+                       plate_image, face_image, camera_index
+                FROM plate_recognition_history
+                {where_sql}
+                ORDER BY recognized_at DESC, id DESC
+                LIMIT %s OFFSET %s
+                """,
+                [*params, effective_limit, effective_offset],
+            )
+            records = [format_record_row(row["id"], row) for row in cursor.fetchall()]
 
         return {
             "stats": stats_payload,
@@ -778,17 +856,12 @@ def fetch_overview(
             "page": safe_page,
             "records": records,
         }
-    except MySQLError as error:
-        raise DatabaseOperationError(str(error)) from error
-    finally:
-        cursor.close()
-        connection.close()
+
+    return _run_read_query(_query)
 
 
 def fetch_parking_session_case(record_id: int) -> dict | None:
     """Truy vấn cặp bản ghi (Check-in & Check-out) trực tiếp từ MySQL theo ID được chọn và entry_record_id."""
-    connection = _connect_mysql()
-    cursor = connection.cursor(dictionary=True)
     select_cols = """
         SELECT id, plate_number, plate_key, direction, parking_status, entry_record_id,
                fee_amount, recognized_at, vote_count, sample_count,
@@ -797,7 +870,8 @@ def fetch_parking_session_case(record_id: int) -> dict | None:
                plate_image, face_image, camera_index
         FROM plate_recognition_history
     """
-    try:
+
+    def _query(cursor):
         cursor.execute(f"{select_cols} WHERE id = %s LIMIT 1", (int(record_id),))
         target = cursor.fetchone()
         if not target:
@@ -836,78 +910,81 @@ def fetch_parking_session_case(record_id: int) -> dict | None:
                 checkin_raw = cursor.fetchone()
         else:
             checkin_raw = target
-            cursor.execute(
-                f"""
-                {select_cols}
-                WHERE direction = 'OUT' AND entry_record_id = %s
-                ORDER BY recognized_at ASC, id ASC
-                LIMIT 1
-                """,
-                (int(target["id"]),),
-            )
-            checkout_raw = cursor.fetchone()
-
-            if checkout_raw is None:
-                norm_plate = target.get("plate_key") or _normalize_search(
-                    target.get("plate_number") or ""
-                )
+            in_status_raw = str(target.get("parking_status") or "").upper()
+            # Short-circuit: nếu dòng IN đang ở trạng thái IN_PARKING thì chắc chắn chưa có lượt OUT
+            if in_status_raw != "IN_PARKING":
                 cursor.execute(
-                    """
-                    SELECT id, recognized_at
-                    FROM plate_recognition_history
-                    WHERE plate_key = %s
-                      AND direction = 'IN'
-                      AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
+                    f"""
+                    {select_cols}
+                    WHERE direction = 'OUT' AND entry_record_id = %s
                     ORDER BY recognized_at ASC, id ASC
                     LIMIT 1
                     """,
-                    (
-                        norm_plate,
-                        target["recognized_at"],
-                        target["recognized_at"],
-                        int(target["id"]),
-                    ),
+                    (int(target["id"]),),
                 )
-                next_in = cursor.fetchone()
-                if next_in:
-                    cursor.execute(
-                        f"""
-                        {select_cols}
-                        WHERE plate_key = %s
-                          AND direction = 'OUT'
-                          AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
-                          AND (recognized_at < %s OR (recognized_at = %s AND id < %s))
-                        ORDER BY recognized_at ASC, id ASC
-                        LIMIT 1
-                        """,
-                        (
-                            norm_plate,
-                            target["recognized_at"],
-                            target["recognized_at"],
-                            int(target["id"]),
-                            next_in["recognized_at"],
-                            next_in["recognized_at"],
-                            int(next_in["id"]),
-                        ),
-                    )
-                else:
-                    cursor.execute(
-                        f"""
-                        {select_cols}
-                        WHERE plate_key = %s
-                          AND direction = 'OUT'
-                          AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
-                        ORDER BY recognized_at ASC, id ASC
-                        LIMIT 1
-                        """,
-                        (
-                            norm_plate,
-                            target["recognized_at"],
-                            target["recognized_at"],
-                            int(target["id"]),
-                        ),
-                    )
                 checkout_raw = cursor.fetchone()
+
+                if checkout_raw is None:
+                    norm_plate = target.get("plate_key") or _normalize_search(
+                        target.get("plate_number") or ""
+                    )
+                    cursor.execute(
+                        """
+                        SELECT id, recognized_at
+                        FROM plate_recognition_history
+                        WHERE plate_key = %s
+                          AND direction = 'IN'
+                          AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
+                        ORDER BY recognized_at ASC, id ASC
+                        LIMIT 1
+                        """,
+                        (
+                            norm_plate,
+                            target["recognized_at"],
+                            target["recognized_at"],
+                            int(target["id"]),
+                        ),
+                    )
+                    next_in = cursor.fetchone()
+                    if next_in:
+                        cursor.execute(
+                            f"""
+                            {select_cols}
+                            WHERE plate_key = %s
+                              AND direction = 'OUT'
+                              AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
+                              AND (recognized_at < %s OR (recognized_at = %s AND id < %s))
+                            ORDER BY recognized_at ASC, id ASC
+                            LIMIT 1
+                            """,
+                            (
+                                norm_plate,
+                                target["recognized_at"],
+                                target["recognized_at"],
+                                int(target["id"]),
+                                next_in["recognized_at"],
+                                next_in["recognized_at"],
+                                int(next_in["id"]),
+                            ),
+                        )
+                    else:
+                        cursor.execute(
+                            f"""
+                            {select_cols}
+                            WHERE plate_key = %s
+                              AND direction = 'OUT'
+                              AND (recognized_at > %s OR (recognized_at = %s AND id > %s))
+                            ORDER BY recognized_at ASC, id ASC
+                            LIMIT 1
+                            """,
+                            (
+                                norm_plate,
+                                target["recognized_at"],
+                                target["recognized_at"],
+                                int(target["id"]),
+                            ),
+                        )
+                    checkout_raw = cursor.fetchone()
 
         checkin_row = (
             format_record_row(checkin_raw["id"], checkin_raw) if checkin_raw else None
@@ -940,11 +1017,8 @@ def fetch_parking_session_case(record_id: int) -> dict | None:
             "in_parking_status": in_status,
             "session_closed_missing_exit": session_closed_missing_exit,
         }
-    except MySQLError as error:
-        raise DatabaseOperationError(str(error)) from error
-    finally:
-        cursor.close()
-        connection.close()
+
+    return _run_read_query(_query)
 
 
 def insert_plate_record(record: dict, connection=None) -> tuple[int, float | None]:
@@ -952,7 +1026,20 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
     own_connection = connection is None
     if own_connection:
         connection = _connect_mysql()
+        if hasattr(connection, "start_transaction"):
+            try:
+                if getattr(connection, "in_transaction", False) is False:
+                    connection.start_transaction()
+            except MySQLError:
+                _release_mysql(connection, had_error=True)
+                connection = _connect_mysql(force_ping=True)
+                if getattr(connection, "in_transaction", False) is False:
+                    connection.start_transaction()
+    elif hasattr(connection, "start_transaction") and getattr(connection, "in_transaction", False) is False:
+        connection.start_transaction()
+
     cursor = connection.cursor()
+    had_error = False
     try:
         direction = str(record.get("direction") or "IN").upper()
         embedding = record.get("face_embedding")
@@ -1022,9 +1109,13 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
         connection.commit()
         return cursor.lastrowid, match_score
     except MySQLError as error:
-        connection.rollback()
+        had_error = True
+        try:
+            connection.rollback()
+        except Exception:
+            pass
         raise DatabaseOperationError(str(error)) from error
     finally:
         cursor.close()
         if own_connection:
-            connection.close()
+            _release_mysql(connection, had_error=had_error)
