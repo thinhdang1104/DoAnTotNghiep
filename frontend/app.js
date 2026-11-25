@@ -85,8 +85,14 @@
 
   // Snapshot & Lost Vehicle Case (Check-in / Check-out / Người lấy xe) modal elements
   const snapshotModal = document.getElementById("snapshot-modal");
+  const snapshotModalCard = document.getElementById("snapshot-modal-card");
   const snapshotModalTitle = document.getElementById("snapshot-modal-title");
-  const snapshotModalMeta = document.getElementById("snapshot-modal-meta");
+  const checkinBadgePill = document.getElementById("checkin-badge-pill");
+  const checkinTimeLabel = document.getElementById("checkin-time-label");
+  const checkinPlateLabel = document.getElementById("checkin-plate-label");
+  const checkinFaceLabel = document.getElementById("checkin-face-label");
+  const checkinPlateImgLabel = document.getElementById("checkin-plate-img-label");
+  const checkinFaceImgLabel = document.getElementById("checkin-face-img-label");
   const modalPlateImg = document.getElementById("modal-plate-img");
   const modalFaceImg = document.getElementById("modal-face-img");
   const checkinPlateEmpty = document.getElementById("checkin-plate-empty");
@@ -242,10 +248,19 @@
     activateView("view-management");
   }
 
-  function renderDirectionPill(dirText) {
-    const str = String(dirText || "Vào bãi");
+  function renderDirectionPill(row) {
+    const str = String((row && typeof row === "object" ? row["Luồng"] : row) || "Vào bãi");
     if (str.includes("Ra")) {
-      return `<span class="pill warn">${escapeHtml(str)}</span>`;
+      const matchLabel =
+        row && typeof row === "object" ? String(row["Đối chiếu"] || "") : "";
+      const isMismatch =
+        matchLabel.includes("Lệch") ||
+        (row &&
+          typeof row === "object" &&
+          typeof row.face_match_score === "number" &&
+          row.face_match_score < faceMatchThreshold);
+      const pillClass = isMismatch ? "pill neg" : "pill warn";
+      return `<span class="${pillClass}">${escapeHtml(str)}</span>`;
     }
     return `<span class="pill pos">${escapeHtml(str)}</span>`;
   }
@@ -1840,7 +1855,7 @@
     const recId = escapeHtml(row["ID"]);
     return `
       <div class="snapshot-cell">
-        <button type="button" class="snap-thumb-btn" data-record-id="${recId}" title="Bấm để mở Hồ sơ đối chiếu Check-in / Check-out / Người lấy xe">
+        <button type="button" class="snap-thumb-btn" data-record-id="${recId}" title="Bấm để xem ảnh cắt biển số và khuôn mặt của lượt này">
           <img class="snap-plate-img" src="${plateImg}" alt="Biển số ${plate}" loading="lazy" />
           <img class="snap-face-img" src="${faceImg}" alt="Khuôn mặt ${plate}" loading="lazy" />
         </button>
@@ -1869,19 +1884,94 @@
     }
   }
 
+  function setModalPrimaryLabels(isSingleMode, isOutRow = false, isMismatch = false) {
+    if (snapshotModalCard) {
+      snapshotModalCard.classList.toggle("single-snapshot-mode", Boolean(isSingleMode));
+    }
+    if (isSingleMode && isOutRow) {
+      if (checkinBadgePill) {
+        checkinBadgePill.className = isMismatch ? "pill neg" : "pill warn";
+        checkinBadgePill.textContent = "CHECK OUT (LÚC LẤY XE)";
+      }
+      if (checkinTimeLabel) checkinTimeLabel.textContent = "Thời gian ra:";
+      if (checkinPlateLabel) checkinPlateLabel.textContent = "Biển số lúc ra:";
+      if (checkinFaceLabel) checkinFaceLabel.textContent = "Đối chiếu FaceNet:";
+      if (checkinPlateImgLabel) checkinPlateImgLabel.textContent = "Biển số Check-out";
+      if (checkinFaceImgLabel) checkinFaceImgLabel.textContent = "Người lấy xe (Check-out)";
+      return;
+    }
+    if (checkinBadgePill) {
+      checkinBadgePill.className = "pill pos";
+      checkinBadgePill.textContent = isSingleMode
+        ? "CHECK IN (LÚC GỬI XE)"
+        : "1. CHECK IN (LÚC GỬI XE)";
+    }
+    if (checkinTimeLabel) checkinTimeLabel.textContent = "Thời gian vào:";
+    if (checkinPlateLabel) checkinPlateLabel.textContent = "Biển số lúc vào:";
+    if (checkinFaceLabel) checkinFaceLabel.textContent = "Nhận diện mặt:";
+    if (checkinPlateImgLabel) checkinPlateImgLabel.textContent = "Biển số Check-in";
+    if (checkinFaceImgLabel) checkinFaceImgLabel.textContent = "Người gửi xe (Check-in)";
+  }
+
+  function openSingleSnapshotModalByRow(row) {
+    if (!snapshotModal || !row) return;
+    lostCaseReqSeq += 1;
+    isLostModalOpen = true;
+    activeLostCase = null;
+    if (btnExportLostCasePdf) {
+      btnExportLostCasePdf.disabled = true;
+    }
+
+    const plateNumber = row["Biển số"] || "-";
+    const isOut =
+      String(row.direction_code || "").toUpperCase() === "OUT" ||
+      String(row["Luồng"] || "").includes("Ra");
+    const matchLabel = String(row["Đối chiếu"] || "-");
+    const isMismatch =
+      isOut &&
+      (matchLabel.includes("Lệch") ||
+        (typeof row.face_match_score === "number" &&
+          row.face_match_score < faceMatchThreshold));
+    const snap = getRowSnapshots(row);
+
+    setModalPrimaryLabels(true, isOut, isMismatch);
+    if (snapshotModalTitle) {
+      snapshotModalTitle.textContent = `Biển số ${plateNumber}`;
+    }
+    if (checkinRecordId) checkinRecordId.textContent = `#${row["ID"]}`;
+    if (checkinTime) checkinTime.textContent = row["Thời gian nhận diện"] || "-";
+    if (checkinPlate) checkinPlate.textContent = plateNumber;
+    if (checkinFaceStatus) {
+      checkinFaceStatus.textContent = isOut
+        ? matchLabel
+        : row["Khuôn mặt"] || "Đã lưu mẫu mặt";
+    }
+    applyImageOrEmptyHint(
+      modalPlateImg,
+      checkinPlateEmpty,
+      snap.realPlateImg,
+      "Không có ảnh lưu trữ"
+    );
+    applyImageOrEmptyHint(
+      modalFaceImg,
+      checkinFaceEmpty,
+      snap.realFaceImg,
+      "Không có ảnh lưu trữ"
+    );
+
+    snapshotModal.classList.remove("hidden");
+  }
+
   function renderLostVehicleModalCase(caseData) {
     if (!snapshotModal || !caseData) return;
+    setModalPrimaryLabels(false, false, false);
     activeLostCase = caseData;
     if (btnExportLostCasePdf) {
       btnExportLostCasePdf.disabled = false;
     }
 
     if (snapshotModalTitle) {
-      snapshotModalTitle.textContent = `Hồ sơ Xử lý Mất xe · Biển số ${caseData.plateNumber}`;
-    }
-    if (snapshotModalMeta) {
-      snapshotModalMeta.textContent =
-        "Đối chiếu 3 thông tin: (1) Check-in lúc gửi · (2) Check-out lúc ra · (3) Khuôn mặt Người lấy xe";
+      snapshotModalTitle.textContent = `Biển số ${caseData.plateNumber}`;
     }
     if (lostCaseVerdictBanner) {
       lostCaseVerdictBanner.className = `lost-case-verdict verdict-${caseData.verdictType}`;
@@ -2026,6 +2116,7 @@
 
   function renderLostModalLoadingState(row) {
     if (!snapshotModal) return;
+    setModalPrimaryLabels(false, false, false);
     activeLostCase = null;
     if (btnExportLostCasePdf) {
       btnExportLostCasePdf.disabled = true;
@@ -2039,7 +2130,7 @@
     const rowSnap = row ? getRowSnapshots(row) : null;
 
     if (snapshotModalTitle) {
-      snapshotModalTitle.textContent = `Hồ sơ Xử lý Mất xe · Biển số ${plateNumber}`;
+      snapshotModalTitle.textContent = `Biển số ${plateNumber}`;
     }
     if (lostCaseVerdictBanner) {
       lostCaseVerdictBanner.className = "lost-case-verdict";
@@ -2263,7 +2354,10 @@
     if (!btn) return;
     const recId = Number(btn.getAttribute("data-record-id"));
     const row = cachedHistoryRecords.find((r) => Number(r["ID"]) === recId);
-    if (row) {
+    if (!row) return;
+    if (btn.classList.contains("snap-thumb-btn")) {
+      openSingleSnapshotModalByRow(row);
+    } else {
       openLostVehicleModalByRow(row);
     }
   });
@@ -2373,7 +2467,7 @@
           <tr>
             <td><span class="plate-cell-main mono-num num">${escapeHtml(row["Biển số"])}</span></td>
             <td>${renderSnapshotCell(row)}</td>
-            <td>${renderDirectionPill(row["Luồng"])}</td>
+            <td>${renderDirectionPill(row)}</td>
             <td class="n mono-num num">${escapeHtml(row["Thời gian nhận diện"])}</td>
             <td class="n mono-num num">#${escapeHtml(row["ID"])}</td>
             <td class="n">

@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=20261125b" />
+  <link rel="stylesheet" href="styles.css?v=20261125e" />
 </head>
 <body>
   <div class="app-shell">
@@ -460,13 +460,12 @@
       </section>
     </main>
 
-    <!-- MODAL XỬ LÝ TÌNH HUỐNG MẤT XE (CHECK IN, CHECK OUT, NGƯỜI LẤY XE) -->
+    <!-- MODAL XEM ẢNH CẮT & HỒ SƠ TRA CỨU MẤT XE (CHECK IN, CHECK OUT, NGƯỜI LẤY XE) -->
     <div id="snapshot-modal" class="snapshot-modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="snapshot-modal-title">
-      <div class="snapshot-modal-card lost-case-modal-card">
+      <div id="snapshot-modal-card" class="snapshot-modal-card lost-case-modal-card">
         <header class="snapshot-modal-header">
           <div>
-            <h3 id="snapshot-modal-title" class="snapshot-modal-title mono-num">Hồ sơ Tra cứu &amp; Xử lý Mất xe</h3>
-            <p id="snapshot-modal-meta" class="snapshot-modal-meta">Đối chiếu thông tin Check-in · Check-out · Người lấy xe</p>
+            <h3 id="snapshot-modal-title" class="snapshot-modal-title mono-num">Biển số -</h3>
           </div>
           <div class="snapshot-modal-actions">
             <button id="btn-export-lost-case-pdf" type="button" class="btn primary">
@@ -487,38 +486,38 @@
 
         <!-- 3 KHỐI THÔNG TIN: 1. CHECK IN | 2. CHECK OUT | 3. NGƯỜI LẤY XE -->
         <div class="lost-case-grid">
-          <!-- KHỐI 1: CHECK IN (LÚC GỬI XE) -->
-          <section class="lost-case-col">
+          <!-- KHỐI 1: CHECK IN (hoặc xem ảnh cắt đơn của 1 lượt VÀO / RA) -->
+          <section class="lost-case-col" id="modal-col-primary">
             <div class="lost-case-col-header">
-              <span class="pill pos">1. CHECK IN (LÚC GỬI XE)</span>
+              <span id="checkin-badge-pill" class="pill pos">1. CHECK IN (LÚC GỬI XE)</span>
               <span id="checkin-record-id" class="stamp mono-num num">#-</span>
             </div>
             <div class="lost-case-meta-list">
               <div class="lost-case-meta-row">
-                <span>Thời gian vào:</span>
+                <span id="checkin-time-label">Thời gian vào:</span>
                 <strong id="checkin-time" class="mono-num num">-</strong>
               </div>
               <div class="lost-case-meta-row">
-                <span>Biển số lúc vào:</span>
+                <span id="checkin-plate-label">Biển số lúc vào:</span>
                 <strong id="checkin-plate" class="plate-cell-main mono-num num">-</strong>
               </div>
               <div class="lost-case-meta-row">
-                <span>Nhận diện mặt:</span>
+                <span id="checkin-face-label">Nhận diện mặt:</span>
                 <strong id="checkin-face-status">-</strong>
               </div>
             </div>
             <div class="lost-case-photos-pair">
               <div class="snapshot-box">
-                <span class="snapshot-box-label">Biển số Check-in</span>
+                <span id="checkin-plate-img-label" class="snapshot-box-label">Biển số Check-in</span>
                 <div class="snapshot-img-frame small-frame">
-                  <img id="modal-plate-img" src="" alt="Ảnh biển số lúc vào" />
+                  <img id="modal-plate-img" src="" alt="Ảnh biển số" />
                   <span id="checkin-plate-empty" class="snapshot-empty-hint hidden">Không có ảnh lưu trữ</span>
                 </div>
               </div>
               <div class="snapshot-box">
-                <span class="snapshot-box-label">Người gửi xe (Check-in)</span>
+                <span id="checkin-face-img-label" class="snapshot-box-label">Người gửi xe (Check-in)</span>
                 <div class="snapshot-img-frame small-frame">
-                  <img id="modal-face-img" src="" alt="Ảnh khuôn mặt người gửi xe" />
+                  <img id="modal-face-img" src="" alt="Ảnh khuôn mặt" />
                   <span id="checkin-face-empty" class="snapshot-empty-hint hidden">Không có ảnh lưu trữ</span>
                 </div>
               </div>
@@ -526,7 +525,7 @@
           </section>
 
           <!-- KHỐI 2: CHECK OUT (LÚC LẤY XE) -->
-          <section class="lost-case-col">
+          <section class="lost-case-col" id="modal-col-checkout">
             <div class="lost-case-col-header">
               <span id="checkout-badge-pill" class="pill warn">2. CHECK OUT (LÚC LẤY XE)</span>
               <span id="checkout-record-id" class="stamp mono-num num">#-</span>
@@ -555,7 +554,7 @@
           </section>
 
           <!-- KHỐI 3: NGƯỜI LẤY XE (TRÍCH XUẤT BẰNG CHỨNG) -->
-          <section class="lost-case-col highlight-taker-col">
+          <section class="lost-case-col highlight-taker-col" id="modal-col-taker">
             <div class="lost-case-col-header">
               <span class="pill neg">3. NGƯỜI LẤY XE</span>
               <span id="taker-match-pill" class="pill mono-num num">-</span>
@@ -574,6 +573,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261125c"></script>
+  <script src="app.js?v=20261125e"></script>
 </body>
 </html>
