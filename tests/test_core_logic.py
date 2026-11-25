@@ -371,84 +371,41 @@ class TestSystemStateRegressions(unittest.TestCase):
         self.assertEqual(res["records"], [])
         st.stop_db_writer()
 
-    def test_connect_mysql_closes_leaked_conn_on_ping_failure(self):
-        """Regression Pool Leak:
-        Khi pool.get_connection() trả về kết nối bị ngắt và conn.ping() ném MySQLError,
-        phải gọi conn.close() để trả slot về pool rồi mới fallback sang mysql.connector.connect().
+    def test_direct_connect_mysql_timeouts_and_error_wrapping(self):
+        """Kiểm chứng kết nối trực tiếp MySQL (không dùng Pool tránh treo socket qua đêm):
+        - Cấu hình luôn gắn đủ connection_timeout=8, read_timeout=10, write_timeout=10.
+        - _connect_mysql() gọi thẳng mysql.connector.connect(**config) và bọc MySQLError thành DatabaseOperationError.
         """
-        leaked_conn = mock.MagicMock()
-        leaked_conn.ping.side_effect = database.MySQLError("Server has gone away")
-        fresh_conn = mock.MagicMock()
-
-        fake_pool = mock.MagicMock()
-        fake_pool.get_connection.return_value = leaked_conn
-        fake_cfg = {
-            "host": "localhost",
-            "port": 3306,
-            "user": "root",
-            "password": "pw",
-            "database": "defaultdb",
-        }
-        cfg_key = ("localhost", 3306, "root", "pw", "defaultdb")
-
-        with mock.patch("database._connection_config", return_value=fake_cfg), mock.patch.object(
-            database, "_MYSQL_POOL", fake_pool
-        ), mock.patch.object(database, "_POOL_CONFIG_KEY", cfg_key), mock.patch.object(
-            database, "_POOL_CREATED_AT", -100.0
-        ), mock.patch.object(
-            database, "_CONN_LAST_ACTIVE", {}
-        ), mock.patch(
-            "database.mysql.connector.connect", return_value=fresh_conn
-        ) as mock_direct_connect:
-            conn = database._connect_mysql()
-
-        self.assertIs(conn, fresh_conn)
-        leaked_conn.close.assert_called_once()
-        mock_direct_connect.assert_called_once()
-
-    def test_connect_mysql_skips_ping_when_recently_active_and_retries_stale_read(self):
-        """Kiểm chứng cắt 2 vòng mạng thừa:
-        - Kết nối vừa hoạt động (< 30s) không gọi conn.ping().
-        - Nếu câu đọc gặp MySQLError trên kết nối ngầm bị đóng trước 30s, _run_read_query tự retry 1 lần với force_ping=True.
-        """
-        warm_conn = mock.MagicMock()
-        raw_id = database._raw_conn_id(warm_conn)
-        fake_pool = mock.MagicMock()
-        fake_pool.get_connection.return_value = warm_conn
-        fake_cfg = {
-            "host": "localhost",
-            "port": 3306,
-            "user": "root",
-            "password": "pw",
-            "database": "defaultdb",
-            "autocommit": True,
-        }
-        cfg_key = ("localhost", 3306, "root", "pw", "defaultdb")
-        now_val = database.time.monotonic()
-
-        with mock.patch("database._connection_config", return_value=fake_cfg), mock.patch.object(
-            database, "_MYSQL_POOL", fake_pool
-        ), mock.patch.object(database, "_POOL_CONFIG_KEY", cfg_key), mock.patch.object(
-            database, "_POOL_CREATED_AT", now_val
-        ), mock.patch.object(
-            database, "_CONN_LAST_ACTIVE", {raw_id: now_val}
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "MYSQL_HOST": "localhost",
+                "MYSQL_PORT": "3306",
+                "MYSQL_USER": "root",
+                "MYSQL_PASSWORD": "pw",
+                "MYSQL_DATABASE": "defaultdb",
+            },
+            clear=False,
         ):
-            conn = database._connect_mysql()
-            self.assertIs(conn, warm_conn)
-            warm_conn.ping.assert_not_called()
+            cfg = database._connection_config()
+            self.assertEqual(cfg["connection_timeout"], 8)
+            self.assertEqual(cfg["read_timeout"], 10)
+            self.assertEqual(cfg["write_timeout"], 10)
 
-            # Giả lập lần đọc thứ 1 bị đứt kết nối ngầm, lần retry thứ 2 thành công
-            stale_cursor = mock.MagicMock()
-            stale_cursor.execute.side_effect = database.MySQLError("Lost connection during query")
-            good_cursor = mock.MagicMock()
-            good_cursor.fetchone.return_value = {"ok": 1}
-            warm_conn.cursor.side_effect = [stale_cursor, good_cursor]
+            fresh_conn = mock.MagicMock()
+            with mock.patch(
+                "database.mysql.connector.connect", return_value=fresh_conn
+            ) as mock_connect:
+                conn = database._connect_mysql()
+                self.assertIs(conn, fresh_conn)
+                mock_connect.assert_called_once_with(**cfg)
 
-            result = database._run_read_query(
-                lambda cur: (cur.execute("SELECT 1"), cur.fetchone())[1]
-            )
-            self.assertEqual(result, {"ok": 1})
-            warm_conn.ping.assert_called_once_with(reconnect=True, attempts=1, delay=0)
+            with mock.patch(
+                "database.mysql.connector.connect",
+                side_effect=database.MySQLError("Connection refused"),
+            ):
+                with self.assertRaises(DatabaseOperationError):
+                    database._connect_mysql()
 
     def test_fetch_overview_skips_revenue_and_count_queries_on_history_tab(self):
         """Kiểm chứng giảm vòng mạng tab Lịch sử & Phân trang:

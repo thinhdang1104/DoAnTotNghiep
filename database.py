@@ -1,13 +1,10 @@
 import math
 import os
-import threading
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import mysql.connector
 from mysql.connector import Error as MySQLError
-from mysql.connector import pooling
 from dotenv import load_dotenv
 
 from face_service import (
@@ -23,13 +20,6 @@ load_dotenv(BASE_DIR / ".env")
 
 PARKING_FEE_VND = 2000  # 2.000 VNĐ / lượt giữ xe
 VN_TZ = timezone(timedelta(hours=7))
-
-_POOL_LOCK = threading.Lock()
-_MYSQL_POOL: pooling.MySQLConnectionPool | None = None
-_POOL_CONFIG_KEY: tuple | None = None
-_POOL_CREATED_AT: float = 0.0
-_CONN_LAST_ACTIVE: dict[int, float] = {}
-_POOL_IDLE_PING_SECONDS = 30.0
 
 
 def now_vn() -> datetime:
@@ -67,100 +57,30 @@ def _connection_config():
         "password": os.environ["MYSQL_PASSWORD"],
         "database": os.environ["MYSQL_DATABASE"],
         "connection_timeout": 8,
+        "read_timeout": 10,
+        "write_timeout": 10,
         "use_pure": True,
-        "autocommit": True,
     }
 
 
-def _raw_conn_id(conn) -> int:
-    return id(getattr(conn, "_cnx", conn))
-
-
-def _release_mysql(conn, had_error: bool = False) -> None:
-    if conn is None:
-        return
-    raw_id = _raw_conn_id(conn)
-    with _POOL_LOCK:
-        if had_error:
-            _CONN_LAST_ACTIVE[raw_id] = 0.0
-        else:
-            _CONN_LAST_ACTIVE[raw_id] = time.monotonic()
-    try:
-        conn.close()
-    except Exception:
-        pass
-
-
-def _connect_mysql(force_ping: bool = False):
-    global _MYSQL_POOL, _POOL_CONFIG_KEY, _POOL_CREATED_AT
+def _connect_mysql():
     config = _connection_config()
-    cfg_key = (
-        config["host"],
-        config["port"],
-        config["user"],
-        config["password"],
-        config["database"],
-    )
     try:
-        with _POOL_LOCK:
-            if _MYSQL_POOL is None or _POOL_CONFIG_KEY != cfg_key:
-                _MYSQL_POOL = pooling.MySQLConnectionPool(
-                    pool_name="datn_mysql_pool",
-                    pool_size=6,
-                    pool_reset_session=False,
-                    **config,
-                )
-                _POOL_CONFIG_KEY = cfg_key
-                _POOL_CREATED_AT = time.monotonic()
-                _CONN_LAST_ACTIVE.clear()
-            pool = _MYSQL_POOL
-            pool_created_at = _POOL_CREATED_AT
-
-        conn = None
-        try:
-            conn = pool.get_connection()
-            raw_id = _raw_conn_id(conn)
-            now_mono = time.monotonic()
-            with _POOL_LOCK:
-                last_ok = _CONN_LAST_ACTIVE.get(raw_id, pool_created_at)
-            if force_ping or (now_mono - last_ok) >= _POOL_IDLE_PING_SECONDS:
-                conn.ping(reconnect=True, attempts=1, delay=0)
-            with _POOL_LOCK:
-                _CONN_LAST_ACTIVE[raw_id] = time.monotonic()
-            return conn
-        except pooling.PoolError:
-            # Khi pool tạm thời cạn kết nối -> mở kết nối trực tiếp dự phòng thay vì báo lỗi mất DB
-            return mysql.connector.connect(**config)
-        except MySQLError:
-            # Nếu kết nối cũ trong pool bị Aiven đóng và ping thất bại -> trả slot về pool rồi mở kết nối mới
-            if conn is not None:
-                _release_mysql(conn, had_error=True)
-            return mysql.connector.connect(**config)
+        return mysql.connector.connect(**config)
     except MySQLError as error:
         raise DatabaseOperationError(str(error)) from error
 
 
 def _run_read_query(fn):
-    """Thực thi truy vấn đọc trên kết nối pool; nếu kết nối ngầm vừa bị đóng trước ngưỡng 30s thì tự kết nối lại 1 lần."""
-    last_error = None
-    for attempt in range(2):
-        connection = _connect_mysql(force_ping=(attempt > 0))
-        cursor = connection.cursor(dictionary=True)
-        had_error = False
-        try:
-            return fn(cursor)
-        except MySQLError as error:
-            had_error = True
-            last_error = error
-            if attempt == 1:
-                raise DatabaseOperationError(str(error)) from error
-        finally:
-            try:
-                cursor.close()
-            except Exception:
-                pass
-            _release_mysql(connection, had_error=had_error)
-    raise DatabaseOperationError(str(last_error)) from last_error
+    connection = _connect_mysql()
+    cursor = connection.cursor(dictionary=True)
+    try:
+        return fn(cursor)
+    except MySQLError as error:
+        raise DatabaseOperationError(str(error)) from error
+    finally:
+        cursor.close()
+        connection.close()
 
 
 def _ensure_mysql_table(cursor):
@@ -446,9 +366,8 @@ def seed_demo_records_if_empty() -> int:
 
 def initialize_database() -> None:
     """Kết nối và khởi tạo bảng trên MySQL."""
-    connection = _connect_mysql(force_ping=True)
+    connection = _connect_mysql()
     cursor = connection.cursor(dictionary=True)
-    had_error = False
     try:
         _ensure_mysql_table(cursor)
         connection.commit()
@@ -457,11 +376,10 @@ def initialize_database() -> None:
             f"{os.getenv('MYSQL_HOST')}:{os.getenv('MYSQL_PORT', '3306')}/{os.getenv('MYSQL_DATABASE')}"
         )
     except MySQLError as error:
-        had_error = True
         raise DatabaseOperationError(str(error)) from error
     finally:
         cursor.close()
-        _release_mysql(connection, had_error=had_error)
+        connection.close()
     seed_demo_records_if_empty()
 
 
@@ -1026,20 +944,7 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
     own_connection = connection is None
     if own_connection:
         connection = _connect_mysql()
-        if hasattr(connection, "start_transaction"):
-            try:
-                if getattr(connection, "in_transaction", False) is False:
-                    connection.start_transaction()
-            except MySQLError:
-                _release_mysql(connection, had_error=True)
-                connection = _connect_mysql(force_ping=True)
-                if getattr(connection, "in_transaction", False) is False:
-                    connection.start_transaction()
-    elif hasattr(connection, "start_transaction") and getattr(connection, "in_transaction", False) is False:
-        connection.start_transaction()
-
     cursor = connection.cursor()
-    had_error = False
     try:
         direction = str(record.get("direction") or "IN").upper()
         embedding = record.get("face_embedding")
@@ -1109,7 +1014,6 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
         connection.commit()
         return cursor.lastrowid, match_score
     except MySQLError as error:
-        had_error = True
         try:
             connection.rollback()
         except Exception:
@@ -1118,4 +1022,4 @@ def insert_plate_record(record: dict, connection=None) -> tuple[int, float | Non
     finally:
         cursor.close()
         if own_connection:
-            _release_mysql(connection, had_error=had_error)
+            connection.close()

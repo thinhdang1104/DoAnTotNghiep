@@ -123,7 +123,7 @@
   let isLostModalOpen = false;
   let lostCaseReqSeq = 0;
   let overviewReqSeq = 0;
-  let overviewAbortCtrl = null;
+  let overviewInFlight = false;
   let currentPage = 1;
   let pageSize = 10;
   let isCameraStreaming = false;
@@ -1598,9 +1598,13 @@
       typeof state.records_version === "number" &&
       state.records_version !== lastRecordsVersion
     ) {
+      const wasUninitialized = lastRecordsVersion < 0;
       lastRecordsVersion = state.records_version;
       clearClientManagementCaches();
-      if (activeViewId === "view-management" || activeViewId === "view-revenue") {
+      if (
+        (activeViewId === "view-management" || activeViewId === "view-revenue") &&
+        !(wasUninitialized && overviewInFlight)
+      ) {
         fetchManagementOverview();
       }
     }
@@ -2488,12 +2492,6 @@
   async function fetchManagementOverview(options = {}) {
     const forceNetwork = Boolean(options && options.forceNetwork);
     const reqSeq = ++overviewReqSeq;
-    if (overviewAbortCtrl && typeof overviewAbortCtrl.abort === "function") {
-      try {
-        overviewAbortCtrl.abort();
-      } catch (_) {}
-    }
-    overviewAbortCtrl = null;
 
     const isRevenueOnly = activeViewId === "view-revenue";
     const query = (searchPlateInput.value || "").trim();
@@ -2536,9 +2534,6 @@
       return;
     }
 
-    overviewAbortCtrl =
-      typeof AbortController === "function" ? new AbortController() : null;
-
     const params = new URLSearchParams();
     if (isRevenueOnly) {
       params.set("include_records", "false");
@@ -2556,11 +2551,9 @@
     const qs = params.toString();
     const url = `/api/management/overview?${qs}`;
 
+    overviewInFlight = true;
     try {
-      const fetchOpts = overviewAbortCtrl
-        ? { signal: overviewAbortCtrl.signal }
-        : undefined;
-      const res = await fetch(url, fetchOpts);
+      const res = await fetch(url);
       if (reqSeq !== overviewReqSeq) return;
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
@@ -2592,11 +2585,14 @@
           data.matched
         );
       }
-    } catch (err) {
-      if (err && err.name === "AbortError") return;
+    } catch (_) {
       if (reqSeq !== overviewReqSeq) return;
       setHistoryTableLoading(false);
       showBanner(managementAlertBox, "error", "Không kết nối được tới máy chủ FastAPI.");
+    } finally {
+      if (reqSeq === overviewReqSeq) {
+        overviewInFlight = false;
+      }
     }
   }
 
