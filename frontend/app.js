@@ -67,6 +67,9 @@
   const revPeriodBtns = document.querySelectorAll(".rev-period-btn[data-rev-period]");
   const revenuePeriodColTitle = document.getElementById("revenue-period-col-title");
   const revenueTableBody = document.getElementById("revenue-table-body");
+  const revPaginationRangeText = document.getElementById("rev-pagination-range-text");
+  const revPageSizeSelect = document.getElementById("rev-page-size-select");
+  const revPaginationControls = document.getElementById("rev-pagination-controls");
 
   const tabLinks = document.querySelectorAll(".tab-link[data-status-filter]");
   const tabCountAll = document.getElementById("tab-count-all");
@@ -122,6 +125,8 @@
   let activeStatusFilter = "all";
   let activeDirectionSort = "";
   let activeRevenuePeriod = "daily";
+  let revCurrentPage = 1;
+  let revPageSize = 10;
   let cachedRevenueData = null;
   let cachedHistoryRecords = [];
   let cachedMatchedCount = 0;
@@ -1632,6 +1637,52 @@
     return `${val.toLocaleString("de-DE")} đ`;
   }
 
+  function renderRevenuePaginationControls(totalItems, totalPages) {
+    if (!revPaginationControls) return;
+
+    if (totalItems === 0) {
+      if (revPaginationRangeText) {
+        revPaginationRangeText.textContent = "Hiển thị 0–0";
+      }
+      revPaginationControls.innerHTML = "";
+      return;
+    }
+
+    const startIdx = (revCurrentPage - 1) * revPageSize + 1;
+    const endIdx = Math.min(totalItems, revCurrentPage * revPageSize);
+    if (revPaginationRangeText) {
+      revPaginationRangeText.textContent = `Hiển thị ${startIdx}–${endIdx}`;
+    }
+
+    const pageItems = buildPageNumbers(totalPages, revCurrentPage);
+    const buttonsHtml = [];
+
+    buttonsHtml.push(
+      `<button type="button" class="page-btn" data-rev-page="${revCurrentPage - 1}" ${
+        revCurrentPage <= 1 ? "disabled" : ""
+      } title="Trang trước">‹ Trước</button>`
+    );
+
+    pageItems.forEach((item) => {
+      if (item === "...") {
+        buttonsHtml.push(`<span class="page-ellipsis">…</span>`);
+      } else {
+        const activeClass = item === revCurrentPage ? " active" : "";
+        buttonsHtml.push(
+          `<button type="button" class="page-btn${activeClass}" data-rev-page="${item}">${item}</button>`
+        );
+      }
+    });
+
+    buttonsHtml.push(
+      `<button type="button" class="page-btn" data-rev-page="${revCurrentPage + 1}" ${
+        revCurrentPage >= totalPages ? "disabled" : ""
+      } title="Trang sau">Sau ›</button>`
+    );
+
+    revPaginationControls.innerHTML = buttonsHtml.join("");
+  }
+
   function renderRevenueBreakdownTable() {
     if (!revenueTableBody) return;
 
@@ -1658,10 +1709,19 @@
           <td colspan="4">Chưa có dữ liệu doanh thu trong kỳ này.</td>
         </tr>
       `;
+      renderRevenuePaginationControls(0, 1);
       return;
     }
 
-    revenueTableBody.innerHTML = rows
+    const totalItems = rows.length;
+    const totalPages = Math.max(1, Math.ceil(totalItems / revPageSize));
+    if (revCurrentPage > totalPages) revCurrentPage = totalPages;
+    if (revCurrentPage < 1) revCurrentPage = 1;
+
+    const startOffset = (revCurrentPage - 1) * revPageSize;
+    const pageRows = rows.slice(startOffset, startOffset + revPageSize);
+
+    revenueTableBody.innerHTML = pageRows
       .map(
         (item) => `
           <tr>
@@ -1673,6 +1733,29 @@
         `
       )
       .join("");
+
+    renderRevenuePaginationControls(totalItems, totalPages);
+  }
+
+  if (revPaginationControls) {
+    revPaginationControls.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-rev-page]");
+      if (!btn || btn.disabled) return;
+      const targetPage = parseInt(btn.getAttribute("data-rev-page") || "1", 10);
+      if (!Number.isNaN(targetPage) && targetPage !== revCurrentPage) {
+        revCurrentPage = targetPage;
+        renderRevenueBreakdownTable();
+      }
+    });
+  }
+
+  if (revPageSizeSelect) {
+    revPageSizeSelect.addEventListener("change", () => {
+      const val = parseInt(revPageSizeSelect.value || "10", 10);
+      revPageSize = Number.isNaN(val) || val < 1 ? 10 : val;
+      revCurrentPage = 1;
+      renderRevenueBreakdownTable();
+    });
   }
 
   function renderRevenueSection(revenue) {
@@ -1706,6 +1789,7 @@
       btn.setAttribute("aria-pressed", "true");
       btn.classList.add("highlight-card");
       activeRevenuePeriod = btn.getAttribute("data-rev-period") || "daily";
+      revCurrentPage = 1;
       renderRevenueBreakdownTable();
     });
   });
@@ -2609,9 +2693,9 @@
     }
     thDirectionSort.title = "Bấm để sắp xếp Ra bãi lệch mặt / không lệch mặt";
     if (activeDirectionSort === "mismatch_first") {
-      directionSortIndicator.textContent = "▾ Lệch trước";
+      directionSortIndicator.textContent = "▾";
     } else if (activeDirectionSort === "matched_first") {
-      directionSortIndicator.textContent = "▴ Khớp trước";
+      directionSortIndicator.textContent = "▴";
     } else {
       directionSortIndicator.textContent = "⇅";
     }

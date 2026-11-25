@@ -563,7 +563,6 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
         WHERE direction = 'IN'
         GROUP BY DATE(recognized_at), DATE_FORMAT(recognized_at, '%d/%m/%Y')
         ORDER BY sort_date DESC
-        LIMIT 14
         """
     )
     daily_rows = [
@@ -587,7 +586,6 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
         WHERE direction = 'IN'
         GROUP BY sort_month, period_label
         ORDER BY sort_month DESC
-        LIMIT 12
         """
     )
     monthly_rows = [
@@ -611,7 +609,6 @@ def _fetch_revenue_report_mysql(cursor) -> dict:
         WHERE direction = 'IN'
         GROUP BY sort_year, period_label
         ORDER BY sort_year DESC
-        LIMIT 10
         """
     )
     yearly_rows = [
@@ -1362,7 +1359,7 @@ class WarmDatabaseMirror:
                 "unit_price": PARKING_FEE_VND,
                 "revenue": val[2],
             }
-            for _, val in sorted(daily_buckets.items(), key=lambda kv: kv[0], reverse=True)[:14]
+            for _, val in sorted(daily_buckets.items(), key=lambda kv: kv[0], reverse=True)
         ]
         monthly_rows = [
             {
@@ -1371,7 +1368,7 @@ class WarmDatabaseMirror:
                 "unit_price": PARKING_FEE_VND,
                 "revenue": val[2],
             }
-            for _, val in sorted(monthly_buckets.items(), key=lambda kv: kv[0], reverse=True)[:12]
+            for _, val in sorted(monthly_buckets.items(), key=lambda kv: kv[0], reverse=True)
         ]
         yearly_rows = [
             {
@@ -1380,7 +1377,7 @@ class WarmDatabaseMirror:
                 "unit_price": PARKING_FEE_VND,
                 "revenue": val[2],
             }
-            for _, val in sorted(yearly_buckets.items(), key=lambda kv: kv[0], reverse=True)[:10]
+            for _, val in sorted(yearly_buckets.items(), key=lambda kv: kv[0], reverse=True)
         ]
 
         return {

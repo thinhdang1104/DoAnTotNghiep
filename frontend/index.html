@@ -448,6 +448,21 @@
               </tbody>
             </table>
           </div>
+
+          <div id="revenue-pagination" class="pagination-bar" aria-label="Phân trang bảng doanh thu">
+            <div class="pagination-meta">
+              <span id="rev-pagination-range-text" class="stamp mono-num num">Hiển thị 0–0</span>
+              <label for="rev-page-size-select" class="pagination-size-label">
+                <span>Số dòng:</span>
+                <select id="rev-page-size-select" class="input page-size-select mono-num num">
+                  <option value="10" selected>10 / trang</option>
+                  <option value="20">20 / trang</option>
+                  <option value="50">50 / trang</option>
+                </select>
+              </label>
+            </div>
+            <div id="rev-pagination-controls" class="pagination-controls"></div>
+          </div>
         </div>
       </section>
     </main>
@@ -565,6 +580,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261125f"></script>
+  <script src="app.js?v=20261125g"></script>
 </body>
 </html>
