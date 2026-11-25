@@ -19,8 +19,6 @@
   const btnCam2Start = document.getElementById("btn-cam2-start");
   const btnCam2Stop = document.getElementById("btn-cam2-stop");
 
-  const cam1UnitCard = document.getElementById("cam1-unit-card");
-  const cam2UnitCard = document.getElementById("cam2-unit-card");
   const cam1VotePill = document.getElementById("cam1-vote-pill");
   const cam2VotePill = document.getElementById("cam2-vote-pill");
   const cam1PlateValue = document.getElementById("cam1-plate-value");
@@ -1536,8 +1534,11 @@
       active2
     );
 
-    // Two-Phase Latch UI
-    if (state.latched) {
+    // Two-Phase Latch UI (hiển thị gọn trong header-topup-slot, không làm nhảy khung Camera)
+    if (state.latched && !state.security_alert) {
+      if (gateTopupBox) {
+        showBanner(gateTopupBox, "", "");
+      }
       latchStatusBox.classList.remove("hidden");
       const isIn = state.latched.direction === "IN";
       latchDirectionBadge.className = isIn ? "pill pos" : "pill warn";
@@ -1546,23 +1547,8 @@
       latchStepText.textContent = state.latched.sampling_face
         ? `Cam ${state.latched.plate_cam} đã chốt biển — Đang chọn mặt nét nhất ở Cam ${state.latched.required_face_cam}...`
         : `Cam ${state.latched.plate_cam} đã chốt biển — Chờ khuôn mặt ở Cam ${state.latched.required_face_cam} (${state.latched.remaining_seconds}s)`;
-
-      if (cam1UnitCard) {
-        cam1UnitCard.classList.toggle(
-          "cam-target-highlight",
-          state.latched.required_face_cam === 1
-        );
-      }
-      if (cam2UnitCard) {
-        cam2UnitCard.classList.toggle(
-          "cam-target-highlight",
-          state.latched.required_face_cam === 2
-        );
-      }
     } else {
       latchStatusBox.classList.add("hidden");
-      if (cam1UnitCard) cam1UnitCard.classList.remove("cam-target-highlight");
-      if (cam2UnitCard) cam2UnitCard.classList.remove("cam-target-highlight");
     }
 
     // Security Alert UI (Face mismatch on exit — Top-up in blue box area)

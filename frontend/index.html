@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=20261124a" />
+  <link rel="stylesheet" href="styles.css?v=20261125b" />
 </head>
 <body>
   <div class="app-shell">
@@ -72,8 +72,17 @@
               <h2>Hệ thống 2 Camera Kiểm soát Cổng</h2>
             </div>
 
-            <!-- TOP-UP POPUP AREA FOR ENTRY/EXIT FEEDBACK & FACE MISMATCH ALERT -->
+            <!-- TOP-UP POPUP AREA FOR LATCH, ENTRY/EXIT FEEDBACK & FACE MISMATCH ALERT -->
             <div class="header-topup-slot">
+              <div id="latch-status-box" class="latch-banner hidden">
+                <div class="latch-info">
+                  <span id="latch-direction-badge" class="pill pos">LƯU HỜ · ĐI VÀO</span>
+                  <strong id="latch-plate-text" class="plate-cell-main mono-num num">-</strong>
+                  <span id="latch-step-text" class="latch-step">Chờ khuôn mặt ở Camera đối diện...</span>
+                </div>
+                <button id="btn-cancel-latch" class="btn btn-sm" type="button">Hủy</button>
+              </div>
+
               <div id="gate-topup-box" class="topup-toast hidden" role="status" aria-live="polite"></div>
 
               <section id="security-alert-box" class="topup-security-alert hidden" role="alert">
@@ -122,16 +131,6 @@
               </button>
             </div>
           </header>
-
-          <!-- TWO-PHASE LATCH STATUS BOX (ONLY SHOWN WHILE WAITING FOR OPPOSITE CAMERA FACE) -->
-          <div id="latch-status-box" class="latch-banner hidden">
-            <div class="latch-info">
-              <span id="latch-direction-badge" class="pill pos">LƯU HỜ · ĐI VÀO</span>
-              <strong id="latch-plate-text" class="plate-cell-main mono-num num">-</strong>
-              <span id="latch-step-text" class="latch-step">Chờ khuôn mặt ở Camera đối diện...</span>
-            </div>
-            <button id="btn-cancel-latch" class="btn btn-sm" type="button">Hủy</button>
-          </div>
 
           <div class="dual-camera-grid">
             <!-- CAMERA 1 -->
@@ -575,6 +574,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261125a"></script>
+  <script src="app.js?v=20261125b"></script>
 </body>
 </html>
