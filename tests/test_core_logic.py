@@ -700,6 +700,23 @@ class TestSystemStateRegressions(unittest.TestCase):
             self.assertEqual(case_from_out["checkin_row"]["ID"], 101)
             self.assertEqual(case_from_out["checkout_row"]["ID"], 102)
             mock_fetch_case.assert_not_called()
+            # Kiểm tra sắp xếp tab Lượt ra theo Lệch trước / Khớp trước
+            mock_insert.return_value = (103, 0.41)
+            rec_out_mismatch = dict(
+                rec_out,
+                plate_number="59A1-99999",
+                entry_record_id=None,
+                face_match_score=0.41,
+            )
+            self.assertTrue(st._store_record(rec_out_mismatch))
+            ov_mis_first = st.get_cached_overview(
+                "", "direction_out", page=1, page_size=10, sort_by="mismatch_first"
+            )
+            ov_mat_first = st.get_cached_overview(
+                "", "direction_out", page=1, page_size=10, sort_by="matched_first"
+            )
+            self.assertEqual([r["ID"] for r in ov_mis_first["records"]], [103, 102])
+            self.assertEqual([r["ID"] for r in ov_mat_first["records"]], [102, 103])
             mock_fetch_ov.assert_not_called()
 
         st.stop_db_writer()

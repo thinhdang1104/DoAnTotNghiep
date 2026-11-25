@@ -559,10 +559,12 @@ class SystemState:
         page_size: int = 10,
         include_records: bool = True,
         include_revenue: bool | None = None,
+        sort_by: str = "",
     ) -> dict | None:
         effective_include_revenue = (
             bool(include_revenue) if include_revenue is not None else (not include_records)
         )
+        safe_sort = sort_by.strip() if sort_by else ""
         today_str = now_vn().strftime("%Y-%m-%d")
         with self.lock:
             if self.overview_cache_date != today_str:
@@ -575,6 +577,7 @@ class SystemState:
                 ver,
                 q.strip(),
                 status.strip(),
+                safe_sort,
                 limit,
                 int(page),
                 int(page_size),
@@ -614,6 +617,7 @@ class SystemState:
             include_records=include_records,
             include_stats=need_stats,
             include_revenue=need_revenue,
+            sort_by=safe_sort,
         )
         if overview is None:
             overview = fetch_overview(
@@ -626,6 +630,7 @@ class SystemState:
                 include_stats=need_stats,
                 include_revenue=need_revenue,
                 known_stats=cached_stats,
+                sort_by=safe_sort,
             )
 
         # Luôn gắn stats & revenue đã có trong cache trước khi return (kể cả khi records_version vừa tăng giữa chừng)
@@ -1953,10 +1958,12 @@ def get_management_overview(
     page_size: int = 10,
     include_records: bool = True,
     include_revenue: bool | None = None,
+    sort: str = "",
 ):
     safe_limit = max(1, min(int(limit), 1000)) if limit is not None else None
     safe_page = max(1, int(page))
     safe_page_size = max(1, min(int(page_size), 200))
+    safe_sort = sort if sort in ("mismatch_first", "matched_first") else ""
 
     with state.lock:
         ready = state.database_ready
@@ -1972,6 +1979,7 @@ def get_management_overview(
                 page_size=safe_page_size,
                 include_records=include_records,
                 include_revenue=include_revenue,
+                sort_by=safe_sort,
             )
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
             state._set_db_status(False, str(error))

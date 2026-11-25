@@ -658,6 +658,10 @@ def _matched_from_stats(stats: dict, status_filter: str) -> int:
     return int(stats.get("total_records") or 0)
 
 
+def _is_face_mismatch_score(score) -> bool:
+    return score is not None and float(score) < FACE_MATCH_THRESHOLD
+
+
 def fetch_overview(
     query: str = "",
     status_filter: str = "all",
@@ -669,6 +673,7 @@ def fetch_overview(
     include_revenue: bool = False,
     known_stats: dict | None = None,
     include_stats_and_revenue: bool | None = None,
+    sort_by: str = "",
 ):
     """Thống kê toàn bộ bảng + báo cáo doanh thu Ngày/Tháng/Năm (tùy chọn) + danh sách bản ghi phân trang."""
     if include_stats_and_revenue is not None:
@@ -756,6 +761,21 @@ def fetch_overview(
         if matched == 0:
             records = []
         else:
+            if sort_by == "mismatch_first":
+                order_sql = (
+                    f"ORDER BY (CASE WHEN face_match_score IS NOT NULL "
+                    f"AND face_match_score < {FACE_MATCH_THRESHOLD:.4f} THEN 0 ELSE 1 END) ASC, "
+                    "recognized_at DESC, id DESC"
+                )
+            elif sort_by == "matched_first":
+                order_sql = (
+                    f"ORDER BY (CASE WHEN face_match_score IS NOT NULL "
+                    f"AND face_match_score < {FACE_MATCH_THRESHOLD:.4f} THEN 1 ELSE 0 END) ASC, "
+                    "recognized_at DESC, id DESC"
+                )
+            else:
+                order_sql = "ORDER BY recognized_at DESC, id DESC"
+
             cursor.execute(
                 f"""
                 SELECT id, plate_number, direction, parking_status, entry_record_id,
@@ -765,7 +785,7 @@ def fetch_overview(
                        plate_image, face_image, camera_index
                 FROM plate_recognition_history
                 {where_sql}
-                ORDER BY recognized_at DESC, id DESC
+                {order_sql}
                 LIMIT %s OFFSET %s
                 """,
                 [*params, effective_limit, effective_offset],
@@ -1384,6 +1404,7 @@ class WarmDatabaseMirror:
         include_records: bool = True,
         include_stats: bool = True,
         include_revenue: bool = False,
+        sort_by: str = "",
     ) -> dict | None:
         with self._lock:
             if not self.ready:
@@ -1418,6 +1439,17 @@ class WarmDatabaseMirror:
             filtered = [it for it in filtered if it["direction"] == "IN"]
         elif status_filter == "direction_out":
             filtered = [it for it in filtered if it["direction"] == "OUT"]
+
+        if sort_by == "mismatch_first":
+            filtered = sorted(
+                filtered,
+                key=lambda it: 0 if _is_face_mismatch_score(it.get("face_match_score")) else 1,
+            )
+        elif sort_by == "matched_first":
+            filtered = sorted(
+                filtered,
+                key=lambda it: 1 if _is_face_mismatch_score(it.get("face_match_score")) else 0,
+            )
 
         matched = len(filtered)
         if limit is not None:

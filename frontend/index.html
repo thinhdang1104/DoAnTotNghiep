@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=20261125e" />
+  <link rel="stylesheet" href="styles.css?v=20261125f" />
 </head>
 <body>
   <div class="app-shell">
@@ -331,7 +331,7 @@
                 <tr>
                   <th>Biển số xe</th>
                   <th>Ảnh cắt (Biển &amp; Mặt)</th>
-                  <th>Luồng</th>
+                  <th id="th-direction-sort">Luồng <span id="direction-sort-indicator" class="sort-indicator"></span></th>
                   <th class="n">Thời gian</th>
                   <th class="n">Mã ghi</th>
                   <th class="n">Xử lý mất xe</th>
@@ -375,32 +375,6 @@
             </div>
 
             <div class="revenue-header-actions">
-              <div class="cam-switcher" role="group" aria-label="Chu kỳ thống kê doanh thu">
-                <button
-                  type="button"
-                  class="cam-switch-btn rev-period-btn"
-                  data-rev-period="daily"
-                  aria-pressed="true"
-                >
-                  Theo ngày
-                </button>
-                <button
-                  type="button"
-                  class="cam-switch-btn rev-period-btn"
-                  data-rev-period="monthly"
-                  aria-pressed="false"
-                >
-                  Theo tháng
-                </button>
-                <button
-                  type="button"
-                  class="cam-switch-btn rev-period-btn"
-                  data-rev-period="yearly"
-                  aria-pressed="false"
-                >
-                  Theo năm
-                </button>
-              </div>
               <button id="btn-export-revenue-pdf" class="btn" type="button" title="Xuất báo cáo Doanh thu ra file PDF">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
@@ -414,23 +388,41 @@
           </header>
 
           <div class="revenue-summary-grid">
-            <div class="revenue-card highlight-card">
+            <button
+              type="button"
+              class="revenue-card rev-period-btn highlight-card"
+              data-rev-period="daily"
+              aria-pressed="true"
+              title="Bấm để xem bảng doanh thu theo ngày"
+            >
               <span class="kpi-label">Doanh thu hôm nay</span>
               <strong id="rev-today-amount" class="revenue-amount mono-num num">0 đ</strong>
               <span id="rev-today-tickets" class="stamp mono-num num">0 lượt gửi xe</span>
-            </div>
+            </button>
 
-            <div class="revenue-card">
+            <button
+              type="button"
+              class="revenue-card rev-period-btn"
+              data-rev-period="monthly"
+              aria-pressed="false"
+              title="Bấm để xem bảng doanh thu theo tháng"
+            >
               <span class="kpi-label">Doanh thu tháng này</span>
               <strong id="rev-month-amount" class="revenue-amount mono-num num">0 đ</strong>
               <span id="rev-month-tickets" class="stamp mono-num num">0 lượt gửi xe</span>
-            </div>
+            </button>
 
-            <div class="revenue-card">
+            <button
+              type="button"
+              class="revenue-card rev-period-btn"
+              data-rev-period="yearly"
+              aria-pressed="false"
+              title="Bấm để xem bảng doanh thu theo năm"
+            >
               <span class="kpi-label">Doanh thu năm nay</span>
               <strong id="rev-year-amount" class="revenue-amount mono-num num">0 đ</strong>
               <span id="rev-year-tickets" class="stamp mono-num num">0 lượt gửi xe</span>
-            </div>
+            </button>
 
             <div class="revenue-card">
               <span class="kpi-label">Tổng doanh thu tích lũy</span>
@@ -573,6 +565,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261125e"></script>
+  <script src="app.js?v=20261125f"></script>
 </body>
 </html>

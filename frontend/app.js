@@ -78,6 +78,8 @@
   const btnExportHistoryPdf = document.getElementById("btn-export-history-pdf");
   const btnRefreshManagement = document.getElementById("btn-refresh-management");
   const btnExportRevenuePdf = document.getElementById("btn-export-revenue-pdf");
+  const thDirectionSort = document.getElementById("th-direction-sort");
+  const directionSortIndicator = document.getElementById("direction-sort-indicator");
   const historyTableBody = document.getElementById("history-table-body");
   const paginationRangeText = document.getElementById("pagination-range-text");
   const pageSizeSelect = document.getElementById("page-size-select");
@@ -118,6 +120,7 @@
 
   let activeViewId = "view-recognition";
   let activeStatusFilter = "all";
+  let activeDirectionSort = "";
   let activeRevenuePeriod = "daily";
   let cachedRevenueData = null;
   let cachedHistoryRecords = [];
@@ -164,8 +167,8 @@
     lostCaseClientCache.clear();
   }
 
-  function makeOverviewCacheKey(ver, query, statusFilter, page, size) {
-    return `${ver}|${String(query || "").trim()}|${statusFilter || "all"}|${page}|${size}`;
+  function makeOverviewCacheKey(ver, query, statusFilter, page, size, sortBy = "") {
+    return `${ver}|${String(query || "").trim()}|${statusFilter || "all"}|${sortBy || ""}|${page}|${size}`;
   }
 
   function setOverviewClientCache(key, payload) {
@@ -1696,8 +1699,12 @@
 
   revPeriodBtns.forEach((btn) => {
     btn.addEventListener("click", () => {
-      revPeriodBtns.forEach((b) => b.setAttribute("aria-pressed", "false"));
+      revPeriodBtns.forEach((b) => {
+        b.setAttribute("aria-pressed", "false");
+        b.classList.remove("highlight-card");
+      });
       btn.setAttribute("aria-pressed", "true");
+      btn.classList.add("highlight-card");
       activeRevenuePeriod = btn.getAttribute("data-rev-period") || "daily";
       renderRevenueBreakdownTable();
     });
@@ -2551,13 +2558,13 @@
     }
   }
 
-  function prefetchNextOverviewPage(ver, query, statusFilter, page, size, totalItems) {
+  function prefetchNextOverviewPage(ver, query, statusFilter, page, size, totalItems, sortBy = "") {
     if (typeof ver !== "number" || ver < 0) return;
     const totalPages = Math.max(1, Math.ceil((Number(totalItems) || 0) / size));
     const nextPage = page + 1;
     if (nextPage > totalPages) return;
 
-    const nextKey = makeOverviewCacheKey(ver, query, statusFilter, nextPage, size);
+    const nextKey = makeOverviewCacheKey(ver, query, statusFilter, nextPage, size, sortBy);
     if (overviewPageCache.has(nextKey) || overviewPrefetchInFlight.has(nextKey)) {
       return;
     }
@@ -2566,6 +2573,9 @@
     if (query) params.set("q", query);
     if (statusFilter && statusFilter !== "all") {
       params.set("status", statusFilter);
+    }
+    if (sortBy) {
+      params.set("sort", sortBy);
     }
     params.set("page", String(nextPage));
     params.set("page_size", String(size));
@@ -2588,6 +2598,25 @@
       });
   }
 
+  function updateDirectionSortHeaderUI() {
+    if (!thDirectionSort || !directionSortIndicator) return;
+    const isOutTab = activeStatusFilter === "direction_out";
+    thDirectionSort.classList.toggle("sortable-th", isOutTab);
+    if (!isOutTab) {
+      thDirectionSort.removeAttribute("title");
+      directionSortIndicator.textContent = "";
+      return;
+    }
+    thDirectionSort.title = "Bấm để sắp xếp Ra bãi lệch mặt / không lệch mặt";
+    if (activeDirectionSort === "mismatch_first") {
+      directionSortIndicator.textContent = "▾ Lệch trước";
+    } else if (activeDirectionSort === "matched_first") {
+      directionSortIndicator.textContent = "▴ Khớp trước";
+    } else {
+      directionSortIndicator.textContent = "⇅";
+    }
+  }
+
   async function fetchManagementOverview(options = {}) {
     const forceNetwork = Boolean(options && options.forceNetwork);
     const reqSeq = ++overviewReqSeq;
@@ -2595,6 +2624,7 @@
     const isRevenueOnly = activeViewId === "view-revenue";
     const query = (searchPlateInput.value || "").trim();
     const statusFilter = activeStatusFilter || "all";
+    const sortBy = statusFilter === "direction_out" ? activeDirectionSort : "";
     const requestedPage = currentPage;
     const requestedSize = pageSize;
 
@@ -2605,7 +2635,8 @@
         query,
         statusFilter,
         requestedPage,
-        requestedSize
+        requestedSize,
+        sortBy
       );
       if (overviewPageCache.has(hitKey)) {
         const cachedPayload = overviewPageCache.get(hitKey);
@@ -2616,7 +2647,8 @@
           statusFilter,
           currentPage,
           requestedSize,
-          cachedPayload.matched
+          cachedPayload.matched,
+          sortBy
         );
         return;
       }
@@ -2641,6 +2673,9 @@
       if (query) params.set("q", query);
       if (statusFilter && statusFilter !== "all") {
         params.set("status", statusFilter);
+      }
+      if (sortBy) {
+        params.set("sort", sortBy);
       }
       params.set("page", String(requestedPage));
       params.set("page_size", String(requestedSize));
@@ -2672,7 +2707,8 @@
           query,
           statusFilter,
           resolvedPage,
-          requestedSize
+          requestedSize,
+          sortBy
         );
         setOverviewClientCache(storeKey, data);
         prefetchNextOverviewPage(
@@ -2681,7 +2717,8 @@
           statusFilter,
           resolvedPage,
           requestedSize,
-          data.matched
+          data.matched,
+          sortBy
         );
       }
     } catch (_) {
@@ -2700,10 +2737,30 @@
       tabLinks.forEach((b) => b.setAttribute("aria-selected", "false"));
       btn.setAttribute("aria-selected", "true");
       activeStatusFilter = btn.getAttribute("data-status-filter") || "all";
+      if (activeStatusFilter !== "direction_out") {
+        activeDirectionSort = "";
+      }
+      updateDirectionSortHeaderUI();
       currentPage = 1;
       fetchManagementOverview();
     });
   });
+
+  if (thDirectionSort) {
+    thDirectionSort.addEventListener("click", () => {
+      if (activeStatusFilter !== "direction_out") return;
+      if (activeDirectionSort === "") {
+        activeDirectionSort = "mismatch_first";
+      } else if (activeDirectionSort === "mismatch_first") {
+        activeDirectionSort = "matched_first";
+      } else {
+        activeDirectionSort = "";
+      }
+      updateDirectionSortHeaderUI();
+      currentPage = 1;
+      fetchManagementOverview();
+    });
+  }
 
   searchPlateInput.addEventListener("input", () => {
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
@@ -2949,6 +3006,9 @@
         if (searchQuery) params.set("q", searchQuery);
         if (activeStatusFilter && activeStatusFilter !== "all") {
           params.set("status", activeStatusFilter);
+        }
+        if (activeStatusFilter === "direction_out" && activeDirectionSort) {
+          params.set("sort", activeDirectionSort);
         }
         params.set("limit", "200");
         const res = await fetch(`/api/management/overview?${params.toString()}`);

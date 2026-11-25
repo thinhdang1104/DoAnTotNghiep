@@ -785,11 +785,41 @@ th.n,
   display: flex;
   flex-direction: column;
   gap: 4px;
+  text-align: left;
+  font-family: inherit;
 }
 
-.revenue-card.highlight-card {
+.revenue-card.rev-period-btn {
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.revenue-card.rev-period-btn:hover {
+  border-color: var(--border-strong);
+  background: var(--elevated);
+}
+
+.revenue-card.highlight-card,
+.revenue-card.rev-period-btn.highlight-card:hover {
   background: #1a1710;
   border-color: #54431c;
+}
+
+#th-direction-sort.sortable-th {
+  cursor: pointer;
+  user-select: none;
+  color: var(--text);
+}
+
+#th-direction-sort.sortable-th:hover {
+  color: var(--accent);
+}
+
+.sort-indicator {
+  font-size: 11px;
+  color: var(--accent);
+  margin-left: 4px;
+  font-weight: 600;
 }
 
 .revenue-card .kpi-label {
