@@ -611,6 +611,99 @@ class TestSystemStateRegressions(unittest.TestCase):
         self.assertIsNotNone(status_payload["gate_feedback"])
         self.assertIn("VÀO BÃI THÀNH CÔNG", status_payload["gate_feedback"]["message"])
 
+    def test_warm_database_mirror_zero_db_reads_and_live_sync(self):
+        """Kiểm chứng WarmDatabaseMirror:
+        - Sau 1 lần nạp ban đầu, mọi thao tác Lịch sử / Tìm kiếm / Phân trang / Doanh thu / Hồ sơ mất xe / Kiểm tra IN_PARKING
+          đều trả về tức thì từ RAM (0 truy vấn SQL sang Aiven), kể cả ngay sau khi có lượt xe mới vào/ra.
+        """
+        st = main.SystemState()
+        st.database_ready = True
+        fake_cursor = mock.MagicMock()
+        fake_cursor.fetchall.side_effect = [[], []]  # meta_rows=[], active_rows=[]
+        st.warm_mirror.load_from_cursor(fake_cursor)
+        self.assertTrue(st.warm_mirror.ready)
+
+        emb_vec = [0.2] * 512
+        now_dt = database.now_vn()
+
+        with mock.patch("main.insert_plate_record") as mock_insert, mock.patch(
+            "main.fetch_overview"
+        ) as mock_fetch_ov, mock.patch(
+            "main.fetch_parking_session_case"
+        ) as mock_fetch_case, mock.patch(
+            "main.find_active_parking_session"
+        ) as mock_find_act:
+            # 1) Xe VÀO BÃI -> commit lên MySQL rồi cập nhật thẳng vào WarmDatabaseMirror
+            mock_insert.return_value = (101, None)
+            rec_in = {
+                "plate_number": "72C1-60266",
+                "direction": "IN",
+                "fee_amount": 2000,
+                "recognized_at": now_dt,
+                "vote_count": 3,
+                "sample_count": 3,
+                "consensus_rate": 1.0,
+                "face_detected": True,
+                "face_confidence": 0.96,
+                "face_embedding": emb_vec,
+                "plate_image": "data:image/jpeg;base64,INPLATE",
+                "face_image": "data:image/jpeg;base64,INFACE",
+                "camera_index": 0,
+            }
+            self.assertTrue(st._store_record(rec_in))
+
+            # Kiểm tra IN_PARKING từ RAM (0 query MySQL)
+            act_sess, db_ok = st._get_active_parking_session("72C1-60266")
+            self.assertTrue(db_ok)
+            self.assertIsNotNone(act_sess)
+            self.assertEqual(act_sess["id"], 101)
+            mock_find_act.assert_not_called()
+
+            # Xem Lịch sử & Doanh thu ngay sau khi xe vào -> 0 query MySQL
+            ov_in = st.get_cached_overview("", "in_parking", page=1, page_size=10, include_revenue=True)
+            self.assertEqual(ov_in["stats"]["in_parking"], 1)
+            self.assertEqual(ov_in["revenue"]["today"]["revenue"], 2000)
+            self.assertEqual(ov_in["matched"], 1)
+            self.assertEqual(ov_in["records"][0]["ID"], 101)
+            mock_fetch_ov.assert_not_called()
+
+            # 2) Xe RA BÃI -> commit lên MySQL rồi đóng phiên IN_PARKING ngay trên RAM
+            mock_insert.return_value = (102, 0.89)
+            rec_out = {
+                "plate_number": "72C1-60266",
+                "direction": "OUT",
+                "entry_record_id": 101,
+                "fee_amount": 0,
+                "recognized_at": now_dt,
+                "vote_count": 2,
+                "sample_count": 2,
+                "consensus_rate": 1.0,
+                "face_detected": True,
+                "face_confidence": 0.95,
+                "face_embedding": emb_vec,
+                "face_match_score": 0.89,
+                "plate_image": "data:image/jpeg;base64,OUTPLATE",
+                "face_image": "data:image/jpeg;base64,OUTFACE",
+                "camera_index": 1,
+            }
+            self.assertTrue(st._store_record(rec_out))
+
+            act_after_out, _ = st._get_active_parking_session("72C1-60266")
+            self.assertIsNone(act_after_out)
+            mock_find_act.assert_not_called()
+
+            # Mở Modal Hồ sơ Mất xe ở cả dòng IN (#101) lẫn dòng OUT (#102) -> 0 query MySQL, đủ cả 2 chiều
+            case_from_in = st.get_cached_session_case(101)
+            case_from_out = st.get_cached_session_case(102)
+            self.assertEqual(case_from_in["checkin_row"]["ID"], 101)
+            self.assertEqual(case_from_in["checkout_row"]["ID"], 102)
+            self.assertEqual(case_from_out["checkin_row"]["ID"], 101)
+            self.assertEqual(case_from_out["checkout_row"]["ID"], 102)
+            mock_fetch_case.assert_not_called()
+            mock_fetch_ov.assert_not_called()
+
+        st.stop_db_writer()
+
 
 if __name__ == "__main__":
     unittest.main()

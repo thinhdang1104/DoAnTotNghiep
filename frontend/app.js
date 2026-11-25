@@ -2168,6 +2168,25 @@
       return;
     }
 
+    // Nếu dòng IN đã lấy xe có sẵn dòng OUT liên kết ngay trong trang hiện tại -> ghép cặp tức thì 0 ms
+    if (verSnapshot >= 0 && dirCode === "IN" && recId > 0) {
+      const linkedCheckout = cachedHistoryRecords.find(
+        (r) =>
+          String(r.direction_code || "").toUpperCase() === "OUT" &&
+          Number(r.entry_record_id) === recId
+      );
+      if (linkedCheckout) {
+        const instantInCase = computeLostCaseDetails(
+          row,
+          linkedCheckout,
+          row["Biển số"]
+        );
+        lostCaseClientCache.set(cacheKey, instantInCase);
+        renderLostVehicleModalCase(instantInCase);
+        return;
+      }
+    }
+
     // Nếu dòng OUT có sẵn entry_record_id đang nằm ngay trong trang hiện tại -> ghép cặp tức thì 0 ms
     if (verSnapshot >= 0 && dirCode === "OUT" && row.entry_record_id) {
       const linkedCheckin = cachedHistoryRecords.find(

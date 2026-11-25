@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from ultralytics import YOLO
@@ -23,6 +24,7 @@ from database import (
     PARKING_FEE_VND,
     DatabaseConfigurationError,
     DatabaseOperationError,
+    WarmDatabaseMirror,
     fetch_overview,
     fetch_parking_session_case,
     find_active_parking_session,
@@ -454,6 +456,7 @@ class SystemState:
         self.database_ready = False
         self.database_error: str | None = None
         self.records_version = 0
+        self.warm_mirror = WarmDatabaseMirror()
         self.overview_cache: dict[tuple, dict] = {}
         self.overview_summary_cache: dict[tuple, dict] = {}
         self.session_case_cache: dict[tuple[int, int], dict] = {}
@@ -602,7 +605,7 @@ class SystemState:
                 "records": [],
             }
 
-        overview = fetch_overview(
+        overview = self.warm_mirror.query_overview(
             q,
             status,
             limit=limit,
@@ -611,8 +614,19 @@ class SystemState:
             include_records=include_records,
             include_stats=need_stats,
             include_revenue=need_revenue,
-            known_stats=cached_stats,
         )
+        if overview is None:
+            overview = fetch_overview(
+                q,
+                status,
+                limit=limit,
+                page=page,
+                page_size=page_size,
+                include_records=include_records,
+                include_stats=need_stats,
+                include_revenue=need_revenue,
+                known_stats=cached_stats,
+            )
 
         # Luôn gắn stats & revenue đã có trong cache trước khi return (kể cả khi records_version vừa tăng giữa chừng)
         if overview.get("stats") is None and cached_stats is not None:
@@ -648,7 +662,9 @@ class SystemState:
         if cached_case is not None:
             return cached_case
 
-        case_data = fetch_parking_session_case(rec_id)
+        handled_in_ram, case_data = self.warm_mirror.get_session_case(rec_id)
+        if not handled_in_ram:
+            case_data = fetch_parking_session_case(rec_id)
         if case_data is not None:
             with self.lock:
                 if self.records_version == ver:
@@ -660,7 +676,7 @@ class SystemState:
 
     def connect_database(self) -> None:
         try:
-            initialize_database()
+            initialize_database(warm_mirror=self.warm_mirror)
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
             self._set_db_status(False, str(error))
             raise
@@ -671,9 +687,11 @@ class SystemState:
         inserted_to_db = False
         with self.db_write_lock:
             try:
-                _, match_score = insert_plate_record(record)
+                new_id, match_score = insert_plate_record(record)
                 if match_score is not None:
                     record["face_match_score"] = match_score
+                if new_id is not None:
+                    self.warm_mirror.apply_inserted_record(int(new_id), record)
                 self._set_db_status(True, None)
                 inserted_to_db = True
             except (DatabaseConfigurationError, DatabaseOperationError) as error:
@@ -1547,11 +1565,14 @@ class SystemState:
     def _get_active_parking_session(
         self, plate_number: str
     ) -> tuple[dict | None, bool]:
-        """Trả về (active_session, db_ok). Nếu lỗi kết nối MySQL thì db_ok = False."""
+        """Trả về (active_session, db_ok). Đọc tức thì 0 ms từ WarmDatabaseMirror khi sẵn sàng."""
         with self.lock:
             db_ready = self.database_ready
         if not db_ready:
             return None, False
+        warm_ready, warm_sess = self.warm_mirror.find_active_session(plate_number)
+        if warm_ready:
+            return warm_sess, True
         try:
             return find_active_parking_session(plate_number), True
         except (DatabaseConfigurationError, DatabaseOperationError) as error:
@@ -1820,6 +1841,7 @@ app = FastAPI(
     title="Hệ thống Nhận diện Khuôn mặt & Biển số xe AI (2 Camera)",
     lifespan=lifespan,
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 class BrowserDualFrameRequest(BaseModel):
